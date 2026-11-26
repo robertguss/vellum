@@ -1,0 +1,7 @@
+[package]
+name = "vellum"
+version = "0.1.0"
+
+[dependencies]
+arvo = { path = "../arvo" }
+modb = { path = "../modb" }

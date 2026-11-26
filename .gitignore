@@ -1,0 +1,16 @@
+# Local runtime & database state
+data/
+.env
+.env.local
+
+# Compiled Mo / build artifacts
+build/
+*.bc
+public/
+
+# Frontend dependencies & staging
+frontend/node_modules/
+frontend/dist/
+
+# OS / editor noise
+.DS_Store
