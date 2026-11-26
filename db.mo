@@ -93,6 +93,7 @@ use Domain.Types{
   AppError,
   Attachment,
   AuthContext,
+  AuthorKind,
   Block,
   BlockKind,
   Collection,
@@ -102,6 +103,7 @@ use Domain.Types{
   PageKind,
   Principal,
   PrincipalKind,
+  Provenance,
   SearchResultItem,
   Workspace,
   WorkspaceRole,
@@ -613,18 +615,42 @@ fn page_embedding_text(page: Page, blocks: List(Block), extra_text: Option(Text)
   parts.join("\n")
 end
 
+fn truncate_text_bytes(s: Text, max_bytes: Int) : Text
+  return "" if max_bytes <= 0
+  return s if s.byte_count <= max_bytes
+  raw = s.bytes
+  var cut = max_bytes
+  while cut > 0
+    case raw.slice(0, cut).decode_utf8
+      Some(valid): return valid
+      None: cut -= 1
+    end
+  end
+  ""
+end
+
 ## Indexes `page` and its `blocks` into both `Modb.Fts` and `Modb.Vec` (sketch index) inside `tx`.
 fn tx_index_page(tx: WriteTx, page: Page, blocks: List(Block)) : Result(WriteTx, AppError)
+  body_plain = Blocks.blocks_plain_text(blocks)
   doc = Fts.DocumentInput(
     doc_id: page.id,
     scope: page.collection_id,
     fields: [
       Fts.FieldInput(name: "title", text: page.title, weight: 3),
-      Fts.FieldInput(name: "body", text: Blocks.blocks_plain_text(blocks), weight: 1)
+      Fts.FieldInput(name: "body", text: body_plain, weight: 1)
     ]
   )
   t1 = try Fts.tx_index_document(tx, fts_index(), doc).map_error(map_fts_error)
-  embed_txt = page_embedding_text(page, blocks, None)
+  t = page.title.trim
+  body_trimmed = body_plain.trim
+  sketch_raw = if t.empty?
+    body_trimmed
+  else if body_trimmed.empty?
+    t
+  else
+    "#{t}\n#{body_trimmed}"
+  end
+  embed_txt = truncate_text_bytes(sketch_raw, 4096)
   vec_inp = Vec.VectorInput(
     doc_id: page.id,
     scope: page.collection_id,
@@ -675,6 +701,7 @@ fn tx_save_page_and_blocks(tx: WriteTx, page: Page, blocks: List(Block)) : Resul
   bidx = blocks_by_page()
   existing = try Table.tx_lookup(tx, btbl, bidx, page.id).map_error(map_table_error)
   new_ids = blocks.map(fn(b) b.id end).to_set
+  existing_by_id = existing.to_map
 
   var cur = try Table.put(tx, pages_table(), page.id, page).map_error(map_table_error)
   for (old_id, _old_blk) in existing
@@ -683,7 +710,13 @@ fn tx_save_page_and_blocks(tx: WriteTx, page: Page, blocks: List(Block)) : Resul
     end
   end
   for blk in blocks
-    cur = try Table.put(cur, btbl, blk.id, blk).map_error(map_table_error)
+    changed? = case existing_by_id.get(blk.id)
+      Some(old_blk): old_blk != blk
+      None: true
+    end
+    if changed?
+      cur = try Table.put(cur, btbl, blk.id, blk).map_error(map_table_error)
+    end
   end
   if page.archived_at == None
     tx_index_page(cur, page, blocks)
@@ -2009,4 +2042,207 @@ test "Db Modb.Vec hybrid RRF search, neural vector updates/dimension switches, a
     end
   )
   assert verify_after is Ok(Unit)
+end
+
+test "truncate_text_bytes, diff-only tx_save_page_and_blocks, and large-doc sketch search"
+  assert truncate_text_bytes("hello", 0) == ""
+  assert truncate_text_bytes("hello", 5) == "hello"
+  assert truncate_text_bytes("hello 😀 world", 9) == "hello "
+  assert truncate_text_bytes("hello 😀 world", 10) == "hello 😀"
+
+  files = Files.in_memory({})
+  t0 = Time.parse("2026-11-26T12:00:00Z") or stop "t0"
+  t1_time = Time.parse("2026-11-26T12:01:00Z") or stop "t1"
+  schema = vellum_schema()
+  meta = Ledger.WriteMeta(
+    principal: "@ada",
+    action: "db.diff_test",
+    reason: "verify diff-only block puts and truncated sketch indexing",
+    at: t0
+  )
+  prov = Provenance(
+    author_id: "usr_ada",
+    author_kind: HumanAuthor,
+    grant_id: None,
+    proposal_id: None,
+    reason: None,
+    citations: [],
+    updated_at: t0
+  )
+  large_tail = " filler word".repeat(500)
+  pg = Page(
+    id: "pg_diff",
+    collection_id: default_collection_id,
+    parent_page_id: None,
+    title: "Kernel Runbook",
+    icon: None,
+    cover_attachment_id: None,
+    kind: Document,
+    sort_order: "a",
+    database_id: None,
+    freshness_ttl_days: None,
+    verified_at: None,
+    verified_by: None,
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+  b1 = Block(
+    id: "blk_d1",
+    page_id: pg.id,
+    parent_block_id: None,
+    rank: "i0001",
+    kind: Paragraph,
+    markdown: "Unchanged quantum telemetry lead paragraph.#{large_tail}",
+    provenance: prov,
+    version: 1
+  )
+  b2 = Block(
+    id: "blk_d2",
+    page_id: pg.id,
+    parent_block_id: None,
+    rank: "i0002",
+    kind: Paragraph,
+    markdown: "Original second paragraph.",
+    provenance: prov,
+    version: 1
+  )
+  b3 = Block(
+    id: "blk_d3",
+    page_id: pg.id,
+    parent_block_id: None,
+    rank: "i0003",
+    kind: Paragraph,
+    markdown: "Deleted third paragraph.",
+    provenance: prov,
+    version: 1
+  )
+
+  seed = Ledger.transact_locked(
+    files,
+    ledger_db_path,
+    schema,
+    meta,
+    "seed diff test",
+    Json.Null,
+    map_ledger_error,
+    fn(tx)
+      t_next = try tx_save_page_and_blocks(tx, pg, [b1, b2, b3])
+      Ok((t_next, Unit))
+    end
+  )
+  assert seed is Ok(Unit)
+
+  pg_v2 = Page(
+    id: pg.id,
+    collection_id: pg.collection_id,
+    parent_page_id: None,
+    title: pg.title,
+    icon: None,
+    cover_attachment_id: None,
+    kind: Document,
+    sort_order: "a",
+    database_id: None,
+    freshness_ttl_days: None,
+    verified_at: None,
+    verified_by: None,
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t1_time,
+    archived_at: None,
+    version: 2
+  )
+  b2_v2 = Block(
+    id: "blk_d2",
+    page_id: pg.id,
+    parent_block_id: None,
+    rank: "i0002",
+    kind: Paragraph,
+    markdown: "Edited second paragraph.",
+    provenance: prov,
+    version: 2
+  )
+  b4 = Block(
+    id: "blk_d4",
+    page_id: pg.id,
+    parent_block_id: None,
+    rank: "i0004",
+    kind: Paragraph,
+    markdown: "Inserted fourth paragraph.",
+    provenance: prov,
+    version: 1
+  )
+
+  diff_res = Ledger.transact_locked(
+    files,
+    ledger_db_path,
+    schema,
+    meta,
+    "diff update",
+    Json.Null,
+    map_ledger_error,
+    fn(tx)
+      t_next = try tx_save_page_and_blocks(tx, pg_v2, [b1, b2_v2, b4])
+      puts_cnt = Modb.tx_touched_puts(t_next, blocks_table().bucket).size
+      Ok((t_next, puts_cnt))
+    end
+  )
+  assert diff_res == Ok(2)
+
+  verify = Ledger.read_locked(
+    files.read_only,
+    ledger_db_path,
+    schema,
+    map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      loaded = try load_page_blocks(store, pg.id)
+      return Error(BadInput(reason: "expected 3 blocks after diff update")) if loaded != [
+        b1,
+        b2_v2,
+        b4
+      ]
+      auth = AuthContext(
+        principal: Principal(
+          id: "usr_ada",
+          kind: Human,
+          handle: "ada",
+          display_name: "Ada",
+          email: Some("ada@example.com"),
+          avatar_url: None,
+          role: Owner,
+          model_id: None,
+          root_grant_id: "gr_root",
+          suspended: false,
+          created_at: t0,
+          last_seen_at: None
+        ),
+        grant_id: "gr_root",
+        session: None,
+        allowed_collections: None,
+        allowed_actions: ["read"]
+      )
+      q_txt = "Kernel Runbook quantum telemetry"
+      hits = try search_pages_hybrid(
+        store,
+        auth,
+        q_txt,
+        Some(Vec.text_sketch_embedding(q_txt, sketch_vec_dims)),
+        sketch_vec_index(),
+        "hybrid",
+        10,
+        true,
+        None,
+        Some(sketch_min_vec_score)
+      )
+      first_h = try hits.first.or_fail(BadInput(reason: "expected sketch hit on >5KiB doc"))
+      return Error(BadInput(reason: "wrong doc hit")) if first_h.page_id != pg.id
+      rep = try Ledger.verify_all(db).map_error(map_ledger_error)
+      return Error(BadInput(reason: "expected invariants")) if rep.invariants_checked < 5
+      Ok(Unit)
+    end
+  )
+  assert verify is Ok(Unit)
 end
