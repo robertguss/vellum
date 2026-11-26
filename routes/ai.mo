@@ -1,16 +1,23 @@
 ## Built-in configurable AI workflows (OpenAI, Anthropic, or local OpenAI-compatible gateway):
-## grant-filtered Ask Workspace with block citations + SSE streaming, Draft-into-Proposal,
-## and Knowledge Gardening (`freshness_ttl_days` expiration & broken `PageLink` detector).
+## grant-filtered Hybrid (BM25 + Modb.Vec) Ask Workspace with block citations + SSE streaming,
+## OpenAI-compatible `/v1/embeddings` client + workspace hybrid search orchestrator,
+## Draft-into-Proposal, and Knowledge Gardening.
 module Routes.Ai
 expose AiConfig(..),
+EmbedConfig(..),
+WorkspaceSearchOutcome(..),
 AskWorkspaceInput(..),
 DraftBlockInput(..),
 GardenStalePage(..),
 GardenBrokenLink(..),
 GardenReport(..),
 ai_config,
+embed_config,
 build_llm_request,
 build_llm_request_with_stream,
+build_embedding_request,
+fetch_embedding,
+execute_workspace_search,
 ask_workspace,
 draft_blocks,
 run_garden,
@@ -21,13 +28,23 @@ use Db
 use Domain.Blocks
 use Domain.Collab{ProposalMeta, WorldPatchArgs}
 use Domain.Policy
-use Domain.Types{AppError, AuthContext, AuthorKind, BlockKind, BlockOp, PrincipalKind, Provenance}
+use Domain.Types{
+  AppError,
+  AuthContext,
+  AuthorKind,
+  BlockKind,
+  BlockOp,
+  PrincipalKind,
+  Provenance,
+  SearchResultItem
+}
 use Http
 use Json
 use Modb{Store}
 use Modb.Grants
 use Modb.Ledger
 use Modb.Table
+use Modb.Vec
 use Modb.World
 use Routes.Auth
 
@@ -37,6 +54,22 @@ struct AiConfig
   api_key: Text
   base_url: Text
   model: Text
+end
+
+## Optional runtime configuration for OpenAI-compatible neural `/v1/embeddings`.
+struct EmbedConfig
+  api_key: Text
+  base_url: Text
+  model: Text
+  dimensions: Int
+  min_score: Float
+end
+
+## Unified hybrid/BM25/semantic search response metadata returned by `execute_workspace_search`.
+struct WorkspaceSearchOutcome
+  results: List(SearchResultItem)
+  mode: Text
+  vector_backend: Text
 end
 
 ## JSON payload for `POST /api/ai/ask`.
@@ -118,6 +151,109 @@ fn ai_config(env: Env) : Result(AiConfig, AppError)
   Ok(AiConfig(provider: provider, api_key: api_key.trim, base_url: base_url, model: model))
 end
 
+fn non_empty_env(env: Env, key: Text) : Option(Text)
+  case env.get(key)
+    Some(v) if not v.trim.empty?: Some(v.trim)
+    Some(_) | None: None
+  end
+end
+
+## Loads neural embedding configuration when explicitly opted in via `VELLUM_EMBED_BASE_URL`,
+## `VELLUM_EMBED_MODEL`, or `VELLUM_EMBED_API_KEY`.
+fn embed_config(env: Env) : Option(EmbedConfig)
+  base_opt = non_empty_env(env, "VELLUM_EMBED_BASE_URL")
+  model_opt = non_empty_env(env, "VELLUM_EMBED_MODEL")
+  embed_key_opt = non_empty_env(env, "VELLUM_EMBED_API_KEY")
+  if base_opt is None and model_opt is None and embed_key_opt is None
+    return None
+  end
+  api_key = case embed_key_opt
+    Some(k): k
+    None:
+      case non_empty_env(env, "VELLUM_AI_API_KEY")
+        Some(k): k
+        None: return None
+      end
+  end
+  base_url = base_opt or "https://api.openai.com/v1/embeddings"
+  model = model_opt or "text-embedding-3-small"
+  dims = case env.get("VELLUM_EMBED_DIMENSIONS")
+    Some(raw):
+      case raw.trim.to_int
+        Some(n) if n >= 1 and n <= 4096: n
+        Some(_) | None: 256
+      end
+    None: 256
+  end
+  Some(
+    EmbedConfig(
+      api_key: api_key,
+      base_url: base_url,
+      model: model,
+      dimensions: dims,
+      min_score: 0.25.to_float
+    )
+  )
+end
+
+## Builds the signed HTTP request for OpenAI-compatible `POST /v1/embeddings`.
+fn build_embedding_request(cfg: EmbedConfig, input_text: Text) : Http.Request
+  Http.post(cfg.base_url).json(
+    Json.Object({
+      "model": Json.String(cfg.model),
+      "input": Json.String(input_text),
+      "dimensions": Json.int(cfg.dimensions)
+    })
+  ).header("Authorization", "Bearer #{cfg.api_key}")
+end
+
+## Requests a neural embedding vector from the configured `/v1/embeddings` endpoint and validates dimensions.
+fn fetch_embedding(cfg: EmbedConfig, input_text: Text, net: Network) : Result(
+  List(Float),
+  AppError
+)
+  clean = input_text.trim
+  if clean.empty?
+    return Error(BadInput(reason: "embedding input text must not be empty"))
+  end
+  http_res = try Http.send(build_embedding_request(cfg, clean), net).map_error(fn(e)
+    ServerFailed(reason: "Embedding HTTP request failed: #{e.to_text}")
+  end)
+  if http_res.status < 200 or http_res.status >= 300
+    return Error(ServerFailed(reason: "Embedding provider returned HTTP #{http_res.status}"))
+  end
+  parsed = try Json.decode_strict[Json](http_res.body).map_error(fn(e)
+    ServerFailed(reason: "invalid embedding JSON response: #{e.to_text}")
+  end)
+  raw_list = case parsed.list_at("data.0.embedding")
+    Some(xs): xs
+    None: return Error(ServerFailed(reason: "embedding response missing data.0.embedding array"))
+  end
+  var vec = []
+  for item in raw_list
+    case item
+      Json.Number(num):
+        case num.to_float
+          Some(f) if not f.nan? and not f.infinite?: vec = vec.append(f)
+          Some(_) | None: return Error(
+            ServerFailed(reason: "embedding vector contains non-finite float value")
+          )
+        end
+      Json.Null | Json.Boolean(_) | Json.String(_) | Json.Array(_) | Json.Object(_): return Error(
+        ServerFailed(reason: "embedding vector element is not a number")
+      )
+    end
+  end
+  if vec.size != cfg.dimensions
+    return Error(
+      ServerFailed(
+        reason: "embedding dimension mismatch: expected #{cfg.dimensions}, got #{vec.size}"
+      )
+    )
+  end
+  Ok(vec)
+end
+
 ## Builds the signed HTTP request for either OpenAI-compatible chat completions or Anthropic
 ## messages, optionally setting `"stream": true` for SSE delta streaming.
 fn build_llm_request_with_stream(
@@ -194,7 +330,115 @@ fn make_provenance(auth: AuthContext, reason: Text, now: Time) : Provenance
   )
 end
 
-## `POST /api/ai/ask` — Grant-filtered BM25 context retrieval + LLM synthesis (JSON or SSE stream, `ReadFiles`-only).
+fn normalize_search_mode(raw: Option(Text)) : Result(Text, AppError)
+  case raw
+    None: Ok("hybrid")
+    Some(s):
+      m = s.trim.ascii_lowercase
+      if m.empty? or m == "hybrid"
+        Ok("hybrid")
+      else if m == "bm25" or m == "semantic"
+        Ok(m)
+      else
+        Error(BadInput(reason: "search mode must be 'hybrid', 'bm25', or 'semantic'"))
+      end
+  end
+end
+
+## Executes fail-closed grant-filtered hybrid (`Modb.Fts` + `Modb.Vec` RRF), `bm25`, or `semantic` search
+## strictly using `ReadFiles`, selecting the neural vector index when populated and gracefully falling
+## back to the local 256-dim `Modb.Vec` sketch index otherwise (never calling external HTTP inside a lock).
+fn execute_workspace_search(
+  rf: ReadFiles,
+  auth: AuthContext,
+  query: Text,
+  limit: Int,
+  prefix_last?: Bool,
+  collection_filter: Option(Text),
+  raw_mode: Option(Text),
+  env: Env,
+  net: Network
+) : Result(WorkspaceSearchOutcome, AppError)
+  mode = try normalize_search_mode(raw_mode)
+  if not Policy.action_permitted?(auth, "read")
+    return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'read'"))
+  end
+  q = query.trim
+  if q.empty? or not rf.exists?(Db.ledger_db_path)
+    empty_backend = if mode == "bm25": "none" else: "sketch"
+    return Ok(WorkspaceSearchOutcome(results: [], mode: mode, vector_backend: empty_backend))
+  end
+
+  if mode == "bm25"
+    hits = try Ledger.read_locked(
+      rf,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      Db.map_ledger_error,
+      fn(db) Db.search_pages(Ledger.store(db), auth, q, limit, prefix_last?, collection_filter) end
+    )
+    return Ok(WorkspaceSearchOutcome(results: hits, mode: "bm25", vector_backend: "none"))
+  end
+
+  (qv_opt, vec_idx, backend_label, min_vec_score) = case embed_config(env)
+    None: (
+      Some(Vec.text_sketch_embedding(q, Db.sketch_vec_dims)),
+      Db.sketch_vec_index(),
+      "sketch",
+      Some(Db.sketch_min_vec_score)
+    )
+    Some(ecfg):
+      has_neural = try Ledger.read_locked(
+        rf,
+        Db.ledger_db_path,
+        Db.vellum_schema(),
+        Db.map_ledger_error,
+        fn(db) Db.neural_vec_populated(Ledger.store(db), ecfg.dimensions) end
+      )
+      if has_neural
+        case fetch_embedding(ecfg, q, net)
+          Ok(qv): (Some(qv), Db.neural_vec_index(ecfg.dimensions), "neural", Some(ecfg.min_score))
+          Error(_): (
+            Some(Vec.text_sketch_embedding(q, Db.sketch_vec_dims)),
+            Db.sketch_vec_index(),
+            "sketch",
+            Some(Db.sketch_min_vec_score)
+          )
+        end
+      else
+        (
+          Some(Vec.text_sketch_embedding(q, Db.sketch_vec_dims)),
+          Db.sketch_vec_index(),
+          "sketch",
+          Some(Db.sketch_min_vec_score)
+        )
+      end
+  end
+
+  hits = try Ledger.read_locked(
+    rf,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      Db.search_pages_hybrid(
+        Ledger.store(db),
+        auth,
+        q,
+        qv_opt,
+        vec_idx,
+        mode,
+        limit,
+        prefix_last?,
+        collection_filter,
+        min_vec_score
+      )
+    end
+  )
+  Ok(WorkspaceSearchOutcome(results: hits, mode: mode, vector_backend: backend_label))
+end
+
+## `POST /api/ai/ask` — Grant-filtered Hybrid (BM25 + `Modb.Vec`) context retrieval + LLM synthesis (JSON or SSE stream, `ReadFiles`-only).
 fn ask_workspace(
   req: Api.Request,
   auth: AuthContext,
@@ -217,7 +461,18 @@ fn ask_workspace(
     Some(_) | None: 5
   end
 
-  (citations, context_lines) = if not rf.exists?(Db.ledger_db_path)
+  search_out = try execute_workspace_search(
+    rf,
+    auth,
+    q,
+    max_src,
+    true,
+    input.collection_id,
+    Some("hybrid"),
+    env,
+    net
+  )
+  (citations, context_lines) = if search_out.results.empty? or not rf.exists?(Db.ledger_db_path)
     ([], [])
   else
     try Ledger.read_locked(
@@ -227,10 +482,9 @@ fn ask_workspace(
       Db.map_ledger_error,
       fn(db)
         store = Ledger.store(db)
-        hits = try Db.search_pages(store, auth, q, max_src, true, input.collection_id)
         var cites = []
         var ctx = []
-        for hit in hits
+        for hit in search_out.results
           blks = try Db.load_page_blocks(store, hit.page_id)
           first_blk = blks.first
           excerpt = case first_blk

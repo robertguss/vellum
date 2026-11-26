@@ -232,7 +232,7 @@ struct Attachment
   created_at: Time
 end
 
-## Grant-filtered full-text search hit returned by `/search`.
+## Grant-filtered search hit returned by `/api/search` and `/mcp` (`vellum.search`).
 struct SearchResultItem
   page_id: Text
   collection_id: Text
@@ -240,6 +240,9 @@ struct SearchResultItem
   score: Float
   matched_terms: List(Text)
   matched_fields: List(Text)
+  fts_rank: Option(Int)
+  vec_rank: Option(Int)
+  vec_score: Option(Float)
 end
 
 ## UI-ready summary of a `Modb.Ledger.AuditEntry` (`actor_name` avoids Mo's `actor` keyword).
