@@ -340,6 +340,8 @@ export interface ProposalMeta {
   world_id: string;
   collection_id: string;
   target_page_id: string;
+  target_database_id?: string | null;
+  branch_kind?: "proposal" | "scenario";
   title: string;
   reason: string;
   author_id: string;
@@ -356,6 +358,8 @@ export interface BlockDiffEntry {
   block_id: string;
   change: "added" | "removed" | "modified";
   rank: string;
+  page_id?: string;
+  page_title?: string | null;
   before_kind: BlockKind | null;
   after_kind: BlockKind | null;
   before_markdown: string | null;
@@ -369,11 +373,85 @@ export interface BucketDiffSummary {
   modified: number;
 }
 
+export interface PrincipalSummary {
+  id: string;
+  handle: string;
+  display_name: string;
+  kind: PrincipalKind;
+  role: WorkspaceRole;
+}
+
+export interface RelationTargetOption {
+  row_id: string;
+  page_id: string;
+  title: string;
+}
+
+export interface DecimalDelta {
+  database_id: string;
+  database_title: string;
+  prop_id: string;
+  prop_name: string;
+  format: string;
+  is_rollup: boolean;
+  live_total: string;
+  scenario_total: string;
+  delta: string;
+  changed: boolean;
+}
+
+export interface DbCellDiff {
+  prop_id: string;
+  prop_name: string;
+  before: CellValue;
+  after: CellValue;
+}
+
+export interface DbRowDiffEntry {
+  database_id: string;
+  database_title: string;
+  row_id: string;
+  page_id: string;
+  change: "added" | "modified" | "removed";
+  row_title: string;
+  cell_diffs: DbCellDiff[];
+}
+
+export interface DbSchemaDiffEntry {
+  database_id: string;
+  database_title: string;
+  prop_id: string;
+  prop_name: string;
+  change: "added" | "removed" | "modified";
+  before_kind: PropertyKind | null;
+  after_kind: PropertyKind | null;
+  before_required: boolean | null;
+  after_required: boolean | null;
+}
+
+export interface ScenarioQueryResponse {
+  proposal: ProposalMeta;
+  database: DatabaseDef;
+  query_result: ViewQueryResult;
+  deltas: DecimalDelta[];
+  row_changes: Record<string, "added" | "modified">;
+  removed_rows: EnrichedRow[];
+  live_row_count: number;
+  scenario_row_count: number;
+  schema_changed: boolean;
+  step_count: number;
+}
+
 export interface ProposalDiffResponse {
   proposal: ProposalMeta;
   page_title?: string | null;
+  database_title?: string | null;
   bucket_diffs: BucketDiffSummary[];
   block_diffs?: BlockDiffEntry[];
+  db_row_diffs?: DbRowDiffEntry[];
+  db_schema_diffs?: DbSchemaDiffEntry[];
+  rollup_deltas?: DecimalDelta[];
+  step_count?: number;
 }
 
 export interface WebhookSubPublic {

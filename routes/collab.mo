@@ -17,7 +17,10 @@ heartbeat_claim,
 release_claim,
 list_proposals,
 open_proposal,
+open_db_scenario,
 stage_proposal_ops,
+stage_proposal_mutation,
+query_db_scenario,
 diff_proposal,
 accept_proposal,
 reject_proposal,
@@ -34,9 +37,26 @@ use Arvo.Id
 use Arvo.Modb.Jobs
 use Arvo.Sse
 use Arvo.Webhooks
+use Date
 use Db
 use Domain.Blocks
-use Domain.Collab{ProposalMeta, WebhookJobPayload, WebhookSub, WorldPatchArgs}
+use Domain.Collab{
+  ProposalMeta,
+  WebhookJobPayload,
+  WebhookSub,
+  WorldBranchArgs,
+  WorldMutation,
+  WorldPatchArgs
+}
+use Domain.DatabaseModel{
+  CellValue,
+  DatabaseDef,
+  DbRow,
+  DbViewKind,
+  EnrichedRow,
+  PropertyDef,
+  ViewQueryResult
+}
 use Domain.Policy
 use Domain.Types{
   AgentToken,
@@ -60,6 +80,7 @@ use Modb.Replay
 use Modb.Table
 use Modb.World
 use Routes.Auth
+use Routes.Databases
 
 ## JSON payload for `POST /api/claims`.
 struct AcquireClaimInput
@@ -509,6 +530,8 @@ fn open_proposal(
     world_id: world_id,
     collection_id: page.collection_id,
     target_page_id: page.id,
+    target_database_id: None,
+    branch_kind: "proposal",
     title: clean_title,
     reason: clean_reason,
     author_id: auth.principal.id,
@@ -572,6 +595,151 @@ fn open_proposal(
       "proposal.opened",
       prop_payload
     ).with_sse_publish_json("page:#{saved.target_page_id}", "proposal.opened", prop_payload)
+  )
+end
+
+## `POST /api/databases/:id/scenarios` — Forks an isolated `Modb.World` What-If Scenario or Proposal anchored to a database.
+fn open_db_scenario(
+  req: Api.Request,
+  id: Text,
+  auth: AuthContext,
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  raw_json = case Json.parse(req.text or "")
+    Ok(j): j
+    Error(_): return Error(BadInput(reason: "invalid JSON body"))
+  end
+  case raw_json
+    Json.Object(_): Unit
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+      BadInput(reason: "expected JSON object")
+    )
+  end
+
+  clean_title = (raw_json.text_at("title") or "").trim
+  clean_reason = (raw_json.text_at("reason") or "").trim
+  if clean_title.empty? or clean_reason.empty?
+    return Error(BadInput(reason: "scenario title and reason must not be empty"))
+  end
+  branch_kind = case raw_json.get("branch_kind")
+    None | Some(Json.Null): "scenario"
+    Some(Json.String(k)):
+      tk = k.trim
+      if tk != "scenario" and tk != "proposal"
+        return Error(BadInput(reason: "branch_kind must be 'scenario' or 'proposal'"))
+      end
+      tk
+    Some(_): return Error(BadInput(reason: "invalid branch_kind"))
+  end
+
+  if not files.read_only.exists?(Db.ledger_db_path)
+    return Error(Missing(entity: "database", id: id))
+  end
+
+  (def, matching_subs) = try Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      found_def = case try Table.get(store, Db.databases_table(), id).map_error(Db.map_table_error)
+        Some(d): d
+        None: return Error(Missing(entity: "database", id: id))
+      end
+      try Policy.require_collection_access(auth, "propose", found_def.collection_id)
+      subs = try matching_webhooks_in_store(store, "proposal.opened", Some(found_def.collection_id))
+      Ok((found_def, subs))
+    end
+  )
+
+  now = clock.now
+  prop_id = "prop_#{Id.ulid(rng, clock)}"
+  world_id = "w_#{Id.ulid(rng, clock)}"
+  _wrec = try World.open_world_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    world_id,
+    auth.grant_id,
+    now,
+    now + 7.days
+  ).map_error(Db.map_world_error)
+
+  proposal = ProposalMeta(
+    id: prop_id,
+    world_id: world_id,
+    collection_id: def.collection_id,
+    target_page_id: def.page_id,
+    target_database_id: Some(def.id),
+    branch_kind: branch_kind,
+    title: clean_title,
+    reason: clean_reason,
+    author_id: auth.principal.id,
+    author_handle: auth.principal.handle,
+    grant_id: auth.grant_id,
+    status: "open",
+    created_at: now,
+    updated_at: now,
+    decided_by: None,
+    decided_at: None
+  )
+  hook_jobs = prepare_webhook_jobs(
+    matching_subs,
+    "proposal.opened",
+    Json.Object({"event": Json.String("proposal.opened"), "proposal": proposal.to_json}),
+    rng,
+    clock
+  )
+  meta = Ledger.WriteMeta(
+    principal: auth.principal.handle,
+    action: "scenario.open",
+    reason: clean_reason,
+    at: now
+  )
+  audit_payload = Json.Object({
+    "proposal_id": Json.String(prop_id),
+    "world_id": Json.String(world_id),
+    "database_id": Json.String(def.id)
+  })
+  saved = try Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    meta,
+    "opened #{branch_kind} #{prop_id} on database #{def.id}",
+    audit_payload,
+    Db.map_ledger_error,
+    fn(tx)
+      t1 = try tx_authorize_if_agent(tx, auth, "propose", now)
+      var cur = try Table.put(t1, Db.proposals_table(), proposal.id, proposal).map_error(
+        Db.map_table_error
+      )
+      for job_rec in hook_jobs
+        (next_tx, _jid) = try Jobs.tx_put(cur, job_rec).map_error(Db.map_table_error)
+        cur = next_tx
+      end
+      Ok((cur, proposal))
+    end
+  )
+  prop_payload = Json.Object({
+    "proposal_id": Json.String(saved.id),
+    "database_id": Json.String(def.id),
+    "page_id": Json.String(saved.target_page_id),
+    "collection_id": Json.String(saved.collection_id),
+    "branch_kind": Json.String(saved.branch_kind),
+    "title": Json.String(saved.title),
+    "actor": Json.String(auth.principal.handle)
+  })
+  Ok(
+    json_ok(201, saved.to_json).with_sse_publish_json(
+      "collection:#{saved.collection_id}",
+      "proposal.opened",
+      prop_payload
+    ).with_sse_publish_json("database:#{def.id}", "proposal.opened", prop_payload)
   )
 end
 
@@ -643,12 +811,702 @@ fn stage_proposal_ops(
   Ok(json_ok(200, Json.Object({"proposal": pm.to_json, "step_reply": step_reply})))
 end
 
+## `POST /api/proposals/:id/mutations` — Stages multi-resource page block patches or database row/schema mutations inside one `Modb.World` branch.
+fn stage_proposal_mutation(
+  req: Api.Request,
+  id: Text,
+  auth: AuthContext,
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  raw_json = case Json.parse(req.text or "")
+    Ok(j): j
+    Error(_): return Error(BadInput(reason: "invalid JSON body"))
+  end
+  case raw_json
+    Json.Object(_): Unit
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+      BadInput(reason: "expected JSON object")
+    )
+  end
+
+  kind = (raw_json.text_at("kind") or "").trim
+  clean_reason = (raw_json.text_at("reason") or "").trim
+  if kind.empty? or clean_reason.empty?
+    return Error(BadInput(reason: "kind and non-empty reason are required"))
+  end
+  if not files.read_only.exists?(Db.ledger_db_path)
+    return Error(Missing(entity: "proposal", id: id))
+  end
+
+  pm = try Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      found = case try Table.get(Ledger.store(db), Db.proposals_table(), id).map_error(
+        Db.map_table_error
+      )
+        Some(p): p
+        None: return Error(Missing(entity: "proposal", id: id))
+      end
+      try Policy.require_collection_access(auth, "propose", found.collection_id)
+      Ok(found)
+    end
+  )
+  if pm.status != "open"
+    return Error(Conflict(reason: "proposal '#{id}' is '#{pm.status}', not 'open'"))
+  end
+  is_admin? = auth.principal.role == Owner or auth.principal.role == Admin
+  if pm.author_id != auth.principal.id and not is_admin?
+    return Error(Forbidden(reason: "only the proposal author or admin may stage mutations"))
+  end
+
+  now = clock.now
+  prov = make_provenance(auth, Some(clean_reason), now)
+
+  (mut, sse_col_id, sse_page_id, sse_db_id) = if kind == "page_patch"
+    pid = case raw_json.text_at("page_id")
+      Some(s) if not s.trim.empty?: s.trim
+      Some(_) | None: pm.target_page_id
+    end
+    ops_json = try raw_json.get("ops").or_fail(BadInput(reason: "ops required for page_patch"))
+    ops = try Json.decode_strict[List(BlockOp)](ops_json.to_text.bytes).map_error(fn(e)
+      BadInput(reason: "invalid ops: #{e.to_text}")
+    end)
+    if ops.empty?
+      return Error(BadInput(reason: "ops must not be empty"))
+    end
+    exp_vers = case raw_json.get("expected_versions")
+      None | Some(Json.Null): {}
+      Some(evj): try Json.decode_strict[Map(Text, Int)](evj.to_text.bytes).map_error(fn(e)
+        BadInput(reason: "invalid expected_versions: #{e.to_text}")
+      end)
+    end
+    pg = try Ledger.read_locked(
+      files.read_only,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      Db.map_ledger_error,
+      fn(db)
+        found_pg = case try Table.get(Ledger.store(db), Db.pages_table(), pid).map_error(
+          Db.map_table_error
+        )
+          Some(p) if p.archived_at == None: p
+          Some(_) | None: return Error(Missing(entity: "page", id: pid))
+        end
+        try Policy.require_collection_access(auth, "propose", found_pg.collection_id)
+        Ok(found_pg)
+      end
+    )
+    new_ids = generate_insert_block_ids(ops, rng, clock)
+    (
+      PatchPageBlocks(
+        page_id: pg.id,
+        ops: ops,
+        new_ids: new_ids,
+        provenance: prov,
+        expected_versions: exp_vers
+      ),
+      pg.collection_id,
+      Some(pg.id),
+      pm.target_database_id
+    )
+  else
+    did_raw = case raw_json.text_at("database_id")
+      Some(s) if not s.trim.empty?: s.trim
+      Some(_) | None:
+        case pm.target_database_id
+          Some(d) if not d.trim.empty?: d.trim
+          Some(_) | None: return Error(BadInput(reason: "database_id required for #{kind}"))
+        end
+    end
+    def = try Ledger.read_locked(
+      files.read_only,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      Db.map_ledger_error,
+      fn(db)
+        found_def = case try Table.get(Ledger.store(db), Db.databases_table(), did_raw).map_error(
+          Db.map_table_error
+        )
+          Some(d): d
+          None: return Error(Missing(entity: "database", id: did_raw))
+        end
+        try Policy.require_collection_access(auth, "propose", found_def.collection_id)
+        Ok(found_def)
+      end
+    )
+    if kind == "db_row_create"
+      cells_json = try raw_json.get("cells").or_fail(
+        BadInput(reason: "cells required for db_row_create")
+      )
+      cells = try Json.decode_strict[Map(Text, CellValue)](cells_json.to_text.bytes).map_error(fn(
+        e
+      )
+        BadInput(reason: "invalid cells: #{e.to_text}")
+      end)
+      md_opt = raw_json.text_at("markdown")
+      new_row_id = "row_#{Id.ulid(rng, clock)}"
+      new_page_id = "pg_#{Id.ulid(rng, clock)}"
+      blk_pref = "blk_#{Id.ulid(rng, clock)}"
+      (
+        CreateDbRow(
+          database_id: def.id,
+          row_id: new_row_id,
+          page_id: new_page_id,
+          cells: cells,
+          markdown: md_opt,
+          block_prefix: blk_pref,
+          provenance: prov
+        ),
+        def.collection_id,
+        None,
+        Some(def.id)
+      )
+    else if kind == "db_row_update"
+      rid = (raw_json.text_at("row_id") or "").trim
+      if rid.empty?
+        return Error(BadInput(reason: "row_id required for db_row_update"))
+      end
+      cells_json = try raw_json.get("cells").or_fail(
+        BadInput(reason: "cells required for db_row_update")
+      )
+      cells = try Json.decode_strict[Map(Text, CellValue)](cells_json.to_text.bytes).map_error(fn(
+        e
+      )
+        BadInput(reason: "invalid cells: #{e.to_text}")
+      end)
+      exp_ver = raw_json.int_at("expected_version")
+      (
+        UpdateDbRow(
+          database_id: def.id,
+          row_id: rid,
+          cells: cells,
+          expected_version: exp_ver,
+          provenance: prov
+        ),
+        def.collection_id,
+        None,
+        Some(def.id)
+      )
+    else if kind == "db_row_delete"
+      rid = (raw_json.text_at("row_id") or "").trim
+      if rid.empty?
+        return Error(BadInput(reason: "row_id required for db_row_delete"))
+      end
+      (DeleteDbRow(database_id: def.id, row_id: rid), def.collection_id, None, Some(def.id))
+    else if kind == "db_schema_update"
+      title_opt = case raw_json.get("title")
+        None | Some(Json.Null): None
+        Some(Json.String(s)): Some(s)
+        Some(_): return Error(BadInput(reason: "invalid schema title"))
+      end
+      desc_opt = case raw_json.get("description")
+        None | Some(Json.Null): None
+        Some(Json.String(s)): Some(s)
+        Some(_): return Error(BadInput(reason: "invalid schema description"))
+      end
+      props_opt = case raw_json.get("properties")
+        None | Some(Json.Null): None
+        Some(pj): Some(
+          try Json.decode_strict[List(PropertyDef)](pj.to_text.bytes).map_error(fn(e)
+            BadInput(reason: "invalid schema properties: #{e.to_text}")
+          end)
+        )
+      end
+      exp_ver = raw_json.int_at("expected_version")
+      (
+        UpdateDbSchema(
+          database_id: def.id,
+          title: title_opt,
+          description: desc_opt,
+          properties: props_opt,
+          expected_version: exp_ver
+        ),
+        def.collection_id,
+        None,
+        Some(def.id)
+      )
+    else
+      return Error(BadInput(reason: "unsupported mutation kind '#{kind}'"))
+    end
+  end
+
+  bargs = WorldBranchArgs(mutation: mut, updated_at: now)
+  step_reply = try World.world_call_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.world_catalog(),
+    pm.world_id,
+    "propose",
+    bargs.to_json,
+    clean_reason,
+    now
+  ).map_error(Db.map_world_error)
+
+  upd_ev = Json.Object({
+    "proposal_id": Json.String(pm.id),
+    "kind": Json.String(kind),
+    "actor": Json.String(auth.principal.handle)
+  })
+  var res = json_ok(200, Json.Object({"proposal": pm.to_json, "step_reply": step_reply}))
+    .with_sse_publish_json("collection:#{sse_col_id}", "proposal.updated", upd_ev)
+  case sse_page_id
+    Some(pid): res = res.with_sse_publish_json("page:#{pid}", "proposal.updated", upd_ev)
+    None: Unit
+  end
+  case sse_db_id
+    Some(did): res = res.with_sse_publish_json("database:#{did}", "proposal.updated", upd_ev)
+    None: Unit
+  end
+  Ok(res)
+end
+
+## `POST /api/databases/:id/scenarios/:proposal_id/query` — Evaluates a live query against a forked Scenario branch with exact `Decimal` deltas (`ReadFiles`-only).
+fn query_db_scenario(
+  req: Api.Request,
+  id: Text,
+  proposal_id: Text,
+  auth: AuthContext,
+  input: Databases.QueryDatabaseInput,
+  rf: ReadFiles
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  from_d = case input.from_date
+    Some(s) if not s.trim.empty?:
+      case Date.parse_iso(s.trim)
+        Some(d): Some(d)
+        None: return Error(BadInput(reason: "invalid ISO from_date '#{s}'"))
+      end
+    Some(_) | None: None
+  end
+  to_d = case input.to_date
+    Some(s) if not s.trim.empty?:
+      case Date.parse_iso(s.trim)
+        Some(d): Some(d)
+        None: return Error(BadInput(reason: "invalid ISO to_date '#{s}'"))
+      end
+    Some(_) | None: None
+  end
+  if not rf.exists?(Db.ledger_db_path)
+    return Error(Missing(entity: "database", id: id))
+  end
+
+  read_act = if Policy.action_permitted?(auth, "query_db")
+    "query_db"
+  else
+    "read"
+  end
+
+  body_json = try Ledger.read_locked(
+    rf,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      live_def = case try Table.get(store, Db.databases_table(), id).map_error(Db.map_table_error)
+        Some(d): d
+        None: return Error(Missing(entity: "database", id: id))
+      end
+      pm = case try Table.get(store, Db.proposals_table(), proposal_id).map_error(
+        Db.map_table_error
+      )
+        Some(p): p
+        None: return Error(Missing(entity: "proposal", id: proposal_id))
+      end
+      try Policy.require_collection_access(auth, read_act, live_def.collection_id)
+      try Policy.require_collection_access(auth, read_act, pm.collection_id)
+      if pm.status != "open"
+        return Error(Conflict(reason: "scenario '#{proposal_id}' is '#{pm.status}', not 'open'"))
+      end
+      world = case try World.get_world(store, pm.world_id).map_error(Db.map_world_error)
+        Some(w): w
+        None: return Error(Missing(entity: "world", id: pm.world_id))
+      end
+
+      (_base_tx, spec_tx) = try Db.materialize_world_tx(store, world)
+
+      live_pairs = try Table.lookup(store, Db.db_rows_table(), Db.db_rows_by_database(), live_def.id)
+        .map_error(Db.map_table_error)
+      var live_rows = []
+      var live_by_id = {}
+      for (_rid, r) in live_pairs
+        if r.archived_at == None
+          live_rows = live_rows.append(r)
+          live_by_id = live_by_id.set(r.id, r)
+        end
+      end
+      live_enriched = try Db.enrich_rows_with_rollups(store, live_def, live_rows)
+
+      spec_def = case try Table.tx_get(spec_tx, Db.databases_table(), id).map_error(
+        Db.map_table_error
+      )
+        Some(d): d
+        None: return Error(Missing(entity: "database", id: id))
+      end
+      spec_pairs = try Table.tx_lookup(
+        spec_tx,
+        Db.db_rows_table(),
+        Db.db_rows_by_database(),
+        spec_def.id
+      ).map_error(Db.map_table_error)
+      var spec_rows = []
+      var spec_id_set = Set.empty
+      for (_rid, r) in spec_pairs
+        if r.archived_at == None
+          spec_rows = spec_rows.append(r)
+          spec_id_set = spec_id_set.add(r.id)
+        end
+      end
+      spec_enriched = try Db.tx_enrich_rows_with_rollups(spec_tx, spec_def, spec_rows)
+
+      var row_changes_map = {}
+      for sr in spec_rows
+        case live_by_id.get(sr.id)
+          None: row_changes_map = row_changes_map.set(sr.id, Json.String("added"))
+          Some(lr):
+            if lr.cells != sr.cells
+              row_changes_map = row_changes_map.set(sr.id, Json.String("modified"))
+            end
+        end
+      end
+      removed_rows = live_enriched.filter(fn(er) not spec_id_set.has?(er.row.id) end)
+      deltas = Db.compute_db_decimal_deltas(spec_def, live_enriched, spec_enriched)
+
+      view_opt = case input.view_id
+        None: None
+        Some(vid):
+          found = case try Table.tx_get(spec_tx, Db.db_views_table(), vid).map_error(
+            Db.map_table_error
+          )
+            Some(v) if v.database_id == spec_def.id: v
+            Some(_) | None: return Error(Missing(entity: "db_view", id: vid))
+          end
+          Some(found)
+      end
+
+      filters = if not input.filters.empty?
+        input.filters
+      else
+        case view_opt
+          Some(v): v.filters
+          None: []
+        end
+      end
+      match_all? = case input.filter_match_all
+        Some(b): b
+        None:
+          case view_opt
+            Some(v): v.filter_match_all
+            None: true
+          end
+      end
+      sorts = if not input.sorts.empty?
+        input.sorts
+      else
+        case view_opt
+          Some(v): v.sorts
+          None: []
+        end
+      end
+
+      filtered = spec_enriched.filter(fn(er)
+        DatabaseModel.matches_filters?(er, filters, match_all?)
+      end)
+      sorted = DatabaseModel.sort_enriched_rows(filtered, sorts)
+
+      (final_rows, board_groups) = case view_opt
+        Some(v):
+          case v.kind
+            TableView(visible_prop_ids: _, column_widths: _): (sorted, None)
+            BoardView(group_by_prop_id: gb_id, card_prop_ids: _, hide_empty_groups: hide_empty):
+              groups = DatabaseModel.group_rows_for_board(spec_def, sorted, gb_id, hide_empty)
+              (sorted, Some(groups))
+            CalendarView(date_prop_id: dp_id, card_prop_ids: _):
+              ranged = DatabaseModel.filter_calendar_range(sorted, dp_id, from_d, to_d)
+              (ranged, None)
+          end
+        None: (sorted, None)
+      end
+
+      qres = ViewQueryResult(
+        view: view_opt,
+        rows: final_rows,
+        board_groups: board_groups,
+        total_count: final_rows.size
+      )
+      schema_changed = spec_def.properties != live_def.properties or
+        spec_def.title != live_def.title or
+        spec_def.description != live_def.description
+
+      Ok(
+        Json.Object({
+          "proposal": pm.to_json,
+          "database": spec_def.to_json,
+          "query_result": qres.to_json,
+          "deltas": deltas.to_json,
+          "row_changes": Json.Object(row_changes_map),
+          "removed_rows": removed_rows.to_json,
+          "live_row_count": Json.int(live_enriched.size),
+          "scenario_row_count": Json.int(spec_enriched.size),
+          "schema_changed": Json.Boolean(schema_changed),
+          "step_count": Json.int(world.steps.size)
+        })
+      )
+    end
+  )
+  Ok(json_ok(200, body_json))
+end
+
+fn load_active_rows_tx(tx: WriteTx, db_id: Text) : Result(List(DbRow), AppError)
+  pairs = try Table.tx_lookup(tx, Db.db_rows_table(), Db.db_rows_by_database(), db_id).map_error(
+    Db.map_table_error
+  )
+  var out = []
+  for (_rid, r) in pairs
+    if r.archived_at == None
+      out = out.append(r)
+    end
+  end
+  Ok(out)
+end
+
+fn compute_db_schema_diffs(did: Text, base_opt: Option(DatabaseDef), spec_opt: Option(DatabaseDef)) : List(
+  Json
+)
+  case (base_opt, spec_opt)
+    (Some(bdef), Some(sdef)):
+      var base_props = {}
+      for p in bdef.properties
+        base_props = base_props.set(p.id, p)
+      end
+      var spec_props = {}
+      for p in sdef.properties
+        spec_props = spec_props.set(p.id, p)
+      end
+      var diffs = []
+      for p in bdef.properties
+        case spec_props.get(p.id)
+          None: diffs = diffs.append(
+            Json.Object({
+              "database_id": Json.String(did),
+              "database_title": Json.String(sdef.title),
+              "prop_id": Json.String(p.id),
+              "prop_name": Json.String(p.name),
+              "change": Json.String("removed"),
+              "before_kind": p.kind.to_json,
+              "after_kind": Json.Null,
+              "before_required": Json.Boolean(p.required),
+              "after_required": Json.Null
+            })
+          )
+          Some(np):
+            if np != p
+              diffs = diffs.append(
+                Json.Object({
+                  "database_id": Json.String(did),
+                  "database_title": Json.String(sdef.title),
+                  "prop_id": Json.String(p.id),
+                  "prop_name": Json.String(np.name),
+                  "change": Json.String("modified"),
+                  "before_kind": p.kind.to_json,
+                  "after_kind": np.kind.to_json,
+                  "before_required": Json.Boolean(p.required),
+                  "after_required": Json.Boolean(np.required)
+                })
+              )
+            end
+        end
+      end
+      for np in sdef.properties
+        if base_props.get(np.id) == None
+          diffs = diffs.append(
+            Json.Object({
+              "database_id": Json.String(did),
+              "database_title": Json.String(sdef.title),
+              "prop_id": Json.String(np.id),
+              "prop_name": Json.String(np.name),
+              "change": Json.String("added"),
+              "before_kind": Json.Null,
+              "after_kind": np.kind.to_json,
+              "before_required": Json.Null,
+              "after_required": Json.Boolean(np.required)
+            })
+          )
+        end
+      end
+      diffs
+    (_, _): []
+  end
+end
+
+fn union_props(base_opt: Option(DatabaseDef), spec_opt: Option(DatabaseDef)) : List(PropertyDef)
+  var out = []
+  var seen = Set.empty
+  case spec_opt
+    Some(sdef):
+      for p in sdef.properties
+        if not seen.has?(p.id)
+          seen = seen.add(p.id)
+          out = out.append(p)
+        end
+      end
+    None: Unit
+  end
+  case base_opt
+    Some(bdef):
+      for p in bdef.properties
+        if not seen.has?(p.id)
+          seen = seen.add(p.id)
+          out = out.append(p)
+        end
+      end
+    None: Unit
+  end
+  out
+end
+
+fn compute_db_row_diffs(
+  did: Text,
+  base_opt: Option(DatabaseDef),
+  spec_opt: Option(DatabaseDef),
+  base_enr: List(EnrichedRow),
+  spec_enr: List(EnrichedRow)
+) : List(Json)
+  eff_def = case spec_opt
+    Some(s): s
+    None:
+      case base_opt
+        Some(b): b
+        None: return []
+      end
+  end
+  db_title = eff_def.title
+  all_props = union_props(base_opt, spec_opt)
+  var base_map = {}
+  for er in base_enr
+    base_map = base_map.set(er.row.id, er)
+  end
+  var spec_map = {}
+  for er in spec_enr
+    spec_map = spec_map.set(er.row.id, er)
+  end
+  empty_val = Empty
+
+  var diffs = []
+  for ber in base_enr
+    rid = ber.row.id
+    case spec_map.get(rid)
+      None:
+        var cell_diffs = []
+        for p in all_props
+          bv = DatabaseModel.effective_cell(ber, p.id)
+          if bv != empty_val
+            cell_diffs = cell_diffs.append(
+              Json.Object({
+                "prop_id": Json.String(p.id),
+                "prop_name": Json.String(p.name),
+                "before": bv.to_json,
+                "after": empty_val.to_json
+              })
+            )
+          end
+        end
+        row_title = case base_opt
+          Some(bd): DatabaseModel.extract_row_title(bd, ber.row.cells)
+          None: rid
+        end
+        diffs = diffs.append(
+          Json.Object({
+            "database_id": Json.String(did),
+            "database_title": Json.String(db_title),
+            "row_id": Json.String(rid),
+            "page_id": Json.String(ber.row.page_id),
+            "change": Json.String("removed"),
+            "row_title": Json.String(row_title),
+            "cell_diffs": Json.Array(cell_diffs)
+          })
+        )
+      Some(ser):
+        var cell_diffs = []
+        for p in all_props
+          bv = DatabaseModel.effective_cell(ber, p.id)
+          av = DatabaseModel.effective_cell(ser, p.id)
+          if bv != av
+            cell_diffs = cell_diffs.append(
+              Json.Object({
+                "prop_id": Json.String(p.id),
+                "prop_name": Json.String(p.name),
+                "before": bv.to_json,
+                "after": av.to_json
+              })
+            )
+          end
+        end
+        if not cell_diffs.empty?
+          row_title = DatabaseModel.extract_row_title(eff_def, ser.row.cells)
+          diffs = diffs.append(
+            Json.Object({
+              "database_id": Json.String(did),
+              "database_title": Json.String(db_title),
+              "row_id": Json.String(rid),
+              "page_id": Json.String(ser.row.page_id),
+              "change": Json.String("modified"),
+              "row_title": Json.String(row_title),
+              "cell_diffs": Json.Array(cell_diffs)
+            })
+          )
+        end
+    end
+  end
+  for ser in spec_enr
+    rid = ser.row.id
+    if base_map.get(rid) == None
+      var cell_diffs = []
+      for p in all_props
+        av = DatabaseModel.effective_cell(ser, p.id)
+        if av != empty_val
+          cell_diffs = cell_diffs.append(
+            Json.Object({
+              "prop_id": Json.String(p.id),
+              "prop_name": Json.String(p.name),
+              "before": empty_val.to_json,
+              "after": av.to_json
+            })
+          )
+        end
+      end
+      row_title = DatabaseModel.extract_row_title(eff_def, ser.row.cells)
+      diffs = diffs.append(
+        Json.Object({
+          "database_id": Json.String(did),
+          "database_title": Json.String(db_title),
+          "row_id": Json.String(rid),
+          "page_id": Json.String(ser.row.page_id),
+          "change": Json.String("added"),
+          "row_title": Json.String(row_title),
+          "cell_diffs": Json.Array(cell_diffs)
+        })
+      )
+    end
+  end
+  diffs
+end
+
 fn block_diff_json(
   block_id: Text,
   change: Text,
   rank: Text,
   before_blk: Option(Block),
-  after_blk: Option(Block)
+  after_blk: Option(Block),
+  page_id: Text,
+  page_title: Option(Text)
 ) : Json
   before_kind_json = case before_blk
     Some(b): b.kind.to_json
@@ -666,10 +1524,16 @@ fn block_diff_json(
     Some(b): Json.String(b.markdown)
     None: Json.Null
   end
+  pt_json = case page_title
+    Some(t): Json.String(t)
+    None: Json.Null
+  end
   Json.Object({
     "block_id": Json.String(block_id),
     "change": Json.String(change),
     "rank": Json.String(rank),
+    "page_id": Json.String(page_id),
+    "page_title": pt_json,
     "before_kind": before_kind_json,
     "after_kind": after_kind_json,
     "before_markdown": before_md_json,
@@ -677,7 +1541,12 @@ fn block_diff_json(
   })
 end
 
-fn compute_block_diffs(before_blocks: List(Block), after_blocks: List(Block)) : List(Json)
+fn compute_block_diffs(
+  before_blocks: List(Block),
+  after_blocks: List(Block),
+  page_id: Text,
+  page_title: Option(Text)
+) : List(Json)
   var before_map = {}
   for b in before_blocks
     before_map = before_map.set(b.id, b)
@@ -691,7 +1560,11 @@ fn compute_block_diffs(before_blocks: List(Block), after_blocks: List(Block)) : 
     case after_map.get(old_b.id)
       None:
         entries = entries.append(
-          (old_b.rank, old_b.id, block_diff_json(old_b.id, "removed", old_b.rank, Some(old_b), None))
+          (
+            old_b.rank,
+            old_b.id,
+            block_diff_json(old_b.id, "removed", old_b.rank, Some(old_b), None, page_id, page_title)
+          )
         )
       Some(cur_b):
         if old_b.markdown != cur_b.markdown or old_b.kind != cur_b.kind
@@ -699,7 +1572,15 @@ fn compute_block_diffs(before_blocks: List(Block), after_blocks: List(Block)) : 
             (
               cur_b.rank,
               cur_b.id,
-              block_diff_json(cur_b.id, "modified", cur_b.rank, Some(old_b), Some(cur_b))
+              block_diff_json(
+                cur_b.id,
+                "modified",
+                cur_b.rank,
+                Some(old_b),
+                Some(cur_b),
+                page_id,
+                page_title
+              )
             )
           )
         end
@@ -708,19 +1589,23 @@ fn compute_block_diffs(before_blocks: List(Block), after_blocks: List(Block)) : 
   for cur_b in after_blocks
     if before_map.get(cur_b.id) == None
       entries = entries.append(
-        (cur_b.rank, cur_b.id, block_diff_json(cur_b.id, "added", cur_b.rank, None, Some(cur_b)))
+        (
+          cur_b.rank,
+          cur_b.id,
+          block_diff_json(cur_b.id, "added", cur_b.rank, None, Some(cur_b), page_id, page_title)
+        )
       )
     end
   end
   entries.sort_by(fn(e) e.1 end).sort_by(fn(e) e.0 end).map(fn(e) e.2 end)
 end
 
-## `GET /api/proposals/:id/diff` — Inspects structural CoW diffs and human-readable block diffs inside a proposal's `Modb.World` (`ReadFiles`-only).
+## `GET /api/proposals/:id/diff` — Inspects structural CoW diffs plus multi-page block diffs and DB row/schema/rollup diffs (`ReadFiles`-only).
 fn diff_proposal(id: Text, auth: AuthContext, rf: ReadFiles) : Result(Api.Response, AppError)
   if not rf.exists?(Db.ledger_db_path)
     return Error(Missing(entity: "proposal", id: id))
   end
-  (pm, page_title_opt, diffs, block_diffs) = try Ledger.read_locked(
+  payload = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -736,73 +1621,155 @@ fn diff_proposal(id: Text, auth: AuthContext, rf: ReadFiles) : Result(Api.Respon
       page_opt = try Table.get(store, Db.pages_table(), found.target_page_id).map_error(
         Db.map_table_error
       )
-      page_title_opt = page_opt.map(fn(p) p.title end)
+      page_title_json = case page_opt.map(fn(p) p.title end)
+        Some(t): Json.String(t)
+        None: Json.Null
+      end
+      db_title_json = case found.target_database_id
+        Some(did):
+          case try Table.get(store, Db.databases_table(), did).map_error(Db.map_table_error)
+            Some(d): Json.String(d.title)
+            None: Json.Null
+          end
+        None: Json.Null
+      end
+
+      world_opt = try World.get_world(store, found.world_id).map_error(Db.map_world_error)
+      step_count = case world_opt
+        Some(w): w.steps.size
+        None: 0
+      end
+
+      if found.status != "open"
+        return Ok(
+          Json.Object({
+            "proposal": found.to_json,
+            "page_title": page_title_json,
+            "database_title": db_title_json,
+            "bucket_diffs": Json.Array([]),
+            "block_diffs": Json.Array([]),
+            "db_row_diffs": Json.Array([]),
+            "db_schema_diffs": Json.Array([]),
+            "rollup_deltas": Json.Array([]),
+            "step_count": Json.int(step_count)
+          })
+        )
+      end
 
       diffs = try World.world_diff(db, Db.world_catalog(), found.world_id).map_error(
         Db.map_world_error
       )
-
-      block_diffs = case try World.get_world(store, found.world_id).map_error(Db.map_world_error)
-        None: []
+      (block_diffs, db_row_diffs, db_schema_diffs, rollup_deltas) = case world_opt
+        None: ([], [], [], [])
         Some(world):
-          before_blocks = case Modb.get_pin(store, world.base_pin_id)
-            Ok(Some(pin)):
-              base_tx = Modb.begin_write_from_root(store, pin.catalog_root)
-              base_rows = try Table.tx_lookup(
-                base_tx,
-                Db.blocks_table(),
-                Db.blocks_by_page(),
-                found.target_page_id
-              ).map_error(Db.map_table_error)
-              Blocks.sort_blocks(base_rows.map(fn(x) x.1 end))
-            Ok(None) | Error(_): try Db.load_page_blocks(store, found.target_page_id)
-          end
-          var after_blocks = before_blocks
-          for step in world.steps
-            case step
-              World.ReadStep(query: _, args: _, answer_hash: _, answer: _): Unit
-              World.CallStep(action: act_name, args: args_json, reason: _):
-                if act_name == "propose"
-                  case Json.decode_strict[WorldPatchArgs](args_json.to_text.bytes)
-                    Ok(parsed):
-                      if parsed.page_id == found.target_page_id
-                        case Blocks.apply_block_ops(
-                          after_blocks,
-                          parsed.ops,
-                          parsed.page_id,
-                          parsed.provenance,
-                          parsed.new_ids
-                        )
-                          Ok(next_blocks): after_blocks = next_blocks
-                          Error(_): Unit
-                        end
-                      end
-                    Error(_): Unit
-                  end
-                end
+          (base_tx, spec_tx) = try Db.materialize_world_tx(store, world)
+          (touched_pages, touched_dbs) = Db.world_touched_resources(
+            world,
+            found.target_page_id,
+            found.target_database_id
+          )
+
+          var all_bdiffs = []
+          for pid in touched_pages
+            pg_base = try Table.tx_get(base_tx, Db.pages_table(), pid).map_error(Db.map_table_error)
+            pg_spec = try Table.tx_get(spec_tx, Db.pages_table(), pid).map_error(Db.map_table_error)
+            ptitle = case pg_spec
+              Some(p): Some(p.title)
+              None: pg_base.map(fn(p) p.title end)
+            end
+            brows_before = try Table.tx_lookup(
+              base_tx,
+              Db.blocks_table(),
+              Db.blocks_by_page(),
+              pid
+            ).map_error(Db.map_table_error)
+            brows_after = try Table.tx_lookup(
+              spec_tx,
+              Db.blocks_table(),
+              Db.blocks_by_page(),
+              pid
+            ).map_error(Db.map_table_error)
+            b_before = Blocks.sort_blocks(brows_before.map(fn(x) x.1 end))
+            b_after = Blocks.sort_blocks(brows_after.map(fn(x) x.1 end))
+            for bd in compute_block_diffs(b_before, b_after, pid, ptitle)
+              all_bdiffs = all_bdiffs.append(bd)
             end
           end
-          compute_block_diffs(before_blocks, after_blocks)
+
+          var all_rdiffs = []
+          var all_sdiffs = []
+          var all_deltas = []
+          for did in touched_dbs
+            base_def_opt = try Table.tx_get(base_tx, Db.databases_table(), did).map_error(
+              Db.map_table_error
+            )
+            spec_def_opt = try Table.tx_get(spec_tx, Db.databases_table(), did).map_error(
+              Db.map_table_error
+            )
+            for sd in compute_db_schema_diffs(did, base_def_opt, spec_def_opt)
+              all_sdiffs = all_sdiffs.append(sd)
+            end
+            base_enr = case base_def_opt
+              Some(bdef):
+                brows = try load_active_rows_tx(base_tx, did)
+                try Db.tx_enrich_rows_with_rollups(base_tx, bdef, brows)
+              None: []
+            end
+            spec_enr = case spec_def_opt
+              Some(sdef):
+                srows = try load_active_rows_tx(spec_tx, did)
+                try Db.tx_enrich_rows_with_rollups(spec_tx, sdef, srows)
+              None: []
+            end
+            for rd in compute_db_row_diffs(did, base_def_opt, spec_def_opt, base_enr, spec_enr)
+              all_rdiffs = all_rdiffs.append(rd)
+            end
+            case spec_def_opt
+              Some(eff):
+                for dd in Db.compute_db_decimal_deltas(eff, base_enr, spec_enr)
+                  all_deltas = all_deltas.append(dd)
+                end
+              None: Unit
+            end
+          end
+
+          (all_bdiffs, all_rdiffs, all_sdiffs, all_deltas)
       end
 
-      Ok((found, page_title_opt, diffs, block_diffs))
+      Ok(
+        Json.Object({
+          "proposal": found.to_json,
+          "page_title": page_title_json,
+          "database_title": db_title_json,
+          "bucket_diffs": diffs.to_json,
+          "block_diffs": Json.Array(block_diffs),
+          "db_row_diffs": Json.Array(db_row_diffs),
+          "db_schema_diffs": Json.Array(db_schema_diffs),
+          "rollup_deltas": rollup_deltas.to_json,
+          "step_count": Json.int(step_count)
+        })
+      )
     end
   )
-  page_title_json = case page_title_opt
-    Some(t): Json.String(t)
-    None: Json.Null
+  Ok(json_ok(200, payload))
+end
+
+fn map_land_world_error(err: World.WorldError) : AppError
+  case err
+    World.ActionRejected(action: _, detail: d):
+      if d.contains?("version mismatch")
+        Conflict(reason: err.to_text)
+      else
+        Db.map_world_error(err)
+      end
+    World.LedgerFailure(_) | World.GrantFailure(_) | World.WorldNotFound(id: _) | World
+      .WorldAlreadyExists(id: _) | World.WorldNotOpen(id: _, status: _) | World.WorldExpired(id: _) | World
+      .UnknownQuery(name: _) | World.UnknownAction(name: _) | World.QueryFailed(query: _, detail: _) | World
+      .StaleRead(query: _, args: _, expected: _, actual: _) | World.InvariantRejected(
+        name: _,
+        detail: _
+      ): Db.map_world_error(err)
   end
-  Ok(
-    json_ok(
-      200,
-      Json.Object({
-        "proposal": pm.to_json,
-        "page_title": page_title_json,
-        "bucket_diffs": diffs.to_json,
-        "block_diffs": Json.Array(block_diffs)
-      })
-    )
-  )
 end
 
 ## `POST /api/proposals/:id/accept` — Validates & atomically lands a `Modb.World` proposal onto the live workspace.
@@ -833,7 +1800,7 @@ fn accept_proposal(
     "write_direct"
   end
 
-  (pm, col, matching_subs) = try Ledger.read_locked(
+  (pm, col, matching_subs, touched_pages, touched_dbs, touches_schema?) = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -851,8 +1818,75 @@ fn accept_proposal(
         Some(col_rec): col_rec
         None: return Error(Missing(entity: "collection", id: found.collection_id))
       end
+
+      (t_pages, t_dbs, t_schema?) = case try World.get_world(store, found.world_id).map_error(
+        Db.map_world_error
+      )
+        Some(w):
+          (ps, ds) = Db.world_touched_resources(w, found.target_page_id, found.target_database_id)
+          (ps, ds, Db.world_touches_schema?(w))
+        None: ([found.target_page_id], [], false)
+      end
+
+      if t_schema? and not Policy.action_permitted?(auth, "manage_schema")
+        return Error(
+          Forbidden(
+            reason: "grant '#{auth.grant_id}' does not permit 'manage_schema' required to land schema changes"
+          )
+        )
+      end
+
+      for pid in t_pages
+        case try Table.get(store, Db.pages_table(), pid).map_error(Db.map_table_error)
+          Some(pg):
+            try Policy.require_collection_access(auth, accept_act, pg.collection_id)
+            case try Table.get(store, Db.collections_table(), pg.collection_id).map_error(
+              Db.map_table_error
+            )
+              Some(pcol):
+                if pcol.write_policy != DirectWithAudit and auth.principal.kind != Human
+                  return Error(
+                    Forbidden(
+                      reason: "collection '#{pcol.slug}' write policy requires a Human reviewer to accept proposals"
+                    )
+                  )
+                end
+              None: return Error(Missing(entity: "collection", id: pg.collection_id))
+            end
+          None: Unit
+        end
+      end
+
+      for did in t_dbs
+        db_req_act = if t_schema?
+          "manage_schema"
+        else if Policy.action_permitted?(auth, "write_db")
+          "write_db"
+        else
+          accept_act
+        end
+        case try Table.get(store, Db.databases_table(), did).map_error(Db.map_table_error)
+          Some(ddef):
+            try Policy.require_collection_access(auth, db_req_act, ddef.collection_id)
+            case try Table.get(store, Db.collections_table(), ddef.collection_id).map_error(
+              Db.map_table_error
+            )
+              Some(dcol):
+                if dcol.write_policy != DirectWithAudit and auth.principal.kind != Human
+                  return Error(
+                    Forbidden(
+                      reason: "collection '#{dcol.slug}' write policy requires a Human reviewer to accept proposals"
+                    )
+                  )
+                end
+              None: return Error(Missing(entity: "collection", id: ddef.collection_id))
+            end
+          None: return Error(Missing(entity: "database", id: did))
+        end
+      end
+
       subs = try matching_webhooks_in_store(store, "proposal.accepted", Some(found.collection_id))
-      Ok((found, c, subs))
+      Ok((found, c, subs, t_pages, t_dbs, t_schema?))
     end
   )
   if pm.status != "open"
@@ -876,13 +1910,15 @@ fn accept_proposal(
     pm.world_id,
     land_reason,
     now
-  ).map_error(Db.map_world_error)
+  ).map_error(map_land_world_error)
 
   accepted = ProposalMeta(
     id: pm.id,
     world_id: pm.world_id,
     collection_id: pm.collection_id,
     target_page_id: pm.target_page_id,
+    target_database_id: pm.target_database_id,
+    branch_kind: pm.branch_kind,
     title: pm.title,
     reason: pm.reason,
     author_id: pm.author_id,
@@ -894,12 +1930,20 @@ fn accept_proposal(
     decided_by: Some(auth.principal.id),
     decided_at: Some(now)
   )
-  idx_job = Jobs.prepare(
-    rng,
-    clock,
-    "vellum.page.indexed",
-    Json.Object({"page_id": Json.String(pm.target_page_id)})
-  )
+
+  var idx_page_ids = [pm.target_page_id]
+  for pid in touched_pages
+    if not idx_page_ids.contains?(pid)
+      idx_page_ids = idx_page_ids.append(pid)
+    end
+  end
+  var idx_jobs = []
+  for ipid in idx_page_ids
+    idx_jobs = idx_jobs.append(
+      Jobs.prepare(rng, clock, "vellum.page.indexed", Json.Object({"page_id": Json.String(ipid)}))
+    )
+  end
+
   hook_jobs = prepare_webhook_jobs(
     matching_subs,
     "proposal.accepted",
@@ -933,8 +1977,10 @@ fn accept_proposal(
       var cur = try Table.put(t1, Db.proposals_table(), accepted.id, accepted).map_error(
         Db.map_table_error
       )
-      (cur_idx, _idx_jid) = try Jobs.tx_put(cur, idx_job).map_error(Db.map_table_error)
-      cur = cur_idx
+      for ij in idx_jobs
+        (cur_idx, _idx_jid) = try Jobs.tx_put(cur, ij).map_error(Db.map_table_error)
+        cur = cur_idx
+      end
       for job_rec in hook_jobs
         (next_tx, _jid) = try Jobs.tx_put(cur, job_rec).map_error(Db.map_table_error)
         cur = next_tx
@@ -950,11 +1996,25 @@ fn accept_proposal(
     "commit_txid": Json.int(land_res.commit_txid),
     "actor": Json.String(auth.principal.handle)
   })
-  Ok(
-    json_ok(200, Json.Object({"proposal": saved.to_json, "land_result": land_res.to_json}))
-      .with_sse_publish_json("collection:#{saved.collection_id}", "proposal.accepted", prop_payload)
-      .with_sse_publish_json("page:#{saved.target_page_id}", "proposal.accepted", prop_payload)
-  )
+  var resp = json_ok(
+    200,
+    Json.Object({"proposal": saved.to_json, "land_result": land_res.to_json})
+  ).with_sse_publish_json("collection:#{saved.collection_id}", "proposal.accepted", prop_payload)
+    .with_sse_publish_json("page:#{saved.target_page_id}", "proposal.accepted", prop_payload)
+  for did in touched_dbs
+    db_ev = Json.Object({
+      "database_id": Json.String(did),
+      "proposal_id": Json.String(saved.id),
+      "commit_txid": Json.int(land_res.commit_txid),
+      "actor": Json.String(auth.principal.handle)
+    })
+    resp = resp.with_sse_publish_json("database:#{did}", "proposal.accepted", prop_payload)
+      .with_sse_publish_json("database:#{did}", "db.row_updated", db_ev)
+    if touches_schema?
+      resp = resp.with_sse_publish_json("database:#{did}", "db.schema_updated", db_ev)
+    end
+  end
+  Ok(resp)
 end
 
 ## `POST /api/proposals/:id/reject` — Drops a pending `Modb.World` branch and marks the proposal rejected.
@@ -993,19 +2053,19 @@ fn reject_proposal(req: Api.Request, id: Text, auth: AuthContext, files: Files, 
   end
 
   now = clock.now
-  _dropped = try World.drop_world_locked(
-    files,
-    Db.ledger_db_path,
-    Db.vellum_schema(),
-    pm.world_id,
-    now
-  ).map_error(Db.map_world_error)
+  case World.drop_world_locked(files, Db.ledger_db_path, Db.vellum_schema(), pm.world_id, now)
+    Ok(_): Unit
+    Error(World.WorldNotOpen(id: _, status: _)) | Error(World.WorldExpired(id: _)): Unit
+    Error(e): return Error(Db.map_world_error(e))
+  end
 
   rejected = ProposalMeta(
     id: pm.id,
     world_id: pm.world_id,
     collection_id: pm.collection_id,
     target_page_id: pm.target_page_id,
+    target_database_id: pm.target_database_id,
+    branch_kind: pm.branch_kind,
     title: pm.title,
     reason: pm.reason,
     author_id: pm.author_id,
@@ -1045,13 +2105,14 @@ fn reject_proposal(req: Api.Request, id: Text, auth: AuthContext, files: Files, 
     "status": Json.String("rejected"),
     "actor": Json.String(auth.principal.handle)
   })
-  Ok(
-    json_ok(200, saved.to_json).with_sse_publish_json(
-      "collection:#{saved.collection_id}",
-      "proposal.rejected",
-      prop_payload
-    ).with_sse_publish_json("page:#{saved.target_page_id}", "proposal.rejected", prop_payload)
-  )
+  var resp = json_ok(200, saved.to_json)
+    .with_sse_publish_json("collection:#{saved.collection_id}", "proposal.rejected", prop_payload)
+    .with_sse_publish_json("page:#{saved.target_page_id}", "proposal.rejected", prop_payload)
+  case saved.target_database_id
+    Some(did): resp = resp.with_sse_publish_json("database:#{did}", "proposal.rejected", prop_payload)
+    None: Unit
+  end
+  Ok(resp)
 end
 
 ## `POST /api/admin/replay/baseline` — Pins current CoW catalog root as `Modb.Replay` starting point.

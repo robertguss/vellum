@@ -70,16 +70,31 @@ webhooks_table,
 map_claims_error,
 map_world_error,
 map_replay_error,
+proposals_by_database,
+tx_clean_removed_db_properties,
+tx_enrich_rows_with_rollups,
+materialize_world_tx,
+world_touches_schema?,
+world_touched_resources,
+compute_db_decimal_deltas,
 tx_apply_world_patch,
 world_catalog,
 replay_catalog
 use Domain.Blocks
-use Domain.Collab{ProposalMeta, WebhookSub, WorldPatchArgs}
+use Domain.Collab{
+  DecimalDelta,
+  ProposalMeta,
+  WebhookSub,
+  WorldBranchArgs,
+  WorldMutation,
+  WorldPatchArgs
+}
 use Domain.DatabaseModel{
   CellValue,
   DatabaseDef,
   DbRow,
   DbViewDef,
+  DbViewKind,
   EnrichedRow,
   PropertyDef,
   PropertyKind,
@@ -96,6 +111,7 @@ use Domain.Types{
   AuthorKind,
   Block,
   BlockKind,
+  BlockOp,
   Collection,
   CollectionWritePolicy,
   Comment,
@@ -259,10 +275,14 @@ fn proposals_by_page() : Table.Index(Text, ProposalMeta, Text)
   Table.text_index[Text, ProposalMeta]("vlm_proposals_by_page", fn(p) p.target_page_id end)
 end
 
+fn proposals_by_database() : Table.Index(Text, ProposalMeta, Text)
+  Table.text_index[Text, ProposalMeta]("vlm_proposals_by_database", fn(p) p.target_database_id or "" end)
+end
+
 fn proposals_table() : Table.Table(Text, ProposalMeta)
   Table.text_key[ProposalMeta]("vlm_proposals").with_index(proposals_by_status()).with_index(
     proposals_by_page()
-  )
+  ).with_index(proposals_by_database())
 end
 
 fn webhooks_by_workspace() : Table.Index(Text, WebhookSub, Text)
@@ -1267,17 +1287,193 @@ fn enrich_rows_with_rollups(store: Store, def: DatabaseDef, rows: List(DbRow)) :
   Ok(enriched)
 end
 
-## Replayable `Modb.World` + `Modb.Replay` action handler applying surgical `BlockOp`s to a page inside `tx`.
-fn tx_apply_world_patch(tx: WriteTx, args_json: Json) : Result((WriteTx, Json), Text)
-  args = try Json.decode_strict[WorldPatchArgs](args_json.to_text.bytes).map_error(
-    fn(e) e.to_text end
-  )
-  old_page = case try Table.tx_get(tx, pages_table(), args.page_id).map_error(fn(e) e.to_text end)
-    Some(p) if p.archived_at == None: p
-    Some(_) | None: return Error("page '#{args.page_id}' not found or archived")
+## Resolves all `Rollup` columns for `rows` of `def` by fetching referenced target rows from an open `WriteTx`.
+fn tx_enrich_rows_with_rollups(tx: WriteTx, def: DatabaseDef, rows: List(DbRow)) : Result(
+  List(EnrichedRow),
+  AppError
+)
+  var rollup_props = []
+  for p in def.properties
+    case p.kind
+      Rollup(relation_prop_id: rel_id, target_prop_id: tgt_id, agg: agg): rollup_props = rollup_props
+        .append((p.id, rel_id, tgt_id, agg))
+      Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
+        options: _
+      ) | Checkbox | Person | Url | Relation(target_db_id: _, inverse_prop_id: _): Unit
+    end
   end
 
-  existing_rows = try Table.tx_lookup(tx, blocks_table(), blocks_by_page(), args.page_id).map_error(
+  if rollup_props.empty?
+    return Ok(rows.map(fn(r) EnrichedRow(row: r, rollups: {}) end))
+  end
+
+  rtbl = db_rows_table()
+  var rel_cache = {}
+  var enriched = []
+  for r in rows
+    var roll_map = {}
+    for (roll_pid, rel_pid, tgt_pid, agg) in rollup_props
+      rel_ids = case r.cells.get(rel_pid)
+        Some(RelationVal(row_ids: rids)): rids
+        Some(_) | None: []
+      end
+      var tgt_cells = []
+      for rid in rel_ids
+        cached_opt = case rel_cache.get(rid)
+          Some(v): v
+          None:
+            fetched = try Table.tx_get(tx, rtbl, rid).map_error(map_table_error)
+            rel_cache = rel_cache.set(rid, fetched)
+            fetched
+        end
+        case cached_opt
+          Some(tr) if tr.archived_at == None: tgt_cells = tgt_cells.append(
+            tr.cells.get(tgt_pid) or Empty
+          )
+          Some(_) | None: Unit
+        end
+      end
+      roll_map = roll_map.set(roll_pid, DatabaseModel.compute_rollup(agg, tgt_cells))
+    end
+    enriched = enriched.append(EnrichedRow(row: r, rollups: roll_map))
+  end
+  Ok(enriched)
+end
+
+fn clean_view_removed_props(v: DbViewDef, removed_set: Set(Text)) : Result(
+  (DbViewDef, Bool),
+  AppError
+)
+  next_kind = case v.kind
+    TableView(visible_prop_ids: vpids, column_widths: cw):
+      nvpids = vpids.filter(fn(pid) not removed_set.has?(pid) end)
+      var next_cw = {}
+      for (k, w) in cw.entries
+        if not removed_set.has?(k)
+          next_cw = next_cw.set(k, w)
+        end
+      end
+      TableView(visible_prop_ids: nvpids, column_widths: next_cw)
+    BoardView(group_by_prop_id: gb_id, card_prop_ids: cpids, hide_empty_groups: hide):
+      if removed_set.has?(gb_id)
+        return Error(
+          BadInput(reason: "cannot remove property '#{gb_id}' used to group view '#{v.name}'")
+        )
+      end
+      ncpids = cpids.filter(fn(pid) not removed_set.has?(pid) end)
+      BoardView(group_by_prop_id: gb_id, card_prop_ids: ncpids, hide_empty_groups: hide)
+    CalendarView(date_prop_id: dp_id, card_prop_ids: cpids):
+      if removed_set.has?(dp_id)
+        return Error(
+          BadInput(reason: "cannot remove date property '#{dp_id}' used by view '#{v.name}'")
+        )
+      end
+      ncpids = cpids.filter(fn(pid) not removed_set.has?(pid) end)
+      CalendarView(date_prop_id: dp_id, card_prop_ids: ncpids)
+  end
+  next_filters = v.filters.filter(fn(f) not removed_set.has?(f.prop_id) end)
+  next_sorts = v.sorts.filter(fn(s) not removed_set.has?(s.prop_id) end)
+  next_v = DbViewDef(
+    id: v.id,
+    database_id: v.database_id,
+    name: v.name,
+    kind: next_kind,
+    filters: next_filters,
+    filter_match_all: v.filter_match_all,
+    sorts: next_sorts,
+    sort_order: v.sort_order
+  )
+  Ok((next_v, next_v != v))
+end
+
+## Validates existing rows against `next_def`, strips removed column cells & cell indexes,
+## cleans/validates saved views referencing removed columns, and saves `next_def`.
+fn tx_clean_removed_db_properties(tx: WriteTx, old_def: DatabaseDef, next_def: DatabaseDef) : Result(
+  WriteTx,
+  AppError
+)
+  next_prop_ids = next_def.properties.map(fn(p) p.id end).to_set
+  var removed_ids = []
+  for p in old_def.properties
+    if not next_prop_ids.has?(p.id)
+      removed_ids = removed_ids.append(p.id)
+    end
+  end
+  removed_set = removed_ids.to_set
+
+  var cur = tx
+  row_pairs = try Table.tx_lookup(cur, db_rows_table(), db_rows_by_database(), old_def.id)
+    .map_error(map_table_error)
+  for (_rid, row) in row_pairs
+    if row.archived_at == None
+      var next_cells = row.cells
+      var changed? = false
+      if not removed_set.empty?
+        var kept = {}
+        for (cid, cval) in row.cells.entries
+          if removed_set.has?(cid)
+            changed? = true
+          else
+            kept = kept.set(cid, cval)
+          end
+        end
+        next_cells = kept
+      end
+      cleaned_row = DbRow(
+        id: row.id,
+        database_id: row.database_id,
+        page_id: row.page_id,
+        cells: next_cells,
+        created_by: row.created_by,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        archived_at: row.archived_at,
+        version: row.version
+      )
+      case DatabaseModel.validate_row_cells(next_def, cleaned_row)
+        Some(msg): return Error(
+          BadInput(reason: "schema update incompatible with row '#{row.id}': #{msg}")
+        )
+        None: Unit
+      end
+      if changed?
+        cur = try tx_update_db_cell_index(cur, old_def.id, Some(row), Some(cleaned_row))
+        cur = try Table.put(cur, db_rows_table(), cleaned_row.id, cleaned_row).map_error(
+          map_table_error
+        )
+      end
+    end
+  end
+
+  if not removed_set.empty?
+    view_pairs = try Table.tx_lookup(cur, db_views_table(), db_views_by_database(), old_def.id)
+      .map_error(map_table_error)
+    for (_vid, v) in view_pairs
+      (next_v, v_changed?) = try clean_view_removed_props(v, removed_set)
+      if v_changed?
+        cur = try Table.put(cur, db_views_table(), next_v.id, next_v).map_error(map_table_error)
+      end
+    end
+  end
+
+  Table.put(cur, databases_table(), next_def.id, next_def).map_error(map_table_error)
+end
+
+fn tx_apply_page_patch_inner(
+  tx: WriteTx,
+  page_id: Text,
+  ops: List(BlockOp),
+  new_ids: List(Text),
+  provenance: Provenance,
+  expected_versions: Map(Text, Int),
+  updated_at: Time
+) : Result((WriteTx, Json), Text)
+  old_page = case try Table.tx_get(tx, pages_table(), page_id).map_error(fn(e) e.to_text end)
+    Some(p) if p.archived_at == None: p
+    Some(_) | None: return Error("page '#{page_id}' not found or archived")
+  end
+
+  existing_rows = try Table.tx_lookup(tx, blocks_table(), blocks_by_page(), page_id).map_error(
     fn(e) e.to_text end
   )
   existing_blocks = Blocks.sort_blocks(existing_rows.map(fn(x) x.1 end))
@@ -1286,7 +1482,7 @@ fn tx_apply_world_patch(tx: WriteTx, args_json: Json) : Result((WriteTx, Json), 
   for b in existing_blocks
     ver_by_id = ver_by_id.set(b.id, b.version)
   end
-  for (bid, exp_ver) in args.expected_versions.entries
+  for (bid, exp_ver) in expected_versions.entries
     case ver_by_id.get(bid)
       None: return Error("block '#{bid}' not found")
       Some(actual_ver):
@@ -1296,13 +1492,7 @@ fn tx_apply_world_patch(tx: WriteTx, args_json: Json) : Result((WriteTx, Json), 
     end
   end
 
-  updated_blocks = try Blocks.apply_block_ops(
-    existing_blocks,
-    args.ops,
-    args.page_id,
-    args.provenance,
-    args.new_ids
-  )
+  updated_blocks = try Blocks.apply_block_ops(existing_blocks, ops, page_id, provenance, new_ids)
   bumped_page = Page(
     id: old_page.id,
     collection_id: old_page.collection_id,
@@ -1318,7 +1508,7 @@ fn tx_apply_world_patch(tx: WriteTx, args_json: Json) : Result((WriteTx, Json), 
     verified_by: old_page.verified_by,
     created_by: old_page.created_by,
     created_at: old_page.created_at,
-    updated_at: args.updated_at,
+    updated_at: updated_at,
     archived_at: old_page.archived_at,
     version: old_page.version + 1
   )
@@ -1326,11 +1516,467 @@ fn tx_apply_world_patch(tx: WriteTx, args_json: Json) : Result((WriteTx, Json), 
   Ok((
     next_tx,
     Json.Object({
+      "kind": Json.String("page_patch"),
       "page_id": Json.String(bumped_page.id),
       "page_version": Json.int(bumped_page.version),
       "block_count": Json.int(updated_blocks.size)
     })
   ))
+end
+
+## Replayable `Modb.World` + `Modb.Replay` action handler supporting both legacy `WorldPatchArgs`
+## and unified multi-resource `WorldBranchArgs` (`PatchPageBlocks`, DB row/schema mutations) inside `tx`.
+fn tx_apply_world_patch(tx: WriteTx, args_json: Json) : Result((WriteTx, Json), Text)
+  if args_json.get("mutation") != None
+    bargs = try Json.decode_strict[WorldBranchArgs](args_json.to_text.bytes).map_error(
+      fn(e) e.to_text end
+    )
+    return case bargs.mutation
+      PatchPageBlocks(
+        page_id: pid,
+        ops: ops,
+        new_ids: nids,
+        provenance: prov,
+        expected_versions: exp_vers
+      ): tx_apply_page_patch_inner(tx, pid, ops, nids, prov, exp_vers, bargs.updated_at)
+      CreateDbRow(
+        database_id: did,
+        row_id: rid,
+        page_id: pid,
+        cells: cells,
+        markdown: md_opt,
+        block_prefix: blk_pref,
+        provenance: prov
+      ):
+        def = case try Table.tx_get(tx, databases_table(), did).map_error(fn(e) e.to_text end)
+          Some(d): d
+          None: return Error("database '#{did}' not found")
+        end
+        row = DbRow(
+          id: rid,
+          database_id: def.id,
+          page_id: pid,
+          cells: cells,
+          created_by: prov.author_id,
+          created_at: bargs.updated_at,
+          updated_at: bargs.updated_at,
+          archived_at: None,
+          version: 1
+        )
+        case DatabaseModel.validate_row_cells(def, row)
+          Some(msg): return Error(msg)
+          None: Unit
+        end
+        blocks = case md_opt
+          Some(md) if not md.trim.empty?: Blocks.parse_markdown_blocks(pid, md, prov, blk_pref)
+          Some(_) | None: []
+        end
+        page = Page(
+          id: pid,
+          collection_id: def.collection_id,
+          parent_page_id: Some(def.page_id),
+          title: DatabaseModel.extract_row_title(def, cells),
+          icon: None,
+          cover_attachment_id: None,
+          kind: DatabaseRow(database_id: def.id, row_id: rid),
+          sort_order: rid,
+          database_id: Some(def.id),
+          freshness_ttl_days: None,
+          verified_at: None,
+          verified_by: None,
+          created_by: prov.author_id,
+          created_at: bargs.updated_at,
+          updated_at: bargs.updated_at,
+          archived_at: None,
+          version: 1
+        )
+        next_tx = try tx_put_db_row(tx, def, row, page, blocks).map_error(to_text)
+        Ok((
+          next_tx,
+          Json.Object({
+            "kind": Json.String("db_row_create"),
+            "database_id": Json.String(def.id),
+            "row_id": Json.String(row.id),
+            "page_id": Json.String(page.id)
+          })
+        ))
+      UpdateDbRow(
+        database_id: did,
+        row_id: rid,
+        cells: cell_updates,
+        expected_version: exp_ver_opt,
+        provenance: _
+      ):
+        def = case try Table.tx_get(tx, databases_table(), did).map_error(fn(e) e.to_text end)
+          Some(d): d
+          None: return Error("database '#{did}' not found")
+        end
+        old_row = case try Table.tx_get(tx, db_rows_table(), rid).map_error(fn(e) e.to_text end)
+          Some(r) if r.database_id == def.id and r.archived_at == None: r
+          Some(_) | None: return Error("db_row '#{rid}' not found")
+        end
+        case exp_ver_opt
+          Some(ev) if old_row.version != ev: return Error(
+            "db_row '#{rid}' version mismatch: expected #{ev}, found #{old_row.version}"
+          )
+          Some(_) | None: Unit
+        end
+        var merged_cells = old_row.cells
+        for (k, v) in cell_updates.entries
+          merged_cells = merged_cells.set(k, v)
+        end
+        bumped_row = DbRow(
+          id: old_row.id,
+          database_id: old_row.database_id,
+          page_id: old_row.page_id,
+          cells: merged_cells,
+          created_by: old_row.created_by,
+          created_at: old_row.created_at,
+          updated_at: bargs.updated_at,
+          archived_at: old_row.archived_at,
+          version: old_row.version + 1
+        )
+        case DatabaseModel.validate_row_cells(def, bumped_row)
+          Some(msg): return Error(msg)
+          None: Unit
+        end
+        old_page = case try Table.tx_get(tx, pages_table(), old_row.page_id).map_error(
+          fn(e) e.to_text end
+        )
+          Some(p): p
+          None: return Error("page '#{old_row.page_id}' not found")
+        end
+        block_rows = try Table.tx_lookup(tx, blocks_table(), blocks_by_page(), old_page.id)
+          .map_error(fn(e) e.to_text end)
+        existing_blocks = Blocks.sort_blocks(block_rows.map(fn(x) x.1 end))
+        bumped_page = Page(
+          id: old_page.id,
+          collection_id: old_page.collection_id,
+          parent_page_id: old_page.parent_page_id,
+          title: DatabaseModel.extract_row_title(def, merged_cells),
+          icon: old_page.icon,
+          cover_attachment_id: old_page.cover_attachment_id,
+          kind: old_page.kind,
+          sort_order: old_page.sort_order,
+          database_id: old_page.database_id,
+          freshness_ttl_days: old_page.freshness_ttl_days,
+          verified_at: old_page.verified_at,
+          verified_by: old_page.verified_by,
+          created_by: old_page.created_by,
+          created_at: old_page.created_at,
+          updated_at: bargs.updated_at,
+          archived_at: old_page.archived_at,
+          version: old_page.version + 1
+        )
+        next_tx = try tx_put_db_row(tx, def, bumped_row, bumped_page, existing_blocks).map_error(
+          to_text
+        )
+        Ok((
+          next_tx,
+          Json.Object({
+            "kind": Json.String("db_row_update"),
+            "database_id": Json.String(def.id),
+            "row_id": Json.String(bumped_row.id),
+            "version": Json.int(bumped_row.version)
+          })
+        ))
+      DeleteDbRow(database_id: did, row_id: rid):
+        def = case try Table.tx_get(tx, databases_table(), did).map_error(fn(e) e.to_text end)
+          Some(d): d
+          None: return Error("database '#{did}' not found")
+        end
+        _old_row = case try Table.tx_get(tx, db_rows_table(), rid).map_error(fn(e) e.to_text end)
+          Some(r) if r.database_id == def.id and r.archived_at == None: r
+          Some(_) | None: return Error("db_row '#{rid}' not found")
+        end
+        next_tx = try tx_delete_db_row(tx, def, rid).map_error(to_text)
+        Ok((
+          next_tx,
+          Json.Object({
+            "kind": Json.String("db_row_delete"),
+            "database_id": Json.String(def.id),
+            "row_id": Json.String(rid)
+          })
+        ))
+      UpdateDbSchema(
+        database_id: did,
+        title: title_opt,
+        description: desc_opt,
+        properties: props_opt,
+        expected_version: exp_ver_opt
+      ):
+        old_def = case try Table.tx_get(tx, databases_table(), did).map_error(fn(e) e.to_text end)
+          Some(d): d
+          None: return Error("database '#{did}' not found")
+        end
+        case exp_ver_opt
+          Some(ev) if old_def.version != ev: return Error(
+            "database '#{did}' version mismatch: expected #{ev}, found #{old_def.version}"
+          )
+          Some(_) | None: Unit
+        end
+        next_def = DatabaseDef(
+          id: old_def.id,
+          collection_id: old_def.collection_id,
+          page_id: old_def.page_id,
+          title: case title_opt
+            Some(t): t.trim
+            None: old_def.title
+          end,
+          description: case desc_opt
+            Some(d): d.trim
+            None: old_def.description
+          end,
+          properties: case props_opt
+            Some(ps): ps
+            None: old_def.properties
+          end,
+          version: old_def.version + 1
+        )
+        case DatabaseModel.validate_database_def(next_def)
+          Some(msg): return Error(msg)
+          None: Unit
+        end
+        next_tx = try tx_clean_removed_db_properties(tx, old_def, next_def).map_error(to_text)
+        Ok((
+          next_tx,
+          Json.Object({
+            "kind": Json.String("db_schema_update"),
+            "database_id": Json.String(next_def.id),
+            "version": Json.int(next_def.version)
+          })
+        ))
+    end
+  end
+
+  args = try Json.decode_strict[WorldPatchArgs](args_json.to_text.bytes).map_error(
+    fn(e) e.to_text end
+  )
+  tx_apply_page_patch_inner(
+    tx,
+    args.page_id,
+    args.ops,
+    args.new_ids,
+    args.provenance,
+    args.expected_versions,
+    args.updated_at
+  )
+end
+
+## Reconstructs `(base_tx, speculative_tx)` in memory for an open `WorldRecord` (zero disk writes).
+fn materialize_world_tx(store: Store, world: World.WorldRecord) : Result((WriteTx, WriteTx), AppError)
+  pin = case try Modb.get_pin(store, world.base_pin_id).map_error(fn(e)
+    ServerFailed(reason: e.to_text)
+  end)
+    Some(p): p
+    None: return Error(
+      Conflict(reason: "world '#{world.id}' base pin '#{world.base_pin_id}' is no longer active")
+    )
+  end
+  base_tx = Modb.begin_write_from_root(store, pin.catalog_root)
+  var spec_tx = base_tx
+  for step in world.steps
+    case step
+      World.ReadStep(query: _, args: _, answer_hash: _, answer: _): Unit
+      World.CallStep(action: act_name, args: args_json, reason: _):
+        if act_name == "propose"
+          (next_tx, _reply) = try tx_apply_world_patch(spec_tx, args_json).map_error(fn(msg)
+            Conflict(reason: msg)
+          end)
+          spec_tx = next_tx
+        end
+    end
+  end
+  Ok((base_tx, spec_tx))
+end
+
+## Whether any step in `world` stages a database schema mutation (`UpdateDbSchema`).
+fn world_touches_schema?(world: World.WorldRecord) : Bool
+  for step in world.steps
+    case step
+      World.ReadStep(query: _, args: _, answer_hash: _, answer: _): Unit
+      World.CallStep(action: act_name, args: args_json, reason: _):
+        if act_name == "propose" and args_json.get("mutation") != None
+          case Json.decode_strict[WorldBranchArgs](args_json.to_text.bytes)
+            Ok(bargs):
+              case bargs.mutation
+                UpdateDbSchema(
+                  database_id: _,
+                  title: _,
+                  description: _,
+                  properties: _,
+                  expected_version: _
+                ): return true
+                PatchPageBlocks(
+                  page_id: _,
+                  ops: _,
+                  new_ids: _,
+                  provenance: _,
+                  expected_versions: _
+                ) | CreateDbRow(
+                  database_id: _,
+                  row_id: _,
+                  page_id: _,
+                  cells: _,
+                  markdown: _,
+                  block_prefix: _,
+                  provenance: _
+                ) | UpdateDbRow(
+                  database_id: _,
+                  row_id: _,
+                  cells: _,
+                  expected_version: _,
+                  provenance: _
+                ) | DeleteDbRow(database_id: _, row_id: _): Unit
+              end
+            Error(_): Unit
+          end
+        end
+    end
+  end
+  false
+end
+
+fn append_unique_text(xs: List(Text), item: Text) : List(Text)
+  t = item.trim
+  return xs if t.empty? or xs.contains?(t)
+  xs.append(t)
+end
+
+## Collects deduplicated `(page_ids, database_ids)` referenced across a `WorldRecord`'s steps.
+fn world_touched_resources(
+  world: World.WorldRecord,
+  fallback_page_id: Text,
+  fallback_db_id: Option(Text)
+) : (List(Text), List(Text))
+  var page_ids = case fallback_db_id
+    Some(_): []
+    None: append_unique_text([], fallback_page_id)
+  end
+  var db_ids = case fallback_db_id
+    Some(did): append_unique_text([], did)
+    None: []
+  end
+  for step in world.steps
+    case step
+      World.ReadStep(query: _, args: _, answer_hash: _, answer: _): Unit
+      World.CallStep(action: act_name, args: args_json, reason: _):
+        if act_name == "propose"
+          if args_json.get("mutation") != None
+            case Json.decode_strict[WorldBranchArgs](args_json.to_text.bytes)
+              Ok(bargs):
+                case bargs.mutation
+                  PatchPageBlocks(
+                    page_id: pid,
+                    ops: _,
+                    new_ids: _,
+                    provenance: _,
+                    expected_versions: _
+                  ): page_ids = append_unique_text(page_ids, pid)
+                  CreateDbRow(
+                    database_id: did,
+                    row_id: _,
+                    page_id: _,
+                    cells: _,
+                    markdown: _,
+                    block_prefix: _,
+                    provenance: _
+                  ) | UpdateDbRow(
+                    database_id: did,
+                    row_id: _,
+                    cells: _,
+                    expected_version: _,
+                    provenance: _
+                  ) | DeleteDbRow(database_id: did, row_id: _) | UpdateDbSchema(
+                    database_id: did,
+                    title: _,
+                    description: _,
+                    properties: _,
+                    expected_version: _
+                  ): db_ids = append_unique_text(db_ids, did)
+                end
+              Error(_): Unit
+            end
+          else
+            case Json.decode_strict[WorldPatchArgs](args_json.to_text.bytes)
+              Ok(pargs): page_ids = append_unique_text(page_ids, pargs.page_id)
+              Error(_): Unit
+            end
+          end
+        end
+    end
+  end
+  (page_ids, db_ids)
+end
+
+## Computes exact `Decimal` column and numeric `Rollup` sums & deltas between Live and Scenario rows.
+fn compute_db_decimal_deltas(
+  def: DatabaseDef,
+  live_rows: List(EnrichedRow),
+  scenario_rows: List(EnrichedRow)
+) : List(DecimalDelta)
+  var out = []
+  for p in def.properties
+    (include?, fmt, is_roll) = case p.kind
+      Number(format: f): (true, f, false)
+      Rollup(relation_prop_id: _, target_prop_id: _, agg: agg):
+        always_num = case agg
+          CountAll | CountValues | SumValues: true
+          MinValue | MaxValue: false
+        end
+        (always_num, "plain", true)
+      Title | RichText | DateProp(include_time: _) | Select(options: _) | MultiSelect(options: _) | Checkbox | Person | Url | Relation(
+        target_db_id: _,
+        inverse_prop_id: _
+      ): (false, "plain", false)
+    end
+    var live_sum = 0.0
+    var scen_sum = 0.0
+    var saw_num = false
+    for er in live_rows
+      case DatabaseModel.effective_cell(er, p.id)
+        NumberVal(d):
+          live_sum += d
+          saw_num = true
+        Empty | TextVal(_) | DateVal(start: _, end_date: _) | SelectVal(option_id: _) | MultiSelectVal(
+          option_ids: _
+        ) | BoolVal(_) | PrincipalVal(_) | UrlVal(_) | RelationVal(row_ids: _): Unit
+      end
+    end
+    for er in scenario_rows
+      case DatabaseModel.effective_cell(er, p.id)
+        NumberVal(d):
+          scen_sum += d
+          saw_num = true
+        Empty | TextVal(_) | DateVal(start: _, end_date: _) | SelectVal(option_id: _) | MultiSelectVal(
+          option_ids: _
+        ) | BoolVal(_) | PrincipalVal(_) | UrlVal(_) | RelationVal(row_ids: _): Unit
+      end
+    end
+    should_emit = if is_roll
+      include? or saw_num
+    else
+      include?
+    end
+    if should_emit
+      diff = scen_sum - live_sum
+      out = out.append(
+        DecimalDelta(
+          database_id: def.id,
+          database_title: def.title,
+          prop_id: p.id,
+          prop_name: p.name,
+          format: fmt,
+          is_rollup: is_roll,
+          live_total: live_sum.to_text,
+          scenario_total: scen_sum.to_text,
+          delta: diff.to_text,
+          changed: scen_sum != live_sum
+        )
+      )
+    end
+  end
+  out
 end
 
 ## Speculative `Modb.World` catalog registering `read_page` (O(diff) key-scoped) and `propose`.

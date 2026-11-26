@@ -12,6 +12,8 @@ create_database,
 show_database,
 update_database_schema,
 create_view,
+update_view,
+delete_view,
 query_database,
 create_row,
 update_row,
@@ -378,49 +380,133 @@ fn show_database(req: Api.Request, id: Text, auth: Option(AuthContext), rf: Read
   end
 
   read_act = db_read_action(a)
-  (cols, dbs, def, views, enriched) = try Ledger.read_locked(
-    rf,
-    Db.ledger_db_path,
-    Db.vellum_schema(),
-    Db.map_ledger_error,
-    fn(db)
-      store = Ledger.store(db)
-      def = case try Table.get(store, Db.databases_table(), id).map_error(Db.map_table_error)
-        Some(d): d
-        None: return Error(Missing(entity: "database", id: id))
-      end
-      try Policy.require_collection_access(a, read_act, def.collection_id)
-      col_rows = try Table.scan(store, Db.collections_table(), None, None, 200).map_error(
-        Db.map_table_error
-      )
-      var cols = []
-      for (_cid, c) in col_rows
-        if c.archived_at == None and Policy.collection_permitted?(a, c.id)
-          cols = cols.append(c)
+  (cols, dbs, def, views, enriched, principals_json, relation_targets_json, scenarios_json) = try Ledger
+    .read_locked(
+      rf,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      Db.map_ledger_error,
+      fn(db)
+        store = Ledger.store(db)
+        def = case try Table.get(store, Db.databases_table(), id).map_error(Db.map_table_error)
+          Some(d): d
+          None: return Error(Missing(entity: "database", id: id))
         end
-      end
-      db_rows = try Table.scan(store, Db.databases_table(), None, None, 200).map_error(
-        Db.map_table_error
-      )
-      var dbs = []
-      for (_did, d) in db_rows
-        if Policy.collection_permitted?(a, d.collection_id)
-          dbs = dbs.append(d)
+        try Policy.require_collection_access(a, read_act, def.collection_id)
+        col_rows = try Table.scan(store, Db.collections_table(), None, None, 200).map_error(
+          Db.map_table_error
+        )
+        var cols = []
+        for (_cid, c) in col_rows
+          if c.archived_at == None and Policy.collection_permitted?(a, c.id)
+            cols = cols.append(c)
+          end
         end
+        db_rows = try Table.scan(store, Db.databases_table(), None, None, 200).map_error(
+          Db.map_table_error
+        )
+        var dbs = []
+        var db_by_id = {}
+        for (_did, d) in db_rows
+          if Policy.collection_permitted?(a, d.collection_id)
+            dbs = dbs.append(d)
+            db_by_id = db_by_id.set(d.id, d)
+          end
+        end
+        v_pairs = try Table.lookup(store, Db.db_views_table(), Db.db_views_by_database(), def.id)
+          .map_error(Db.map_table_error)
+        sorted_views = v_pairs.map(fn(x) x.1 end).sort_by(fn(v) v.sort_order end)
+        active_rows = try load_active_db_rows(store, def.id)
+        enr = try Db.enrich_rows_with_rollups(store, def, active_rows)
+
+        p_rows = try Table.scan(store, Db.principals_table(), None, None, 200).map_error(
+          Db.map_table_error
+        )
+        var principals_list = []
+        for (_pid, pr) in p_rows
+          if not pr.suspended
+            principals_list = principals_list.append(
+              Json.Object({
+                "id": Json.String(pr.id),
+                "handle": Json.String(pr.handle),
+                "display_name": Json.String(pr.display_name),
+                "kind": pr.kind.to_json,
+                "role": pr.role.to_json
+              })
+            )
+          end
+        end
+
+        var rel_targets_map = {}
+        var seen_targets = Set.empty
+        for prop in def.properties
+          case prop.kind
+            Relation(target_db_id: tdb_id, inverse_prop_id: _):
+              if not seen_targets.has?(tdb_id)
+                seen_targets = seen_targets.add(tdb_id)
+                case db_by_id.get(tdb_id)
+                  Some(target_def):
+                    t_rows = try load_active_db_rows(store, target_def.id)
+                    var opt_list = []
+                    for tr in t_rows
+                      opt_list = opt_list.append(
+                        Json.Object({
+                          "row_id": Json.String(tr.id),
+                          "page_id": Json.String(tr.page_id),
+                          "title": Json.String(
+                            DatabaseModel.extract_row_title(target_def, tr.cells)
+                          )
+                        })
+                      )
+                    end
+                    rel_targets_map = rel_targets_map.set(tdb_id, Json.Array(opt_list))
+                  None: Unit
+                end
+              end
+            Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
+              options: _
+            ) | Checkbox | Person | Url | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): Unit
+          end
+        end
+
+        scen_pairs = try Table.lookup(
+          store,
+          Db.proposals_table(),
+          Db.proposals_by_database(),
+          def.id
+        ).map_error(Db.map_table_error)
+        var open_scenarios = []
+        for (_spid, pm) in scen_pairs
+          if pm.status == "open" and Policy.collection_permitted?(a, pm.collection_id)
+            open_scenarios = open_scenarios.append(pm)
+          end
+        end
+
+        Ok((
+          cols,
+          dbs,
+          def,
+          sorted_views,
+          DatabaseModel.sort_enriched_rows(enr, []),
+          Json.Array(principals_list),
+          Json.Object(rel_targets_map),
+          open_scenarios.to_json
+        ))
       end
-      v_pairs = try Table.lookup(store, Db.db_views_table(), Db.db_views_by_database(), def.id)
-        .map_error(Db.map_table_error)
-      active_rows = try load_active_db_rows(store, def.id)
-      enr = try Db.enrich_rows_with_rollups(store, def, active_rows)
-      Ok((cols, dbs, def, v_pairs.map(fn(x) x.1 end), DatabaseModel.sort_enriched_rows(enr, [])))
-    end
-  )
+    )
 
   if Auth.wants_json?(req)
     return Ok(
       json_ok(
         200,
-        Json.Object({"database": def.to_json, "views": views.to_json, "rows": enriched.to_json})
+        Json.Object({
+          "database": def.to_json,
+          "views": views.to_json,
+          "rows": enriched.to_json,
+          "principals": principals_json,
+          "relation_targets": relation_targets_json,
+          "scenarios": scenarios_json
+        })
       )
     )
   end
@@ -439,7 +525,10 @@ fn show_database(req: Api.Request, id: Text, auth: Option(AuthContext), rf: Read
       "databases": dbs.to_json,
       "database": def.to_json,
       "views": views.to_json,
-      "rows": enriched.to_json
+      "rows": enriched.to_json,
+      "principals": principals_json,
+      "relation_targets": relation_targets_json,
+      "scenarios": scenarios_json
     },
     shared
   )
@@ -514,13 +603,22 @@ fn update_database_schema(
         Some(msg): return Error(BadInput(reason: msg))
         None: Unit
       end
-      t2 = try Table.put(t1, Db.databases_table(), next_def.id, next_def).map_error(
-        Db.map_table_error
-      )
+      t2 = try Db.tx_clean_removed_db_properties(t1, old_def, next_def)
       Ok((t2, next_def))
     end
   )
-  Ok(json_ok(200, updated.to_json))
+  schema_ev = Json.Object({
+    "database_id": Json.String(updated.id),
+    "version": Json.int(updated.version),
+    "actor": Json.String(auth.principal.handle)
+  })
+  Ok(
+    json_ok(200, updated.to_json).with_sse_publish_json(
+      "database:#{updated.id}",
+      "db.schema_updated",
+      schema_ev
+    )
+  )
 end
 
 ## `POST /api/databases/:id/views` — Creates a saved Table, Board, or Calendar view.
@@ -583,7 +681,212 @@ fn create_view(
       Ok((t2, v))
     end
   )
-  Ok(json_ok(201, saved.to_json))
+  view_ev = Json.Object({
+    "database_id": Json.String(saved.database_id),
+    "view_id": Json.String(saved.id),
+    "actor": Json.String(auth.principal.handle)
+  })
+  Ok(
+    json_ok(201, saved.to_json).with_sse_publish_json(
+      "database:#{saved.database_id}",
+      "db.views_updated",
+      view_ev
+    )
+  )
+end
+
+## `PATCH /api/databases/:id/views/:view_id` — Renames or updates a saved view's config, filters, or sorts.
+fn update_view(
+  req: Api.Request,
+  id: Text,
+  view_id: Text,
+  auth: AuthContext,
+  files: Files,
+  clock: Clock
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  raw_json = case Json.parse(req.text or "")
+    Ok(j): j
+    Error(_): return Error(BadInput(reason: "invalid JSON body"))
+  end
+  case raw_json
+    Json.Object(_): Unit
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+      BadInput(reason: "expected JSON object")
+    )
+  end
+
+  name_opt = case raw_json.get("name")
+    None | Some(Json.Null): None
+    Some(Json.String(s)):
+      t = s.trim
+      if t.empty?
+        return Error(BadInput(reason: "view name must not be empty"))
+      end
+      Some(t)
+    Some(_): return Error(BadInput(reason: "invalid 'name'"))
+  end
+  kind_opt = case raw_json.get("kind")
+    None | Some(Json.Null): None
+    Some(kjson): Some(
+      try Json.decode_strict[DbViewKind](kjson.to_text.bytes).map_error(fn(e)
+        BadInput(reason: "invalid 'kind': #{e.to_text}")
+      end)
+    )
+  end
+  filters_opt = case raw_json.get("filters")
+    None | Some(Json.Null): None
+    Some(fjson): Some(
+      try Json.decode_strict[List(DbFilterRule)](fjson.to_text.bytes).map_error(fn(e)
+        BadInput(reason: "invalid 'filters': #{e.to_text}")
+      end)
+    )
+  end
+  match_all_opt = case raw_json.get("filter_match_all")
+    None | Some(Json.Null): None
+    Some(Json.Boolean(b)): Some(b)
+    Some(_): return Error(BadInput(reason: "invalid 'filter_match_all'"))
+  end
+  sorts_opt = case raw_json.get("sorts")
+    None | Some(Json.Null): None
+    Some(sjson): Some(
+      try Json.decode_strict[List(DbSortRule)](sjson.to_text.bytes).map_error(fn(e)
+        BadInput(reason: "invalid 'sorts': #{e.to_text}")
+      end)
+    )
+  end
+
+  view_act = if Policy.action_permitted?(auth, "manage_schema")
+    "manage_schema"
+  else
+    "write_db"
+  end
+  now = clock.now
+  meta = Ledger.WriteMeta(
+    principal: auth.principal.handle,
+    action: "database.update_view",
+    reason: "update view '#{view_id}' on database '#{id}'",
+    at: now
+  )
+  audit_payload = Json.Object({"database_id": Json.String(id), "view_id": Json.String(view_id)})
+
+  saved = try Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    meta,
+    "updated view #{view_id} on #{id}",
+    audit_payload,
+    Db.map_ledger_error,
+    fn(tx)
+      t1 = try tx_authorize_if_agent(tx, auth, view_act, now)
+      def = case try Table.tx_get(t1, Db.databases_table(), id).map_error(Db.map_table_error)
+        Some(d): d
+        None: return Error(Missing(entity: "database", id: id))
+      end
+      try Policy.require_collection_access(auth, view_act, def.collection_id)
+      old_v = case try Table.tx_get(t1, Db.db_views_table(), view_id).map_error(Db.map_table_error)
+        Some(v) if v.database_id == def.id: v
+        Some(_) | None: return Error(Missing(entity: "db_view", id: view_id))
+      end
+      next_v = DbViewDef(
+        id: old_v.id,
+        database_id: old_v.database_id,
+        name: name_opt or old_v.name,
+        kind: kind_opt or old_v.kind,
+        filters: filters_opt or old_v.filters,
+        filter_match_all: match_all_opt or old_v.filter_match_all,
+        sorts: sorts_opt or old_v.sorts,
+        sort_order: old_v.sort_order
+      )
+      case validate_view_def(def, next_v)
+        Some(msg): return Error(BadInput(reason: msg))
+        None: Unit
+      end
+      t2 = try Table.put(t1, Db.db_views_table(), next_v.id, next_v).map_error(Db.map_table_error)
+      Ok((t2, next_v))
+    end
+  )
+  view_ev = Json.Object({
+    "database_id": Json.String(saved.database_id),
+    "view_id": Json.String(saved.id),
+    "actor": Json.String(auth.principal.handle)
+  })
+  Ok(
+    json_ok(200, saved.to_json).with_sse_publish_json(
+      "database:#{saved.database_id}",
+      "db.views_updated",
+      view_ev
+    )
+  )
+end
+
+## `DELETE /api/databases/:id/views/:view_id` — Deletes a saved view (retaining at least one view per database).
+fn delete_view(
+  req: Api.Request,
+  id: Text,
+  view_id: Text,
+  auth: AuthContext,
+  files: Files,
+  clock: Clock
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  view_act = if Policy.action_permitted?(auth, "manage_schema")
+    "manage_schema"
+  else
+    "write_db"
+  end
+  now = clock.now
+  meta = Ledger.WriteMeta(
+    principal: auth.principal.handle,
+    action: "database.delete_view",
+    reason: "delete view '#{view_id}' from database '#{id}'",
+    at: now
+  )
+  audit_payload = Json.Object({"database_id": Json.String(id), "view_id": Json.String(view_id)})
+
+  try Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    meta,
+    "deleted view #{view_id} on #{id}",
+    audit_payload,
+    Db.map_ledger_error,
+    fn(tx)
+      t1 = try tx_authorize_if_agent(tx, auth, view_act, now)
+      def = case try Table.tx_get(t1, Db.databases_table(), id).map_error(Db.map_table_error)
+        Some(d): d
+        None: return Error(Missing(entity: "database", id: id))
+      end
+      try Policy.require_collection_access(auth, view_act, def.collection_id)
+      all_views = try Table.tx_lookup(t1, Db.db_views_table(), Db.db_views_by_database(), def.id)
+        .map_error(Db.map_table_error)
+      var found? = false
+      for (vid, _v) in all_views
+        if vid == view_id
+          found? = true
+        end
+      end
+      if not found?
+        return Error(Missing(entity: "db_view", id: view_id))
+      end
+      if all_views.size <= 1
+        return Error(BadInput(reason: "database must retain at least one view"))
+      end
+      t2 = try Table.delete(t1, Db.db_views_table(), view_id).map_error(Db.map_table_error)
+      Ok((t2, Unit))
+    end
+  )
+  view_ev = Json.Object({
+    "database_id": Json.String(id),
+    "view_id": Json.String(view_id),
+    "actor": Json.String(auth.principal.handle)
+  })
+  Ok(
+    json_ok(200, Json.Object({"deleted_view_id": Json.String(view_id)}))
+      .with_sse_publish_json("database:#{id}", "db.views_updated", view_ev)
+  )
 end
 
 ## `POST /api/databases/:id/query` — Executes Table/Board/Calendar filtering, sorting, and Rollups (`ReadFiles`-only).
