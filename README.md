@@ -33,7 +33,7 @@ Vellum is designed from first principles as a self-hostable open-source replacem
    ```bash
    cp .env.example .env
    ```
-2. Start local Dex (OIDC) and MinIO (S3) containers:
+2. Start local Dex (OIDC) and VersityGW (S3-compatible) containers:
    ```bash
    docker compose -f docker-compose.dev.yml up -d
    ```
@@ -42,7 +42,7 @@ Vellum is designed from first principles as a self-hostable open-source replacem
    (cd frontend && npm install)
    ./scripts/dev.sh
    ```
-4. Open `http://127.0.0.1:8080`, click **Continue with OIDC SSO**, and sign in with Dex (`ada@acme.io` / `vellum-dev-password`).
+4. Open `http://127.0.0.1:8080`, click **Continue with OIDC SSO**, and sign in with Dex (`ada@acme.io` / `password`).
 
 ## Running Full Verification
 

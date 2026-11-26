@@ -1,0 +1,79 @@
+name: Vellum CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Verify Vite manifest entrypoints
+        working-directory: .
+        run: |
+          node -e '
+            const fs = require("fs");
+            const manifest = JSON.parse(fs.readFileSync("public/manifest.json", "utf8"));
+            const entry = manifest["src/main.tsx"];
+            if (!entry || !entry.file) throw new Error("missing src/main.tsx in manifest.json");
+            if (!fs.existsSync("public/" + entry.file)) throw new Error("missing " + entry.file);
+            for (const css of entry.css || []) {
+              if (!fs.existsSync("public/" + css)) throw new Error("missing " + css);
+            }
+            console.log("Verified:", entry.file);
+          '
+
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Vellum
+        uses: actions/checkout@v4
+        with:
+          path: vellum
+      - name: Checkout sibling MoDB
+        uses: actions/checkout@v4
+        with:
+          repository: robertguss/modb
+          path: modb
+      - name: Checkout sibling Arvo
+        uses: actions/checkout@v4
+        with:
+          repository: robertguss/arvo
+          path: arvo
+      - name: Select Arvo branch (PR stack if open, else main)
+        run: |
+          if git ls-remote --exit-code https://github.com/robertguss/arvo.git refs/heads/feat/mcp-webhooks-sse >/dev/null 2>&1; then
+            git -C arvo fetch --depth 1 https://github.com/robertguss/arvo.git feat/mcp-webhooks-sse
+            git -C arvo checkout -B ci-arvo FETCH_HEAD
+          fi
+      - name: Checkout Mo compiler
+        uses: actions/checkout@v4
+        with:
+          repository: robertguss/mo
+          path: mo
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mo
+      - name: Install OpenSSL dev headers & build Mo
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+          cargo build --release --manifest-path mo/Cargo.toml --bin mo
+          echo "$GITHUB_WORKSPACE/mo/target/release" >> "$GITHUB_PATH"
+      - name: Run Vellum Mo checks & tests
+        working-directory: vellum
+        run: ./scripts/test.sh

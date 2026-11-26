@@ -15,10 +15,11 @@ ARG MO_BIN=/usr/local/bin/mo
 WORKDIR /app
 COPY . /app
 COPY --from=frontend /app/public /app/public
+RUN mkdir -p /var/lib/vellum
 
 ENV MO_BIND=0.0.0.0
 ENV MO_PORT=8080
-VOLUME ["/var/lib/vellum/data"]
+VOLUME ["/var/lib/vellum"]
 EXPOSE 8080
 
-CMD ["mo", "serve", "main.mo", "--bind", "0.0.0.0", "--port", "8080", "--workers", "4", "--data", "/var/lib/vellum/data"]
+CMD ["sh", "-c", "mkdir -p /var/lib/vellum && rm -rf /var/lib/vellum/public && cp -r /app/public /var/lib/vellum/public && exec mo serve /app/main.mo --bind 0.0.0.0 --port 8080 --workers 4 --data /var/lib/vellum"]

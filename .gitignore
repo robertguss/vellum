@@ -1,5 +1,7 @@
 # Local runtime & database state
 data/
+*.modb
+*.modb.*
 .env
 .env.local
 

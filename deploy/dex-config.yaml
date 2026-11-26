@@ -8,7 +8,7 @@ oauth2:
 enablePasswordDB: true
 staticPasswords:
   - email: "ada@acme.io"
-    # bcrypt hash for password: "vellum-dev-password"
+    # bcrypt hash for password: "password" (official Dex local dev test hash)
     hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"
     username: "ada"
     userID: "user-ada"
