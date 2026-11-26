@@ -13,7 +13,7 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ApiError, apiFetch, streamAskWorkspace } from "../lib/api";
 import { useRealtimeEvents, type RealtimeScope } from "../lib/useRealtimeEvents";
 import type {
@@ -79,6 +79,19 @@ export default function WorkspaceLayout({
   const [aiCitations, setAiCitations] = useState<AiCitation[]>([]);
   const [aiError, setAiError] = useState<string | null>(null);
   const [aiStreaming, setAiStreaming] = useState(false);
+  const aiAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    return () => {
+      aiAbortRef.current?.abort();
+    };
+  }, []);
+
+  function closeAiDrawer() {
+    aiAbortRef.current?.abort();
+    aiAbortRef.current = null;
+    setAiOpen(false);
+  }
 
   // Create collection modal
   const [newColOpen, setNewColOpen] = useState(false);
@@ -130,6 +143,9 @@ export default function WorkspaceLayout({
     e.preventDefault();
     const q = aiQuestion.trim();
     if (!q || aiStreaming) return;
+    aiAbortRef.current?.abort();
+    const controller = new AbortController();
+    aiAbortRef.current = controller;
     setAiStreaming(true);
     setAiAnswer("");
     setAiModel("");
@@ -146,11 +162,18 @@ export default function WorkspaceLayout({
           onCitation: (c) => setAiCitations((prev) => [...prev, c]),
           onToken: (delta) => setAiAnswer((prev) => prev + delta),
           onDone: (model) => setAiModel(model),
-        }
+        },
+        controller.signal
       );
     } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        return;
+      }
       setAiError(err instanceof ApiError ? err.message : "Failed to query Ask Workspace");
     } finally {
+      if (aiAbortRef.current === controller) {
+        aiAbortRef.current = null;
+      }
       setAiStreaming(false);
     }
   }
@@ -472,7 +495,7 @@ export default function WorkspaceLayout({
             </div>
             <button
               type="button"
-              onClick={() => setAiOpen(false)}
+              onClick={closeAiDrawer}
               className="text-stone-400 hover:text-stone-700"
             >
               <X className="h-4 w-4" />
@@ -487,7 +510,7 @@ export default function WorkspaceLayout({
                 placeholder="Ask a question answered strictly from pages you can access..."
                 className="w-full rounded-xl border border-stone-200 p-3 text-sm focus:border-teal-600 outline-none"
               />
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 {currentCollectionId ? (
                   <label className="flex items-center gap-2 text-xs text-stone-600">
                     <input
@@ -500,13 +523,24 @@ export default function WorkspaceLayout({
                 ) : (
                   <span className="text-xs text-stone-400">Across permitted collections</span>
                 )}
-                <button
-                  type="submit"
-                  disabled={aiStreaming || !aiQuestion.trim()}
-                  className="rounded-lg bg-teal-700 px-3.5 py-1.5 text-xs font-medium text-white disabled:opacity-50 hover:bg-teal-800 transition"
-                >
-                  {aiStreaming ? "Streaming..." : "Ask"}
-                </button>
+                <div className="flex items-center gap-2">
+                  {aiStreaming && (
+                    <button
+                      type="button"
+                      onClick={() => aiAbortRef.current?.abort()}
+                      className="rounded-lg border border-stone-200 px-3 py-1.5 text-xs font-medium text-stone-600 hover:bg-stone-50 transition"
+                    >
+                      Stop
+                    </button>
+                  )}
+                  <button
+                    type="submit"
+                    disabled={aiStreaming || !aiQuestion.trim()}
+                    className="rounded-lg bg-teal-700 px-3.5 py-1.5 text-xs font-medium text-white disabled:opacity-50 hover:bg-teal-800 transition"
+                  >
+                    {aiStreaming ? "Streaming..." : "Ask"}
+                  </button>
+                </div>
               </div>
             </form>
 

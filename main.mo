@@ -2699,7 +2699,7 @@ test "end-to-end Vellum Stage 4: Notion Markdown+CSV importer, Ask Workspace (JS
   assert (ask_j.text_at("answer") or "").contains?("Gateway Runbook")
   assert (ask_j.list_at("citations") or []).size == 1
 
-  # SSE streaming mode
+  # Live HTTP-to-SSE streaming mode returns immediate citation events + X-Mo-Sse-Relay directive
   ask_sse_res = ApiTest.send(
     Main,
     WebTest.prepare(
@@ -2717,15 +2717,65 @@ test "end-to-end Vellum Stage 4: Notion Markdown+CSV importer, Ask Workspace (JS
     clock0,
     env,
     rng,
-    ai_net
+    empty_net
   )
   assert ask_sse_res.status == 200
   assert ask_sse_res.header("Content-Type") == Some("text/event-stream; charset=utf-8")
   assert ask_sse_res.text.contains?("event: ai.citation")
-  assert ask_sse_res.text.contains?("event: ai.token")
-  assert ask_sse_res.text.contains?("event: ai.done")
+  assert ask_sse_res.text.contains?("Gateway Runbook")
+  assert ask_sse_res.sse_relay_spec is Some(sse_relay)
+  assert sse_relay.method == "POST"
+  assert sse_relay.url == ai_cfg.base_url
+  assert sse_relay.mode == "openai_sse"
+  assert sse_relay.body.contains?("\"stream\":true")
+  assert sse_relay.token_event == Some("ai.token")
+  assert sse_relay.done_event == Some("ai.done")
+  assert sse_relay.error_event == Some("ai.error")
 
-  # Fail-closed secret isolation on Ask Workspace
+  # Anthropic streaming relay mode + x-api-key header
+  ant_env = Env.of({
+    "VELLUM_SECRET_KEY": key_hex,
+    "VELLUM_INSECURE_COOKIES": "1",
+    "VELLUM_OIDC_PROVIDER_ID": "okta-test",
+    "VELLUM_OIDC_CLIENT_ID": "vellum-web",
+    "VELLUM_OIDC_CLIENT_SECRET": "oidc-secret-xyz",
+    "VELLUM_OIDC_REDIRECT_URI": "http://localhost:8080/auth/oidc/callback",
+    "VELLUM_OIDC_ISSUER": "https://auth.example.com",
+    "VELLUM_OIDC_AUTH_URL": "https://auth.example.com/authorize",
+    "VELLUM_OIDC_TOKEN_URL": "https://auth.example.com/token",
+    "VELLUM_OIDC_USERINFO_URL": "https://auth.example.com/userinfo",
+    "VELLUM_OIDC_ALLOWED_DOMAINS": "acme.io",
+    "VELLUM_AI_PROVIDER": "anthropic",
+    "VELLUM_AI_API_KEY": "sk-ant-test-123",
+    "VELLUM_AI_MODEL": "claude-sonnet-4-6"
+  })
+  ant_sse_res = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      agent,
+      Api.post("/api/ai/ask").with_json(
+        Ai.AskWorkspaceInput(
+          question: "rotate secrets",
+          collection_id: None,
+          max_sources: Some(3),
+          stream: Some(true)
+        )
+      )
+    ),
+    files,
+    clock0,
+    ant_env,
+    rng,
+    empty_net
+  )
+  assert ant_sse_res.status == 200
+  assert ant_sse_res.sse_relay_spec is Some(ant_relay)
+  assert ant_relay.mode == "anthropic_sse"
+  assert ant_relay.url == "https://api.anthropic.com/v1/messages"
+  assert ant_relay.headers.any?(fn(h) h.0 == "x-api-key" and h.1 == "sk-ant-test-123" end)
+  assert ant_relay.body.contains?("\"stream\":true")
+
+  # Fail-closed secret isolation on Ask Workspace (both JSON and streaming SSE relay modes)
   ask_sec_res = ApiTest.send(
     Main,
     WebTest.prepare(
@@ -2747,6 +2797,59 @@ test "end-to-end Vellum Stage 4: Notion Markdown+CSV importer, Ask Workspace (JS
   )
   assert ask_sec_res.status == 200
   assert (must_json(ask_sec_res.text).list_at("citations") or []).empty?
+
+  ask_sec_sse = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      agent,
+      Api.post("/api/ai/ask").with_json(
+        Ai.AskWorkspaceInput(
+          question: "zxqvault",
+          collection_id: None,
+          max_sources: Some(3),
+          stream: Some(true)
+        )
+      )
+    ),
+    files,
+    clock0,
+    env,
+    rng,
+    empty_net
+  )
+  assert ask_sec_sse.status == 200
+  assert not ask_sec_sse.text.contains?("event: ai.citation")
+  assert ask_sec_sse.sse_relay_spec is Some(sec_relay)
+  assert not sec_relay.body.contains?("Vault")
+
+  # Pure-Mo Http.open_stream + Http.next_sse_event over Network.fake
+  stream_req = Ai.build_llm_request_with_stream(ai_cfg, ask_sys, ask_usr_pub, true)
+  sse_wire = "event: ai.citation\ndata: {\"page_id\":\"#{gateway_pg_id}\"}\n\nevent: ai.token\ndata: {\"delta\":\"Rotate \"}\n\nevent: ai.done\ndata: {\"model\":\"gpt-4o-mini\"}\n\n"
+  stream_net = Network.fake(
+    Http.replies([
+      (
+        stream_req,
+        Http.Response(
+          status: 200,
+          headers: [
+            ("Content-Type", "text/event-stream; charset=utf-8"),
+            ("Content-Length", "#{sse_wire.byte_count}")
+          ],
+          body: sse_wire.bytes
+        )
+      )
+    ])
+  )
+  assert stream_req.open_stream(stream_net) is Ok(st0)
+  assert st0.stream_status == 200
+  assert st0.next_sse_event is Ok((Some(ev1), st1))
+  assert ev1.event == Some("ai.citation")
+  assert st1.next_sse_event is Ok((Some(ev2), st2))
+  assert ev2.event == Some("ai.token")
+  assert ev2.data == "{\"delta\":\"Rotate \"}"
+  assert st2.next_sse_event is Ok((Some(ev3), st3))
+  assert ev3.event == Some("ai.done")
+  assert st3.next_sse_event is Ok((None, _st4))
 
   # AI Inline Draft as isolated Modb.World Proposal (live Gateway Runbook remains untouched!)
   draft_res = ApiTest.send(
