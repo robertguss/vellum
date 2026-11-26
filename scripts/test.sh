@@ -9,19 +9,23 @@ mo check domain/blocks.mo
 mo check domain/policy.mo
 mo check domain/database-model.mo
 mo check domain/collab.mo
+mo check domain/notion-import.mo
 mo check db.mo
 mo check routes/auth.mo
 mo check routes/workspace.mo
 mo check routes/databases.mo
 mo check routes/collab.mo
 mo check routes/mcp.mo
+mo check routes/importer.mo
+mo check routes/ai.mo
 mo check main.mo
 
 mo test domain/blocks.mo
 mo test domain/policy.mo
 mo test domain/database-model.mo
 mo test domain/collab.mo
+mo test domain/notion-import.mo
 mo test db.mo
 mo test main.mo
 
-echo "All Vellum Stage 1, Stage 2, and Stage 3 checks and tests passed."
+echo "All Vellum Stage 1, Stage 2, Stage 3, and Stage 4 checks and tests passed."
