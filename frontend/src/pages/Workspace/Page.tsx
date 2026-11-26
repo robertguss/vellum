@@ -8,13 +8,14 @@ import {
   Send,
   Upload,
 } from "lucide-react";
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import BlockEditor from "../../components/BlockEditor";
 import WorkspaceLayout from "../../components/WorkspaceLayout";
 import { ApiError, apiFetch } from "../../lib/api";
 import type {
   Attachment,
   Block,
+  ClaimRecord,
   Collection,
   Comment,
   DatabaseDef,
@@ -55,12 +56,57 @@ export default function PageView({
   const [anchoredMd, setAnchoredMd] = useState<string>(initialAnchored);
   const [comments, setComments] = useState<Comment[]>(initialComments);
   const [attachments, setAttachments] = useState<Attachment[]>(initialAttachments);
+  const [activeClaims, setActiveClaims] = useState<ClaimRecord[]>([]);
+  const [liveNotice, setLiveNotice] = useState<string | null>(null);
   const [tab, setTab] = useState<"editor" | "markdown">("editor");
   const [verifying, setVerifying] = useState(false);
   const [commentBody, setCommentBody] = useState("");
   const [commentSaving, setCommentSaving] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setPage(initialPage);
+  }, [initialPage]);
+
+  useEffect(() => {
+    setBlocks(initialBlocks);
+  }, [initialBlocks]);
+
+  useEffect(() => {
+    setAnchoredMd(initialAnchored);
+  }, [initialAnchored]);
+
+  useEffect(() => {
+    setComments(initialComments);
+  }, [initialComments]);
+
+  useEffect(() => {
+    setAttachments(initialAttachments);
+  }, [initialAttachments]);
+
+  const blockIds = new Set(blocks.map((b) => `block:${b.id}`));
+  const pageLeases = activeClaims.filter(
+    (c) => c.resource === `page:${page.id}` || blockIds.has(c.resource)
+  );
+
+  const handleRealtimeEvent = useCallback((eventName: string, data: Record<string, unknown>) => {
+    const actor = typeof data.actor === "string" ? data.actor : "collaborator";
+    if (
+      eventName === "page.blocks_updated" ||
+      eventName === "page.verified" ||
+      eventName === "comment.created" ||
+      eventName === "proposal.accepted" ||
+      eventName === "resync_required"
+    ) {
+      setLiveNotice(
+        eventName === "resync_required"
+          ? "Re-synced page snapshot from server"
+          : `Updated live by ${actor} (${eventName})`
+      );
+      router.reload({ only: ["page", "blocks", "anchored_markdown", "comments"] });
+    }
+  }, []);
 
   async function handleVerify() {
     setVerifying(true);
@@ -164,8 +210,31 @@ export default function PageView({
       databases={databases}
       activeCollectionSlug={collection.slug}
       currentCollectionId={collection.id}
+      realtimeScope={{ pageId: page.id }}
+      onRealtimeEvent={handleRealtimeEvent}
+      onClaimsChange={setActiveClaims}
     >
       <div className="space-y-6">
+        {pageLeases.length > 0 && (
+          <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs text-amber-900 flex flex-wrap items-center justify-between gap-2">
+            <span>
+              Active advisory lease{pageLeases.length > 1 ? "s" : ""}:{" "}
+              {pageLeases.map((c) => `${c.holder} on ${c.resource} (${c.reason})`).join(" · ")}
+            </span>
+          </div>
+        )}
+        {liveNotice && (
+          <div className="rounded-xl border border-teal-200 bg-teal-50 px-4 py-2 text-xs text-teal-900 flex items-center justify-between">
+            <span>{liveNotice}</span>
+            <button
+              type="button"
+              onClick={() => setLiveNotice(null)}
+              className="text-teal-700 hover:underline"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
         {/* Breadcrumb + Freshness Banner */}
         <div className="rounded-2xl border border-stone-200 bg-white p-6 space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-4">

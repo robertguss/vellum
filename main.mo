@@ -3044,3 +3044,347 @@ test "end-to-end Vellum Stage 5: Inertia Workspace shells (/proposals, /admin, /
   assert adm_p.component == "Workspace/Admin"
   assert (Json.Object(adm_p.props).list_at("audit_feed") or []).size >= 1
 end
+
+test "realtime SSE topic grants, 403 unauthorized page scope, and mutation publish directives"
+  manifest_json = """
+    {
+      "src/main.tsx": {
+        "file": "assets/main-a1b2c3d4.js",
+        "css": ["assets/main-f9e8d7c6.css"],
+        "isEntry": true
+      }
+    }
+    """
+  files = Files.in_memory({
+    "public/manifest.json": manifest_json,
+    "public/assets/main-a1b2c3d4.js": "console.log('vellum');",
+    "public/assets/main-f9e8d7c6.css": "body{margin:0}"
+  })
+  rng = SecureRandom.seeded(20261130)
+  key_hex = "1111111111111111111111111111111122222222222222222222222222222222"
+  t0 = Time.parse("2026-11-26T12:00:00Z") or stop "t0"
+  clock0 = Clock.fixed(t0)
+  env = Env.of({
+    "VELLUM_SECRET_KEY": key_hex,
+    "VELLUM_INSECURE_COOKIES": "1",
+    "VELLUM_OIDC_PROVIDER_ID": "okta-test",
+    "VELLUM_OIDC_CLIENT_ID": "vellum-web",
+    "VELLUM_OIDC_CLIENT_SECRET": "oidc-secret-xyz",
+    "VELLUM_OIDC_REDIRECT_URI": "http://localhost:8080/auth/oidc/callback",
+    "VELLUM_OIDC_ISSUER": "https://auth.example.com",
+    "VELLUM_OIDC_AUTH_URL": "https://auth.example.com/authorize",
+    "VELLUM_OIDC_TOKEN_URL": "https://auth.example.com/token",
+    "VELLUM_OIDC_USERINFO_URL": "https://auth.example.com/userinfo",
+    "VELLUM_OIDC_ALLOWED_DOMAINS": "acme.io"
+  })
+  empty_net = Network.fake(Http.replies([]))
+
+  guest = WebTest.new().with_header("Host", "localhost:8080")
+  oidc_start = ApiTest.send(
+    Main,
+    WebTest.prepare(guest, Api.get("/auth/oidc/login?return_to=/")),
+    files,
+    clock0,
+    env,
+    rng,
+    empty_net
+  )
+  assert oidc_start.status == 302
+  q_params = Api.request("GET", oidc_start.header("Location") or "").query
+  oidc_state = q_params.find(fn(p) p.0 == "state" end).map(fn(p) p.1 end) or stop "state"
+  oidc_nonce = q_params.find(fn(p) p.0 == "nonce" end).map(fn(p) p.1 end) or stop "nonce"
+  verifier = unseal_oidc_code_verifier(
+    oidc_start,
+    "vellum_oidc_state",
+    Bytes.from_hex(key_hex) or stop "key"
+  )
+  oidc_cfg = case Auth.oidc_config(env)
+    Ok(c): c
+    Error(_): stop "oidc_cfg"
+  end
+  id_jwt = Oidc.build_unsigned_test_jwt(
+    Json.Object({
+      "iss": Json.String("https://auth.example.com"),
+      "aud": Json.String("vellum-web"),
+      "sub": Json.String("sub_sse_owner"),
+      "nonce": Json.String(oidc_nonce),
+      "exp": Json.int(1800000000),
+      "email": Json.String("sse@acme.io"),
+      "email_verified": Json.Boolean(true)
+    })
+  )
+  token_body = Json.Object({
+    "access_token": Json.String("at-sse"),
+    "token_type": Json.String("Bearer"),
+    "id_token": Json.String(id_jwt)
+  }).to_text
+  userinfo_body = Json.Object({
+    "sub": Json.String("sub_sse_owner"),
+    "email": Json.String("sse@acme.io"),
+    "email_verified": Json.Boolean(true),
+    "name": Json.String("SSE Owner")
+  }).to_text
+  tok_req = Oidc.token_exchange_request(oidc_cfg, "c1", verifier)
+  ui_req = Oidc.userinfo_request("https://auth.example.com/userinfo", "at-sse")
+  oidc_net = Network.fake(
+    Http.replies([(tok_req, Http.reply(200, token_body)), (ui_req, Http.reply(200, userinfo_body))])
+  )
+  guest_with_oidc = WebTest.absorb(guest, oidc_start)
+  cb_res = ApiTest.send(
+    Main,
+    WebTest.prepare(guest_with_oidc, Api.get("/auth/oidc/callback?code=c1&state=#{oidc_state}")),
+    files,
+    clock0,
+    env,
+    rng,
+    oidc_net
+  )
+  assert cb_res.status == 303
+  owner = WebTest.absorb(guest_with_oidc, cb_res)
+
+  # Create collection & page, plus secret collection & page
+  c1 = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/collections").with_json(
+        Workspace.CreateCollectionInput(
+          slug: "pub-col",
+          name: "Public Col",
+          description: None,
+          icon: None,
+          write_policy: DirectWithAudit,
+          freshness_ttl_days: Some(30)
+        )
+      )
+    ),
+    files,
+    clock0,
+    env,
+    rng,
+    empty_net
+  )
+  assert c1.status == 201
+  c1_id = must_json(c1.text).text_at("id") or stop "c1_id"
+
+  c2 = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/collections").with_json(
+        Workspace.CreateCollectionInput(
+          slug: "secret-col",
+          name: "Secret Col",
+          description: None,
+          icon: None,
+          write_policy: DirectWithAudit,
+          freshness_ttl_days: Some(30)
+        )
+      )
+    ),
+    files,
+    clock0,
+    env,
+    rng,
+    empty_net
+  )
+  assert c2.status == 201
+  c2_id = must_json(c2.text).text_at("id") or stop "c2_id"
+
+  p1 = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/pages").with_json(
+        Workspace.CreatePageInput(
+          collection_id: c1_id,
+          parent_page_id: None,
+          title: "Pub Page",
+          markdown: "Initial live copy",
+          icon: None,
+          freshness_ttl_days: None,
+          reason: Some("seed pub")
+        )
+      )
+    ),
+    files,
+    clock0,
+    env,
+    rng,
+    empty_net
+  )
+  assert p1.status == 201
+  p1_id = must_json(p1.text).text_at("page.id") or stop "p1_id"
+  p1_blk = must_json(p1.text).text_at("blocks.0.id") or stop "p1_blk"
+  create_evs = p1.sse_published_events
+  assert create_evs.any?(fn(e) e.topic == "collection:#{c1_id}" and e.event == Some("page.created") end)
+
+  p2 = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/pages").with_json(
+        Workspace.CreatePageInput(
+          collection_id: c2_id,
+          parent_page_id: None,
+          title: "Secret Page",
+          markdown: "Confidential",
+          icon: None,
+          freshness_ttl_days: None,
+          reason: Some("seed secret")
+        )
+      )
+    ),
+    files,
+    clock0,
+    env,
+    rng,
+    empty_net
+  )
+  assert p2.status == 201
+  p2_id = must_json(p2.text).text_at("page.id") or stop "p2_id"
+
+  # Mint scoped agent allowed only on c1_id (forbidden on c2_id)
+  mint_res = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/admin/agents").with_json(
+        Workspace.MintAgentTokenInput(
+          handle: "sse-agent",
+          display_name: "SSE Agent",
+          model_id: None,
+          label: "sse",
+          allowed_actions: ["read", "claim", "propose", "write_direct"],
+          allowed_collections: Some([c1_id]),
+          max_calls: 20,
+          ttl_days: 7
+        )
+      )
+    ),
+    files,
+    clock0,
+    env,
+    rng,
+    empty_net
+  )
+  assert mint_res.status == 201
+  agent_tok = must_json(mint_res.text).text_at("raw_token") or stop "agent_tok"
+
+  # Agent unscoped /api/events subscribes only to claims + c1_id, NEVER c2_id
+  ag_ev = ApiTest.send(Main, Api.get("/api/events").with_bearer(agent_tok), files, clock0, env, rng, empty_net)
+  assert ag_ev.status == 200
+  ag_topics = ag_ev.sse_subscribe_topics
+  assert ag_topics.contains?("claims")
+  assert ag_topics.contains?("collection:#{c1_id}")
+  assert not ag_topics.contains?("collection:#{c2_id}")
+
+  # Agent scoped to unauthorized ?page_id=<p2_id> fails closed with 403
+  ag_forbid = ApiTest.send(
+    Main,
+    Api.get("/api/events?page_id=#{p2_id}").with_bearer(agent_tok),
+    files,
+    clock0,
+    env,
+    rng,
+    empty_net
+  )
+  assert ag_forbid.status == 403
+
+  # Authorized ?page_id=<p1_id> subscribes to claims + page:<p1_id>
+  owner_page_ev = ApiTest.send(
+    Main,
+    WebTest.prepare(owner, Api.get("/api/events?page_id=#{p1_id}")),
+    files,
+    clock0,
+    env,
+    rng,
+    empty_net
+  )
+  assert owner_page_ev.status == 200
+  assert owner_page_ev.sse_subscribe_topics == ["claims", "page:#{p1_id}"]
+  assert owner_page_ev.text.contains?("event: connected")
+
+  # Claim + Patch + Proposal publish expected SSE topics & events
+  cl_res = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/claims").with_json(
+        Collab.AcquireClaimInput(
+          resource: "page:#{p1_id}",
+          ttl_seconds: 60,
+          world_id: None,
+          reason: "editing live"
+        )
+      )
+    ),
+    files,
+    clock0,
+    env,
+    rng,
+    empty_net
+  )
+  assert cl_res.status == 201
+  assert cl_res.sse_published_events.any?(fn(e) e.topic == "claims" and e.event == Some("claim.acquired") end)
+
+  patch_res = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.patch("/api/pages/#{p1_id}/blocks").with_json(
+        Workspace.PatchBlocksInput(
+          ops: [
+            ReplaceBlock(
+              block_id: p1_blk,
+              expected_version: 1,
+              kind: None,
+              markdown: "Updated live copy"
+            )
+          ],
+          expected_versions: {p1_blk: 1},
+          reason: Some("live sync edit")
+        )
+      )
+    ),
+    files,
+    clock0,
+    env,
+    rng,
+    empty_net
+  )
+  assert patch_res.status == 200
+  patch_evs = patch_res.sse_published_events
+  assert patch_evs.any?(fn(e) e.topic == "page:#{p1_id}" and e.event == Some("page.blocks_updated") end)
+  assert patch_evs.any?(fn(e)
+    e.topic == "collection:#{c1_id}" and e.event == Some("page.blocks_updated")
+  end)
+
+  mcp_prop = ApiTest.send(
+    Main,
+    Api.post("/mcp").with_bearer(agent_tok).with_json(
+      Json.Object({
+        "jsonrpc": Json.String("2.0"),
+        "id": Json.int(1),
+        "method": Json.String("tools/call"),
+        "params": Json.Object({
+          "name": Json.String("vellum.proposal_open"),
+          "arguments": Json.Object({
+            "page_id": Json.String(p1_id),
+            "title": Json.String("Agent live proposal"),
+            "reason": Json.String("trigger realtime event")
+          })
+        })
+      })
+    ),
+    files,
+    clock0,
+    env,
+    rng,
+    empty_net
+  )
+  assert mcp_prop.status == 200
+  assert mcp_prop.sse_published_events.any?(fn(e)
+    e.topic == "page:#{p1_id}" and e.event == Some("proposal.opened")
+  end)
+end

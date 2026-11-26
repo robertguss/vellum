@@ -1,6 +1,6 @@
 import { Link, router } from "@inertiajs/react";
 import { Check, ChevronDown, ChevronRight, GitPullRequest, XCircle } from "lucide-react";
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import WorkspaceLayout from "../../components/WorkspaceLayout";
 import { ApiError, apiFetch } from "../../lib/api";
 import type { Collection, DatabaseDef, ProposalMeta } from "../../lib/types";
@@ -84,8 +84,28 @@ export default function ProposalsView({
     }
   }
 
+  useEffect(() => {
+    setProposals(initialProposals);
+  }, [initialProposals]);
+
+  const handleRealtimeEvent = useCallback((eventName: string) => {
+    if (
+      eventName === "proposal.opened" ||
+      eventName === "proposal.accepted" ||
+      eventName === "proposal.rejected" ||
+      eventName === "resync_required"
+    ) {
+      router.reload({ only: ["proposals"] });
+    }
+  }, []);
+
   return (
-    <WorkspaceLayout title="Change Proposals" collections={collections} databases={databases}>
+    <WorkspaceLayout
+      title="Change Proposals"
+      collections={collections}
+      databases={databases}
+      onRealtimeEvent={handleRealtimeEvent}
+    >
       <div className="space-y-6">
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div>

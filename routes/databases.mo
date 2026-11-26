@@ -792,7 +792,18 @@ fn create_row(
       Ok((t2, (row, page)))
     end
   )
-  Ok(json_ok(201, Json.Object({"row": saved_row.to_json, "page": saved_page.to_json})))
+  row_ev = Json.Object({
+    "database_id": Json.String(saved_row.database_id),
+    "row_id": Json.String(saved_row.id),
+    "page_id": Json.String(saved_page.id),
+    "collection_id": Json.String(saved_page.collection_id),
+    "actor": Json.String(auth.principal.handle)
+  })
+  Ok(
+    json_ok(201, Json.Object({"row": saved_row.to_json, "page": saved_page.to_json}))
+      .with_sse_publish_json("database:#{saved_row.database_id}", "db.row_created", row_ev)
+      .with_sse_publish_json("collection:#{saved_page.collection_id}", "db.row_created", row_ev)
+  )
 end
 
 ## `PATCH /api/databases/:id/rows/:row_id` — Updates row cells with optimistic version checks, syncing `vlm_db_cells`, backing `Page`, and `Modb.Fts`.
@@ -897,7 +908,19 @@ fn update_row(
       Ok((t2, (bumped_row, bumped_page)))
     end
   )
-  Ok(json_ok(200, Json.Object({"row": next_row.to_json, "page": next_page.to_json})))
+  row_ev = Json.Object({
+    "database_id": Json.String(next_row.database_id),
+    "row_id": Json.String(next_row.id),
+    "page_id": Json.String(next_page.id),
+    "collection_id": Json.String(next_page.collection_id),
+    "version": Json.int(next_row.version),
+    "actor": Json.String(auth.principal.handle)
+  })
+  Ok(
+    json_ok(200, Json.Object({"row": next_row.to_json, "page": next_page.to_json}))
+      .with_sse_publish_json("database:#{next_row.database_id}", "db.row_updated", row_ev)
+      .with_sse_publish_json("collection:#{next_page.collection_id}", "db.row_updated", row_ev)
+  )
 end
 
 ## `DELETE /api/databases/:id/rows/:row_id` — Deletes a `DbRow`, `vlm_db_cells`, backing `Page`, and FTS entry.
@@ -919,7 +942,7 @@ fn delete_row(
   )
   audit_payload = Json.Object({"database_id": Json.String(id), "row_id": Json.String(row_id)})
 
-  try Ledger.transact_locked(
+  col_id = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -940,8 +963,18 @@ fn delete_row(
       end
       _ignore = old_row
       t2 = try Db.tx_delete_db_row(t1, def, row_id)
-      Ok((t2, Unit))
+      Ok((t2, def.collection_id))
     end
   )
-  Ok(json_ok(200, Json.Object({"deleted_row_id": Json.String(row_id)})))
+  del_ev = Json.Object({
+    "database_id": Json.String(id),
+    "row_id": Json.String(row_id),
+    "collection_id": Json.String(col_id),
+    "actor": Json.String(auth.principal.handle)
+  })
+  Ok(
+    json_ok(200, Json.Object({"deleted_row_id": Json.String(row_id)}))
+      .with_sse_publish_json("database:#{id}", "db.row_deleted", del_ev)
+      .with_sse_publish_json("collection:#{col_id}", "db.row_deleted", del_ev)
+  )
 end

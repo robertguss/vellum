@@ -459,6 +459,156 @@ const finalPage = await apiJson(`/api/pages/${pageId}`);
 assert.equal(finalPage.res.status, 200);
 assert.ok(finalPage.json.anchored_markdown.includes("quorum status"));
 console.log("✓ Live /mcp agent proposal -> Modb.World diff -> human accept verified");
+
+// 8. True Streaming SSE multi-client fanout + MCP live event + Last-Event-ID replay
+async function openLiveSse(path, lastEventId = null) {
+  const controller = new AbortController();
+  const headers = new Headers({ Accept: "text/event-stream" });
+  const cookieHdr = jar.headerFor(BASE);
+  if (cookieHdr) headers.set("Cookie", cookieHdr);
+  if (lastEventId) headers.set("Last-Event-ID", lastEventId);
+
+  const sseRes = await fetch(`${BASE}${path}`, {
+    headers,
+    signal: controller.signal,
+  });
+  assert.equal(sseRes.status, 200, `SSE ${path} HTTP ${sseRes.status}`);
+  assert.ok(
+    (sseRes.headers.get("content-type") || "").startsWith("text/event-stream"),
+    "SSE Content-Type"
+  );
+  assert.equal(sseRes.headers.get("x-mo-sse-subscribe"), null, "Internal subscribe header stripped");
+
+  const reader = sseRes.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const events = [];
+
+  async function nextEvent(timeoutMs = 5000) {
+    const deadline = Date.now() + timeoutMs;
+    while (true) {
+      const idx = buffer.indexOf("\n\n");
+      if (idx !== -1) {
+        const rawFrame = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        if (!rawFrame.trim()) continue;
+        let id = null;
+        let event = "message";
+        const dataLines = [];
+        for (const line of rawFrame.split("\n")) {
+          if (line.startsWith(":")) continue;
+          if (line.startsWith("id:")) id = line.slice(3).trim();
+          else if (line.startsWith("event:")) event = line.slice(6).trim();
+          else if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+        }
+        if (dataLines.length === 0) continue;
+        const parsed = { id, event, data: dataLines.join("\n") };
+        events.push(parsed);
+        return parsed;
+      }
+      const rem = deadline - Date.now();
+      if (rem <= 0) {
+        throw new Error(`Timed out waiting for SSE frame; buffer=${JSON.stringify(buffer)}`);
+      }
+      const chunk = await Promise.race([
+        reader.read(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("SSE read timeout")), rem)
+        ),
+      ]);
+      if (chunk.done) {
+        throw new Error("SSE stream closed unexpectedly");
+      }
+      buffer += decoder.decode(chunk.value, { stream: true });
+    }
+  }
+
+  async function waitFor(predicate, timeoutMs = 5000) {
+    const foundExisting = events.find(predicate);
+    if (foundExisting) return foundExisting;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const ev = await nextEvent(deadline - Date.now());
+      if (predicate(ev)) return ev;
+    }
+    throw new Error("Timed out matching SSE event");
+  }
+
+  return {
+    waitFor,
+    close: () => {
+      controller.abort();
+      reader.cancel().catch(() => {});
+    },
+  };
+}
+
+const sseClient = await openLiveSse(`/api/events?page_id=${pageId}`);
+await sseClient.waitFor((e) => e.event === "connected");
+await sseClient.waitFor((e) => e.event === "claims.snapshot");
+
+const claimRes = await apiJson("/api/claims", {
+  method: "POST",
+  body: JSON.stringify({
+    resource: `page:${pageId}`,
+    ttl_seconds: 60,
+    world_id: null,
+    reason: "live SSE lease check",
+  }),
+});
+assert.equal(claimRes.res.status, 201, claimRes.text);
+assert.equal(claimRes.res.headers.get("x-mo-sse-publish"), null, "Internal publish header stripped");
+const claimEv = await sseClient.waitFor((e) => e.event === "claim.acquired");
+assert.ok(claimEv.id && Number(claimEv.id) >= 1, "claim.acquired carries monotonic broker id");
+
+const patchRes = await apiJson(`/api/pages/${pageId}/blocks`, {
+  method: "PATCH",
+  body: JSON.stringify({
+    ops: [
+      {
+        replace_block: {
+          block_id: blkId,
+          expected_version: 2,
+          kind: null,
+          markdown: "Verify gateway healthz, quorum status, and live SSE propagation.",
+        },
+      },
+    ],
+    expected_versions: { [blkId]: 2 },
+    reason: "live SSE block update",
+  }),
+});
+assert.equal(patchRes.res.status, 200, patchRes.text);
+const patchEv = await sseClient.waitFor((e) => e.event === "page.blocks_updated");
+assert.ok(Number(patchEv.id) > Number(claimEv.id), "monotonic id increased across mutations");
+
+const mcpLiveProp = await mcpCall(5, "tools/call", {
+  name: "vellum.proposal_open",
+  arguments: {
+    page_id: pageId,
+    title: "Live SSE MCP proposal",
+    reason: "Verify MCP -> browser EventSource fanout",
+  },
+});
+assert.equal(mcpLiveProp.result?.isError, false);
+const propEv = await sseClient.waitFor((e) => e.event === "proposal.opened");
+assert.ok(propEv.data.includes("Live SSE MCP proposal"));
+
+const lastSeenId = propEv.id;
+sseClient.close();
+
+// Release claim while SSE tab is disconnected, then reconnect with Last-Event-ID to verify replay
+const relRes = await apiJson("/api/claims/release", {
+  method: "POST",
+  body: JSON.stringify({ resource: `page:${pageId}` }),
+});
+assert.equal(relRes.res.status, 200, relRes.text);
+
+const replayedClient = await openLiveSse(`/api/events?page_id=${pageId}`, lastSeenId);
+const replayedEv = await replayedClient.waitFor((e) => e.event === "claim.released");
+assert.ok(Number(replayedEv.id) > Number(lastSeenId), "replayed claim.released has newer id");
+replayedClient.close();
+console.log("✓ Live streaming SSE fanout (claims, blocks, MCP proposals) & Last-Event-ID replay verified");
 EOF
 
 echo "All Live Vellum E2E checks against mo serve + Dex + VersityGW S3 passed."
