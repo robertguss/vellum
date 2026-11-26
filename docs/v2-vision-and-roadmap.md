@@ -1,226 +1,198 @@
 # Vellum v2 — AI-Native Knowledge Platform Vision & Roadmap
 
+> **Status:** Architectural Alignment Locked (Branches 1–5) · Active Exploration (Branch 6: RLM & Living Summaries)  
 > **Companion Specs:** [vellum-spec.md](vellum-spec.md) · [upstream-roadmap.md](upstream-roadmap.md) · [benchmarks.md](benchmarks.md)  
-> **Substrate:** [Mo](https://github.com/robertguss/mo) (Pure Safe Rust VM) · [MoDB](https://github.com/robertguss/modb) (Pure CoW B+Tree / Ledger / FTS / Vec / World / Replay / Taint / Erasure) · [Arvo](https://github.com/robertguss/arvo)
+> **Substrate:** [Mo](https://github.com/robertguss/mo) (Pure Safe Rust VM) · [MoDB](https://github.com/robertguss/modb) (Pure CoW B+Tree / Ledger / FTS / Vec / World / Replay / Views / Feeds / Taint / Erasure) · [Arvo](https://github.com/robertguss/arvo)
 
 ---
 
-## 1. Core Thesis: Don't Clone 2019 SaaS Wikis
+## 1. Core Thesis: Fuse Local Sovereignty, Team Governance & AI-Native Storage
 
 Modern knowledge tools fall into two broken camps:
 
-1. **Cloud SaaS Wikis (Notion, Confluence, Outline):** Built for human-only editing in mutable SaaS databases. AI is bolted on afterward as a chat sidebar over opaque blobs with weak branching, coarse permissions, external vector pipelines, and SaaS lock-in.
-2. **Local-First Note Apps (Obsidian, Logseq):** Fast and sovereign for individuals, but break down as soon as you need governed multi-user teams, relational queries across typed schemas, cryptographic audit trails, or safe multi-agent collaboration.
+1. **Cloud SaaS Wikis (Notion, Confluence, Outline):** Built for human-only editing inside mutable SaaS databases. AI is bolted on afterward as a chat sidebar over nested JSON/HTML blobs—resulting in MCP token bloat, blind overwrites, coarse ACLs, and SaaS lock-in.
+2. **Local-First & Flat-File Tools (Obsidian, Statamic):** Loved for speed, clean Markdown ownership, and thoughtful authoring UX (Ghost Koenig's serene card canvas, Statamic's Blueprints + Bard Sets + slide-over drawers), yet they break down on live multi-user concurrency, cross-collection relational queries, headless/remote agent access, or granular agent ACLs.
 
-Vellum sits on a stack with storage-layer capabilities neither camp has natively: copy-on-write **Worlds** (`Modb.World`), selective **Replay** undo (`Modb.Replay`), storage-level **Taint Tracking** (`Modb.Taint`), cryptographic **Erasure** (`Modb.Erasure`), reactive **Feeds & Views** (`Modb.Feeds`, `Modb.Views`), hierarchical **Grants** (`Modb.Grants`), advisory **Claims** (`Modb.Claims`), hash-chained **Audit Logs** (`Modb.Ledger`), and in-process **BM25 + Vector Search** (`Modb.Fts`, `Modb.Vec`)—all inside **one binary** and **one portable `.modb` file**.
+Vellum sits on a stack with storage-layer capabilities neither camp has natively: copy-on-write **Worlds** (`Modb.World`), selective **Replay** undo (`Modb.Replay`), storage-level **Taint Tracking** (`Modb.Taint`), cryptographic **Erasure** (`Modb.Erasure`), sandboxed **Read Programs** (`Modb.Views`), reactive **Feeds** (`Modb.Feeds`), hierarchical **Grants** (`Modb.Grants`), advisory **Claims** (`Modb.Claims`), hash-chained **Audit Logs** (`Modb.Ledger`), and in-process **BM25 + Vector Search** (`Modb.Fts`, `Modb.Vec`)—all inside **one binary** and **one portable `.modb` file**.
 
-The goal for Vellum v2 is simple: fuse **solo local-first speed**, **Git-grade branching for docs + data**, **relational databases with AI-compiled columns**, **living self-healing documentation**, and **storage-enforced enterprise AI safety** into one coherent platform.
+Rather than welding one forced UI onto proprietary blobs, Vellum v2 treats **canonical anchored Markdown (`<!-- blk:<ulid> -->`) + typed Blueprint metadata** as the single source of truth under the hood, and projects multiple first-class **Lenses** on top so developers, finance/ops teammates, writers, and AI agents collaborate on the exact same live state.
 
 ---
 
-## 2. Who Vellum Serves (On One Binary & One File)
+## 2. Locked Design Decisions (Collaborative Alignment)
+
+| Decision Area | Locked Choice | Why It Matters |
+| --- | --- | --- |
+| **Delivery Sequencing** | Merge PRs #11 & #12, then build Phase 1 in clean PR slices: `(1) Solo/Personal Auth Modes → (2) Next-Gen DB UX & Unified World Scenarios → (3) Multi-Lens Live Markdown Editor, Blueprints & Embedded DB Views`. | Every slice ships cleanly through `mo test` and `live-e2e.sh` without monolithic integration risk. |
+| **Deployment Modes (Branch 1)** | **3 clean modes (`solo` \| `personal` \| `team`)**: (1) **Local Solo**: strictly `127.0.0.1` auto-owner + local disk blobs, zero env setup; (2) **Personal Self-Hosted**: single owner login (passphrase/magic token, no OIDC IdP needed) on VPS/Tailscale; (3) **Team/Enterprise**: OIDC SSO PKCE + S3/disk. | **All 3 modes keep `Modb.Grants`, `Modb.Ledger`, `Modb.World`, and scoped `vlm_ag_...` agent tokens 100% active** so solo builders sandbox agents per collection safely. |
+| **Document & Editor Architecture (Branch 2)** | **Canonical Anchored Markdown + 4 Switchable Lenses (`⌘⇧L`)**: **Studio** (Ghost/Bard calm typography + `/` Sets), **Markdown** (direct Markdown + hover `blk_` anchors), **Patchwork/Review** (word-level prose diffs + per-hunk accept/reject + steer-in-place), and **X-Ray/Trust** (`Human` vs `Agent` vs `Tainted` vs drifted + `Modb.Replay` time-travel). | Solves the developer vs. finance/ops divide: zero format lock-in, live SSE sync across Lenses, custom Vellum engine owns schema/diffs/cards with a thin replaceable text-span primitive underneath Studio Lens. |
+| **Spaces, Schemas & Drawers (Branch 2)** | **Space (`Collection`) + Schema (`Blueprint`) + Multi-View (`Database`)** split + **Statamic-style slide-over drawers** for `{{metric:...}}` pills, citations, and `Relation` links. | Collections govern ACLs/taint; Blueprints share one `PropertyDef`/`CellValue` engine across structured pages and multi-view databases without forcing schema ceremony on blank notes. |
+| **Databases, Branches & AI Columns (Branch 3)** | Inline editing across all 11 cell types + saved-view tabs + visual schema builder + embedded DB blocks; **one Unified Multi-Resource `Modb.World` Branch** engine for multi-page proposals AND DB "What-If Scenarios"; **strictly typed AI-Compiled Columns**. | Eliminates parallel diff engines; AI columns validate via `DatabaseModel.validate_cell` against user-owned LLMs with `Modb.Feeds` triggers, per-column Auto vs. Proposal routing, and daily budgets. |
+| **Workspace-as-Memory & Local Sync (Branch 4)** | **3-Layer Progressive Disclosure** (`/llms.txt` index → **Context Studio / Compiled Context Packs** `vellum://packs/<slug>` with hard token budget → surgical `blk_` / `db_query` reads) + conflict-safe two-way `vellum sync`. | Prevents MCP schema/context bloat; sync conflicts never inject `<<<<<<<` markers or overwrite—mismatches open a `Modb.World` Proposal for visual Patchwork resolution. |
+| **Autonomous Gardeners & AI Safety (Branch 5)** | **Gardeners strictly Proposals-only**; external imports/webhooks auto-tainted (`TrustTier::Untrusted` in `Modb.Taint`); one-click **Crypto-Erase (`Modb.Erasure`)** for secrets/PII. | Zero silent AI overwrites; Lethal Trifecta blocked structurally at the storage layer; leaked secrets purge cleanly while preserving hash-chain audit integrity. |
+
+---
+
+## 3. Who Vellum Serves (On One Binary & One File)
 
 | Segment | Today's Pain | What Vellum v2 Delivers |
 | --- | --- | --- |
-| **Solo Developers & Indie Builders** | Docker/OIDC/S3 friction for local tools; agent context (`.md`, specs, tasks) drifts away from codebases. | **Zero-config `--solo` mode**, single `.modb` file, two-way `<!-- blk:... -->` local folder Markdown sync, direct `/mcp` context packs for Claude Code / Codex / Cursor. |
-| **Creators, Writers & Researchers** | Scattered bookmarks, untraceable quotes, vector plugins breaking on sync, slow search across big archives. | Fast native sub-millisecond `Modb.Fts` + `Modb.Vec` semantic search, automatic semantic backlinks, structured citation provenance on every paragraph, portable archive export. |
-| **Engineering & Product Teams** | Wiki rot, Confluence sprawl, blind overwrites by teammates or bots, spreadsheet-vs-wiki disconnect. | **"Git for Knowledge"** multi-page + database branches, interactive Kanban/Table/Calendar/Timeline views with exact `Decimal` rollups, autonomous PR-synced doc proposals. |
-| **Security-Conscious Companies** | Blocking AI tools over prompt injection, secret leakage, un-auditable agent mutations, and vendor SaaS custody. | `Modb.Taint` Lethal Trifecta protection, one-click `Modb.Erasure` secret purge, scoped/budgeted/expiring `vlm_ag_...` tokens, full hash-chained audit & selective agent undo. |
+| **Solo Developers & Indie Builders** | Docker/OIDC/S3 friction locally; agent context drifts away from repos; raw Obsidian vaults lack per-collection agent sandboxing. | **`--solo` mode** in 3 seconds, single `.modb` file, two-way YAML-frontmatter + anchored Markdown `vellum sync`, `/llms.txt` + Context Packs via `/mcp`, per-collection agent tokens. |
+| **Personal Self-Hosters & Creators** | Want private cloud access (VPS/Tailscale) without running Dex/Okta; scattered bookmarks & ungrounded notes. | **`personal` mode** (single-owner passphrase/magic login, local disk blobs), sub-millisecond `Modb.Fts` + `Modb.Vec` search, semantic backlinks, structured citation provenance. |
+| **Engineering, Finance & Product Teams** | Devs want Markdown, finance wants Notion/spreadsheet clarity; wiki rot; agents making unreviewed edits. | **4 Lenses over one live doc**, Ghost/Statamic Studio Lens + Live `Decimal` Metric Pills `{{metric:...}}`, slide-over inspection drawers, unified Git-like doc+DB Change Proposals, PR-synced runbooks. |
+| **Security-Conscious Enterprises** | Prompt injection ("Lethal Trifecta"), leaked keys in wikis, opaque agent permissions, SaaS custody risk. | `Modb.Taint` storage enforcement, one-click `Modb.Erasure` crypto-shredding, scoped/budgeted/expiring `vlm_ag_...` grants, hash-chained audit logs, selective agent rollback. |
 
 ---
 
-## 3. System Architecture (v2 Target State)
+## 4. System Architecture (v2 Target State)
 
 ```mermaid
 flowchart TB
-  subgraph Humans["Human Surfaces"]
-    Web["Web UI: Inertia v2 + React 19 + Tailwind v4"]
+  subgraph Humans["Human Surfaces (One Live State, Multi-Lens)"]
+    Web["Web UI: 4 Lenses (Studio / Markdown / Patchwork Review / X-Ray) + Multi-View DB + Drawers"]
     LocalFs["Local Repo Docs Folder (vellum sync / Neovim / VS Code)"]
   end
 
-  subgraph Agents["AI & Automation Surfaces"]
-    Ide["Claude Code / Codex / Cursor via /mcp"]
-    Bot["Autonomous Gardeners & GitHub PR Webhooks"]
-    Llm["Provider-Agnostic LLM / Embeddings (mo-gateway / OpenAI / Anthropic / Gemini)"]
+  subgraph Agents["AI & Automation Surfaces (Progressive Disclosure)"]
+    Ide["Claude Code / Codex / Cursor (/mcp: /llms.txt + Packs + Block/DB Tools)"]
+    Bot["Proposals-Only Gardeners & GitHub PR Webhooks"]
+    Llm["User-Owned LLM / Embeddings (mo-gateway / OpenAI / Anthropic / Gemini)"]
   end
 
   subgraph Server["Single Binary: mo serve (Pure Safe Rust VM)"]
-    Solo["Zero-Config Solo Mode (--solo + local disk blobs)"]
-    Auth["Enterprise Mode (OIDC SSO + S3 SigV4 + Scoped Agent Tokens)"]
-    Packs["Compiled Context Packs Engine (vellum://packs/<slug>)"]
-    Views["Multi-View Relational Engine (Table / Board / Calendar / Gallery / Timeline)"]
-    Branches["Workspace Branch Manager (Multi-Page + DB Proposals + What-If Scenarios)"]
+    Auth["3 Modes: Solo (loopback) | Personal (passphrase/token) | Team (OIDC + S3/disk)"]
+    Packs["Context Studio: /llms.txt & Token-Budgeted Packs (vellum://packs/<slug>)"]
+    Views["Unified Blueprint + Multi-View Engine (Table / Board / Calendar / Gallery / Timeline)"]
+    Branches["Unified Multi-Resource Modb.World Manager (Docs + DBs + What-If Scenarios)"]
   end
 
   subgraph MoDB["100% Pure MoDB Single-File Engine (vellum.modb)"]
-    KV["Modb CoW B+Tree & Table + Ledger Hash Chain"]
-    Search["Modb.Fts (BM25) + Modb.Vec (Sketch + Neural HNSW/Quantized)"]
-    Collab["Modb.World (CoW Branches) + Modb.Replay (Selective Undo) + Modb.Claims"]
+    KV["Modb CoW B+Tree & Table + Ledger Hash Chain + ReadPrograms (Modb.Views)"]
+    Search["Modb.Fts (BM25) + Modb.Vec (Sketch + Quantized Neural Vec)"]
+    Collab["Modb.World (Branches) + Modb.Replay (Selective Undo / Time Travel) + Modb.Claims"]
     Safety["Modb.Grants + Modb.Taint (Lethal Trifecta) + Modb.Erasure"]
-    Reactive["Modb.Feeds + Modb.Views + Modb.Export"]
+    Reactive["Modb.Feeds (O(diff) Cursors) + Modb.Export"]
   end
 
   Web --> Server
-  LocalFs <-->|"Bidirectional Anchored Markdown"| Server
+  LocalFs <-->|"YAML Frontmatter + Anchored Markdown"| Server
   Ide -->|"Streamable HTTP /mcp + Context Packs"| Server
-  Bot -->|"Signed Webhooks + Staged World Ops"| Server
+  Bot -->|"Signed Webhooks + World Proposals Only"| Server
   Server <-->|"Streaming Completions & Embeddings"| Llm
   Server --> MoDB
 ```
 
 ---
 
-## 4. The Six Unfair-Advantage Pillars
+## 5. The Six Unfair-Advantage Pillars
 
-### Pillar 1 — One Binary, One File: Effortless Solo Mode to Enterprise Scale
-- **Motivation:** Teams accept Docker + Dex/Okta + S3 setup; solo developers, creators, and small startups drop tools that take more than 10 seconds to launch.
-- **Zero-Config Solo Mode (`--solo` / `VELLUM_SOLO=1`):**
-  - Starts cleanly on `mo serve main.mo --solo` with **no Docker, no OIDC provider, and no S3 bucket required**.
-  - Auto-provisions or attaches a single local Owner session (strictly bound to `127.0.0.1` unless explicitly configured with shared-secret/OIDC guardrails—never weakening production fail-closed checks).
-  - Swaps `Arvo.S3` presigned uploads for a local content-addressed attachment store (`<data>/attachments/`) when S3 env vars are absent.
-- **Two-Way Lossless Anchored Markdown Sync (`vellum sync`):**
-  - Leverages Vellum's existing `<!-- blk:<ulid> -->` round-trip engine (`domain/blocks.mo`) so any collection can mirror 1:1 to a local directory (e.g., `./docs/`).
-  - Developers and coding agents edit plain `.md` files in Neovim, VS Code, or git branches; Vellum reconciles edits back into canonical `Block` records while preserving stable block IDs, block-level provenance, vectors, and relational links.
-- **True Single-File Portability:** Everything lives in `vellum.modb` + optional attachments directory—instant backup, git-friendly export via `Modb.Export`, or seamless upgrade from solo laptop to multi-worker team server.
+### Pillar 1 — One Binary, One File: Solo, Personal & Team Modes
+- **Three Clean Deployment Modes (`routes/auth.mo`, `routes/workspace.mo`):**
+  - **`solo` (`VELLUM_MODE=solo` / `--solo`):** Enforces loopback binding (`127.0.0.1` fail-closed if bound to `0.0.0.0` without upgrading mode), auto-creates/attaches local Owner session, auto-persists `0600` `.vellum_secret` in `--data`, and stores attachments on local disk (`<data>/attachments/`). Zero Docker, OIDC, or S3 required.
+  - **`personal` (`VELLUM_MODE=personal`):** Designed for solo builders self-hosting on a VPS or Tailscale across devices without setting up Dex/Okta. Single-owner authentication via hashed local passphrase / magic bootstrap token issuing the exact same AES-256-GCM + SHA-256 `sessions.modb` session cookies, backed by local disk or S3 attachments.
+  - **`team` (default production mode):** Full OIDC/SSO PKCE S256 (`Arvo.Oidc`), allowed email domains, and S3 SigV4 (`Arvo.S3`) or mounted object volume.
+- **Uncompromised Security Floor Across Modes:** `Modb.Grants`, `CollectionWritePolicy`, `Modb.Ledger`, `Modb.Claims`, `Modb.World`, and scoped `vlm_ag_...` bearer tokens stay active in **all three modes**.
+- **Two-Way Lossless Local Sync (`vellum sync`):** Mirrors selected collections to a local `./docs/` directory as clean **YAML frontmatter (from Blueprint metadata) + `<!-- blk:<ulid> -->` anchored Markdown**. Developers edit in Neovim, VS Code, or Git branches; teammates stay in the web Studio Lens seamlessly.
 
 ---
 
-### Pillar 2 — "Git for Knowledge": Multi-Page + Database Branches & Time Travel
-- **Motivation:** In Notion and Confluence, every keystroke mutates production truth. That forces teams into two bad extremes: zero review guardrails or blocking AI agents from editing important docs altogether.
-- **Whole-Workspace Branches (`Modb.World`):**
-  - Expand `Modb.World` Change Proposals (`routes/collab.mo`) from single-page edits (`WorldPatchArgs`) to **multi-resource speculative transactions** spanning multiple pages, relational database rows, and database schemas within one World (`base_pin_id`).
-  - Example: An agent updating a release spec edits the Architecture Overview, adds a checklist item to the Security Runbook, and marks 3 Q4 Launch Tracker rows as blocked—inside a single atomic branch.
-- **Unified Content + Data Diff Viewer (`GET /api/proposals/:id/diff` & `/proposals`):**
-  - Render block-by-block Markdown diffs per touched page *plus* row-by-row database cell diffs and **before/after exact `Decimal` rollup impact** (e.g., *"Total Q4 Budget: $17,500.50 → $21,700.50 (+$4,200)"*).
-  - **Accept & Land** commits all touched docs and DB rows atomically via `World.land_world_locked` with conflict detection against concurrent human edits.
-- **Selective Actor Undo & Time-Travel Scrubber (`Modb.Replay`):**
-  - Elevate `Modb.Replay` simulation (`routes/collab.mo`) into a visual Timeline UI on `/admin` and page history sidebars: preview reverting a specific agent run or time window *while keeping subsequent human edits intact*, or scrub any page/database backward across ledger commits (`base_txid`).
+### Pillar 2 — Multi-Lens Live Markdown, Blueprints & "Git for Knowledge"
+- **Space (`Collection`) + Schema (`Blueprint`) + Multi-View (`Database`) Unification:**
+  - **Collections** stay the ACL, write-policy, freshness, and default taint boundary (`Engineering`, `Finance`, `Runbooks`, `Personal`).
+  - **Blueprints** provide one shared typed property schema (`PropertyDef[]` / `CellValue`s): blank notes start with zero fields, structured docs attach a Blueprint for a clean Statamic-style metadata bar + YAML frontmatter sync, and Databases bind a Blueprint to multi-view tables.
+- **Four Instant Lenses Over One Canonical Block Store (`⌘⇧L`):**
+  1. **Studio Lens:** Inspired by Ghost's Koenig editor and Statamic's Bard—serene borderless typography, invisible Markdown shortcuts (`## `, `**`, `> `, `- [ ] `), contextual floating selection bar (**Bold / Italic / Link / Code / Comment / Cite / Ask AI**), interactive inline Sets via a tight `/` palette (`Callout`, `Checklist`, `Code`, `Divider`, `Live DB View`, `Live Metric Pill`, `Living AI Brief`), and hover drag handles (`⋮⋮`). Underneath, a clean bespoke Vellum block-tree & card runtime delegates only raw inline prose spans to a replaceable editor primitive.
+  2. **Markdown Lens:** Direct fast Markdown editing over exact canonical blocks (`blk_...` gutter anchors on hover), instant paste/terminal ergonomics, and live SSE parity with Studio Lens.
+  3. **Patchwork / Review Lens:** Inspired by Ink & Switch's *Patchwork*—word-level prose diffs (soft green additions, margin-pinned deletion pips/before-text, concise change-magnitude summary bars like *"2 sentences · 1 metric ($14.5k → $17.5k)"*), per-hunk Accept/Reject, and **Steer-in-Place** replies asking an agent to revise within the same `Modb.World` branch.
+  4. **X-Ray / Trust Lens:** Lights up authorship (`Human` vs `Agent + model`), verified freshness state, **Cited-Dependency Drift** (*"1 cited block changed since verification"*), `Modb.Taint` shields, and an inline **`Modb.Replay` Time-Travel Scrubber**.
+- **In-Prose Superpowers & Statamic Slide-Over Drawers:**
+  - **Live Exact-`Decimal` Metric Pills (`{{metric:...}}`)** inside narrative Markdown (reflecting Live OR active What-If Scenario totals automatically).
+  - **Living AI Brief Cards (`:::ai-brief`)** triggered by `Modb.Feeds` that stage **refresh proposals** rather than silently mutating docs.
+  - **Slide-Over Drawer Inspector:** Clicking a metric pill, citation `[blk_...]`, or `Relation` link opens the backing DB rows or source block in a slide-over drawer without losing scroll or writing context.
 
 ---
 
-### Pillar 3 — AI-Native Relational Databases (Beyond Spreadsheets)
-Vellum already stores every database row 1:1 as a full `Page` (`domain/database-model.mo`), with `Decimal` exact math, Relations, Rollups, `vlm_db_cells` secondary indexes, and 5 `Ledger` commit invariants.
-
-#### 3A. World-Class Core Database UX (Closing Every Ergonomic Gap)
-- **Inline Editing Everywhere:** Click-to-edit Table cells for all 11 types (`Title`, `RichText`, `Number`, `Date`, `Select`, `MultiSelect` multi-pill popover, `Checkbox`, `Person`, `Url`, `Relation` row picker, plus read-only computed `Rollup`).
-- **Saved-View Tabs & Persistence:** Top view tab bar rendered directly from `views: DbViewDef[]` (switch views without losing filter/sort state; create, rename, duplicate, reorder, and delete views).
-- **Visual Schema & Property Builder Drawer:** Add/edit/reorder columns visually, define `Select` / `MultiSelect` colored choices, and point `Relation` + `Rollup` columns (`count_all`, `count_values`, `sum_values`, `min_value`, `max_value`) with live preview.
-- **Embedded Live Database Views in Docs:** New `BlockKind` variant (`DatabaseViewEmbed(database_id, view_id)`) so docs can embed filtered Table/Board slices directly inline (e.g., an incident postmortem embedding its filtered action-items table).
-- **Kanban Drag-and-Drop, Calendar Drag/Schedule & Gallery/Timeline Views:** Smooth Kanban card drag across columns plus clean Gallery (card grid backed by row cover/snippets) and Timeline/Roadmap modes.
-
-#### 3B. Capabilities Traditional Databases Don't Have
-- **Live-Compiled Agent Columns (`PropertyKind::AiDerived` or reactive column pipeline):**
-  - Define typed columns populated automatically from each row's backing page blocks, linked relation rows, and provenance citations (e.g., *"Risk Severity (Select)"*, *"Exec Summary (RichText)"*, *"Missing Runbook Links (Number)"*).
-  - Triggered on row/page change via **`Modb.Feeds`** or run on demand; optionally staged into a Change Proposal (`Modb.World`) rather than silently mutating live cells; every derived cell stores source citation + model metadata.
-- **One-Click "Fork What-If Scenario" Inside `/d/:id`:**
-  - Click **Fork Scenario** on any database to spawn an isolated `Modb.World` copy of that table. Team leads or agents reorder priorities, adjust `Decimal` budgets, or reassign owners; the header displays a **Live vs. Scenario Delta Ribbon** showing net metric/rollup changes before clicking **Merge Scenario** or **Discard**.
-- **Full Structured MCP Read/Write (`routes/mcp.mo`):**
-  - Extend existing `vellum.db_query` with `vellum.db_schema`, `vellum.db_create_row`, `vellum.db_update_row`, and `vellum.db_propose_changes` (respecting `CollectionWritePolicy` fail-closed).
+### Pillar 3 — Next-Gen Databases, Unified `Modb.World` Branches & Typed AI Columns
+- **Core Relational Ergonomics:** Saved-view header tabs (create, switch, rename, duplicate, delete), inline editing for all 11 column types (`Title`, `RichText`, `Number`, `Date`, `Select`, `MultiSelect`, `Checkbox`, `Person`, `Url`, `Relation`, read-only `Rollup`), visual Schema/Relation/Rollup Builder drawer, drag-and-drop Kanban cards, embedded `DatabaseViewEmbed` blocks inside Pages, Gallery & Timeline views.
+- **Unified Multi-Resource `Modb.World` Branches ("Workspace Branches & What-If Scenarios"):**
+  - Upgrade `Modb.World` Change Proposals so a **single branch (`world_id`)** stages edits across **multiple Pages + Database rows + Database schemas** atomically.
+  - Click **Fork Scenario** inside `/d/:id` to spin up an isolated copy-on-write What-If branch, adjust budgets/priorities/Kanban states, watch a live **Scenario vs. Live exact `Decimal` Rollup Delta Ribbon**, and merge or discard cleanly—all using the exact same Proposal & Diff machinery as agent PRs.
+- **Strictly Typed AI-Compiled Columns:**
+  - Computed properties that validate outputs straight into typed `CellValue`s via `DatabaseModel.validate_cell` (`SelectVal`, `Decimal`, `DateVal`, `BoolVal`, `RichText`) using the user's own LLM/gateway (no SaaS credit tax).
+  - Tracks model + source block citations per cell, detects staleness via `Modb.Feeds`, and enforces **per-column Auto-Apply vs. Stage-as-Proposal** routing plus daily call/budget caps.
+- **Full Structured MCP Database Surface (`routes/mcp.mo`):** `vellum.db_query`, `vellum.db_schema`, `vellum.db_create_row`, `vellum.db_update_row`, and `vellum.db_propose_changes`.
 
 ---
 
-### Pillar 4 — Living, Self-Healing Knowledge Base (Kill Wiki Rot)
-- **First-Class Trust, Verification & Citation Strip:**
-  - Surface block/page `Provenance` (`Human` vs `Agent + model`, `reason`, `verified_at`, `citations`) cleanly at the top of pages and inline beside cited claims.
-  - Detect **Cited-Dependency Drift**: when page A cites block `blk_xyz` on page B and page B changes, flag page A as *"1 cited source updated since last verification"* without waiting for manual calendar reviews.
-- **Autonomous Contradiction, Duplicate & Staleness Gardeners (`Modb.Feeds` + `Modb.Vec` + `Modb.World`):**
-  - Upgrade `routes/ai.mo` (`garden_job`) from passive reporting to active curation: use `Modb.Vec` nearest-neighbor clusters across newly modified pages to detect conflicting numbers/policies or near-duplicate runbooks, then open concrete **Change Proposals** referencing exact `blk_...` anchors for 1-click human review.
-- **Codebase-Connected Living Docs (GitHub PR Webhook Bridge):**
-  - Add an inbound webhook endpoint (`POST /api/webhooks/github`, HMAC-verified) that inspects PR diffs/descriptions, finds semantically relevant runbooks/specs via `search_pages_hybrid`, and stages a reviewable Change Proposal updating affected docs alongside a citation link back to the PR.
+### Pillar 4 — Living, Self-Healing Knowledge Base (Zero Wiki Rot)
+- **Strict "Gardeners Never Write Live" Invariant:** Autonomous gardeners (staleness alerts, `Modb.Vec` near-duplicate & contradiction detection, GitHub PR runbook syncing) may **only open `Modb.World` Change Proposals** with explicit `reason` and `citations`—never overwrite production truth directly, even on `DirectWithAudit` collections.
+- **Cited-Dependency Drift:** Because citations reference stable `blk_...` anchors, MoDB detects when cited source blocks change and flags dependent docs + drafts refresh proposals.
+- **Codebase-Connected Living Docs:** Signed inbound `POST /api/webhooks/github` webhook matches PR changes against `search_pages_hybrid` and opens targeted `Modb.World` proposals updating affected docs with links back to commits/PRs.
 
 ---
 
-### Pillar 5 — Workspace-as-Memory: Compiled Context Packs & Semantic Graph
-- **Compiled Context Packs (`vellum://packs/<slug>` & `/api/packs/:slug`):**
-  - Teams and solo devs define reusable **Context Packs** in the UI: select collections, specific databases/saved views, optional semantic focus query, freshness constraint (`verified_within_days`), and strict token budget (e.g. `4,000`, `8,000`, or `16,000` tokens).
-  - Vellum compiles a clean, grant-filtered, deduplicated Markdown bundle anchored with `<!-- blk:... -->` IDs and citations.
-  - **One URL / One MCP Resource** keeps Claude Code, Codex, Cursor, CI bots, and onboarding chats synchronized with the exact live workspace—respecting caller `Modb.Grants` ACLs on every fetch.
-- **Zero-Infra Semantic Backlinks & Topic Map (`Modb.Vec`):**
-  - Every page sidebar displays **Related Pages** (`Vec.search` nearest neighbors, scoped by caller grants), **Referenced By** (explicit `PageLink` + database `Relation` backlinks), and **Possible Duplicates**.
-  - Workspace **Knowledge Map** (`/graph` or tab) visualizing clusters, orphan pages, stale pockets, and verification health directly from MoDB indexes.
+### Pillar 5 — Workspace-as-Memory: 3-Layer Progressive Disclosure & Context Studio
+Built specifically to eliminate the MCP context bloat and "context rot" hitting Notion and Confluence:
+1. **Layer 1 — Grant-Filtered `/llms.txt` (`vellum://index`):** Compact ~300-token live workspace map of permitted Context Packs, pinned docs, schemas, and freshness status.
+2. **Layer 2 — Context Studio & Compiled Context Packs (`vellum://packs/<slug>`, `/api/packs/:slug.md`):** Reusable bundles combining collections, pinned pages, saved DB views, and optional semantic queries, filtered by freshness + `Modb.Taint` cleanliness, compiled under a **hard token budget** with a live token meter in the UI and 1-click Copy / MCP URI for Claude Code, Codex, and Cursor.
+3. **Layer 3 — Surgical Reads & Typed Queries:** Fetch only exact `<!-- blk:... -->` sections, `vellum.db_query`, or hybrid search hits needed for execution.
+4. **Conflict-Safe `vellum sync`:** When a local `.md` edit diverges from concurrent live edits (`expected_version` mismatch), Vellum **never clobbers files or inserts `<<<<<<<` markers**—instead it stages the local delta into a `Modb.World` Change Proposal resolved visually in Patchwork / Review Lens.
 
 ---
 
-### Pillar 6 — Enterprise AI Safety That Actually Unlocks Adoption
-- **Lethal Trifecta Defense (`Modb.Taint`):**
-  - Expose MoDB's built-in `Modb.Taint` engine inside Vellum: content imported from untrusted external web clips, vendor docs, or public forms carries `tainted` / origin labels at block/page granularity.
-  - If an agent reads tainted data during a session, MoDB structurally blocks that session from exfiltrating data via outbound webhooks (`Arvo.Webhooks`), unrestricted writes, or unauthorized reads—enforced deterministically in the database engine rather than via brittle prompt warnings.
-- **One-Click Cryptographic Secret & PII Erasure (`Modb.Erasure`):**
-  - Detect or report accidentally pasted API keys, tokens, or sensitive PII; let Owners/Admins trigger `Modb.Erasure` directly from Block actions or `/admin` so sensitive payloads are cryptographically scrubbed across history while `Modb.Ledger`'s hash chain remains verifiable.
-- **Visual Agent Control Plane (`/admin`):**
-  - Live SSE activity stream showing active claims (`Modb.Claims`), open proposals, token burn vs `max_calls` budgets, visual **Monotonic Grant Sub-Delegation Tree** (`Modb.Grants`), and one-click token/grant revocation.
+### Pillar 6 — Enterprise AI Safety Enforced in Storage
+- **`Modb.Taint` Lethal Trifecta Defense:** External imports (`routes/importer.mo`), web clips, and inbound webhooks default to `TrustTier::Untrusted`. Agent searches route through `Modb.Taint.hybrid_search_tainted` (with monotonic `fork_session`), structurally blocking tainted sessions from triggering outbound webhooks or restricted write-downs (`authorize_action`)—enforced by MoDB, not prompt wishes.
+- **One-Click Cryptographic Erasure (`Modb.Erasure`):** Scrub leaked keys, tokens, or PII from any block or subject via `Modb.Erasure.erase_subject_locked` (AES-256-GCM key shred + multi-store FTS/Vec/Replay/Audit redaction preserving hash-chain integrity + verifiable `ErasureReceipt`).
+- **Agent Control Plane (`/admin`):** Visual `Modb.Grants` sub-delegation tree, live `max_calls` budget gauges, live SSE lease/activity monitor, and instant kill switch.
 
 ---
 
-## 5. Phased Execution Roadmap
+## 6. Phased Execution Roadmap
 
-### Phase 1 — World-Class Core UX & Zero-Friction Adoption
-*Goal: Make Vellum immediately delightful for solo devs AND dramatically upgrade the Database + Editor UI.*
+### Phase 1 — World-Class Core UX & Frictionless Adoption
+*Delivered in clean PR slices immediately following PRs #11 & #12.*
 
-| Workstream | Deliverables | Primary Touchpoints |
+| Slice | Deliverables | Primary Touchpoints |
 | --- | --- | --- |
-| **1.1 Next-Gen Database UI** | Saved-view tab bar (`create`/`switch`/`delete`), inline editing for all 11 cell types (`Text`, `Number`, `Date`, `MultiSelect`, `Url`, `Relation`), visual Column/Relation/Rollup Schema Builder drawer, drag-and-drop Kanban + View counts, Table column visibility & sorting UX. | `frontend/src/pages/Workspace/Database.tsx`, `routes/databases.mo`, `domain/database-model.mo` |
-| **1.2 What-If Database Scenarios** | One-click **Fork Scenario** (`Modb.World` branch for DB rows), Scenario vs Live rollup delta banner, atomic **Merge Scenario** / **Discard**. | `routes/collab.mo`, `routes/databases.mo`, `db.mo`, `frontend/src/pages/Workspace/Database.tsx` |
-| **1.3 Rich Editor & Embedded Views** | Slash-command menu (`/` for `/h1`, `/callout`, `/code`, `/task`, `/divider`, `/db`), drag-handle block reordering (`MoveBlock`), `DatabaseViewEmbed` block rendering live filtered Table/Board inline inside any Page, clean reading mode vs focused editing chrome. | `frontend/src/components/BlockEditor.tsx`, `domain/types.mo`, `domain/blocks.mo`, `frontend/src/components/EmbeddedDatabase.tsx` |
-| **1.4 Zero-Config Solo Mode** | `--solo` / `VELLUM_SOLO=1` startup path bypassing OIDC/S3 containers cleanly with loopback local owner login & local attachment directory (strictly disabled on non-loopback production binds without explicit flag/auth). | `routes/auth.mo`, `routes/workspace.mo`, `main.mo`, `scripts/dev-solo.sh` |
-
-**Phase 1 Exit Criteria:** A developer clones `vellum`, runs `./scripts/dev-solo.sh` with zero Docker/env setup, creates docs with slash commands, embeds a live relational table, forks a What-If budget scenario on Kanban/Table, compares exact `Decimal` rollup deltas, and merges atomically—all passing `mo test` and `./scripts/live-e2e.sh`.
-
----
+| **1.1 Solo & Personal Auth Modes** | `VELLUM_MODE=solo\|personal\|team`, loopback fail-closed guard on `solo`, auto `.vellum_secret`, passphrase/magic-token `personal` login, local disk attachment backend (`<data>/attachments/`), `./scripts/dev-solo.sh`. | `routes/auth.mo`, `routes/workspace.mo`, `main.mo`, `.env.example`, `scripts/dev-solo.sh` |
+| **1.2 Next-Gen DB UX & Unified World Scenarios** | Saved-view tabs, inline edit for all 11 cell types, visual Column/Relation/Rollup Builder drawer, drag-and-drop Kanban, Unified Multi-Resource `Modb.World` backend + **"Fork Scenario"** / Live vs. Scenario `Decimal` delta ribbon inside `/d/:id`. | `routes/collab.mo`, `routes/databases.mo`, `db.mo`, `domain/collab.mo`, `frontend/src/pages/Workspace/Database.tsx` |
+| **1.3 Multi-Lens Editor, Blueprints & Embedded Views** | 4-Lens switcher (`Studio`, `Markdown`, `Patchwork/Review`, `X-Ray`), ghost-clean borderless Studio typography + `/` Sets menu + drag handles + floating selection toolbar, Statamic `Blueprint` metadata header sharing `PropertyDef`/`CellValue`, `DatabaseViewEmbed` block (`<!-- db_embed:... -->`), slide-over drawer inspector, `{{metric:...}}` live `Decimal` pills. | `domain/types.mo`, `domain/blocks.mo`, `routes/workspace.mo`, `frontend/src/components/BlockEditor.tsx`, `frontend/src/components/EmbeddedDatabase.tsx`, `frontend/src/pages/Workspace/Page.tsx` |
 
 ### Phase 2 — AI-Native Workspace Superpowers
-*Goal: Turn Vellum into live AI memory + structured multi-page agent collaboration.*
-
 | Workstream | Deliverables | Primary Touchpoints |
 | --- | --- | --- |
-| **2.1 Compiled Context Packs** | `ContextPack` schema in MoDB, CRUD + preview UI, `GET /api/packs/:slug` compiler (grant-filtered, verified-prioritized, deduplicated, strict token budget), native MCP resource `vellum://packs/<slug>` & tool `vellum.compile_pack`. | `domain/collab.mo` (or `domain/packs.mo`), `db.mo`, `routes/mcp.mo`, `routes/ai.mo`, `frontend/src/pages/Workspace/Packs.tsx` |
-| **2.2 Multi-Resource Workspace Branches** | Upgrade `Modb.World` proposal actions so one proposal stages ops across N pages + M DB rows/schemas; unified Proposals Inbox diff view showing Markdown block diffs + Database row/rollup diffs. | `routes/collab.mo`, `db.mo`, `domain/collab.mo`, `frontend/src/pages/Workspace/Proposals.tsx` |
-| **2.3 Live-Compiled Agent Columns** | `AiDerived` database property configuration + execution worker (`Modb.Feeds` trigger or on-demand batch), citation + model provenance per cell, optional routing through Change Proposals. | `domain/database-model.mo`, `routes/databases.mo`, `routes/ai.mo`, `frontend/src/pages/Workspace/Database.tsx` |
-| **2.4 Semantic Backlinks & MCP DB Writes** | Right-hand Page Context rail (`Modb.Vec` Related Docs + Explicit Backlinks + Verification/Dependency Drift status) + full MCP DB tools (`vellum.db_schema`, `vellum.db_create_row`, `vellum.db_update_row`, `vellum.db_propose_changes`). | `routes/workspace.mo`, `routes/mcp.mo`, `db.mo`, `frontend/src/pages/Workspace/Page.tsx` |
+| **2.1 Context Studio & Progressive Disclosure** | Grant-filtered `/llms.txt` (`vellum://index`), `ContextPack` MoDB schema, live token-budgeted compiler & UI, `vellum://packs/<slug>` MCP resource, `:::ai-brief` Living Brief cards (`Modb.Feeds`). | `domain/packs.mo`, `db.mo`, `routes/mcp.mo`, `routes/ai.mo`, `frontend/src/pages/Workspace/Packs.tsx` |
+| **2.2 Strictly Typed AI-Compiled Columns** | `AiDerived` DB column builder & executor validated via `DatabaseModel.validate_cell`, `Modb.Feeds` staleness tracking, per-column Auto vs. Proposal toggle, daily call/budget cap, citation provenance. | `domain/database-model.mo`, `routes/databases.mo`, `routes/ai.mo`, `frontend/src/pages/Workspace/Database.tsx` |
+| **2.3 Full Structured MCP DB Surface** | `vellum.db_schema`, `vellum.db_create_row`, `vellum.db_update_row`, `vellum.db_propose_changes` + `Steer-in-Place` comment threads inside Patchwork Review Lens. | `routes/mcp.mo`, `routes/collab.mo`, `frontend/src/pages/Workspace/Proposals.tsx` |
 
-**Phase 2 Exit Criteria:** Claude Code / Codex pulls `vellum://packs/eng-architecture` under an 8k token limit respecting grant boundaries; an agent updates 2 docs + 2 tracker rows inside one Change Proposal with unified content + rollup diff; pages display semantic backlinks and verification drift live.
-
----
-
-### Phase 3 — Living Knowledge & Local Developer Workflows
-*Goal: Zero wiki rot for teams + seamless local filesystem workflows for solo builders.*
-
+### Phase 3 — Living Docs, Local Sync & Time Travel
 | Workstream | Deliverables | Primary Touchpoints |
 | --- | --- | --- |
-| **3.1 Two-Way Anchored Markdown Sync** | `vellum sync` bidirectional watcher/reconciler preserving `<!-- blk:... -->` IDs, provenance, and FTS/Vec indexes between a collection and a local `./docs/` directory. | New CLI subcommand or sync module in `vellum` + `domain/blocks.mo`, upstream check on `mo` filesystem watch needs (`docs/upstream-roadmap.md`). |
-| **3.2 Autonomous Gardener Proposals & PR Sync** | `Modb.Vec` duplicate/contradiction detector proposing concrete fixes via `Modb.World`; signed `POST /api/webhooks/github` PR-to-runbook proposal generator. | `routes/ai.mo`, `routes/collab.mo`, `frontend/src/pages/Workspace/Admin.tsx` |
-| **3.3 Visual `Modb.Replay` Time-Travel UI** | Interactive simulation & point-in-time diff preview in `/admin` and per-page revision history (`Replay.simulate_replay_locked`), plus per-block restore. | `routes/collab.mo`, `routes/workspace.mo`, `frontend/src/pages/Workspace/Admin.tsx`, `frontend/src/pages/Workspace/Page.tsx` |
-| **3.4 Timeline & Gallery Views** | Rich Gallery cards and Date-range Timeline / Roadmap Gantt view on top of existing `DateProp(start, end_date)` storage. | `frontend/src/pages/Workspace/Database.tsx`, `domain/database-model.mo` |
-
----
+| **3.1 Conflict-Safe `vellum sync`** | Two-way YAML frontmatter + `<!-- blk:... -->` Markdown local mirror routing version conflicts cleanly into `Modb.World` Change Proposals. | Sync command/module in `vellum` + `domain/blocks.mo` |
+| **3.2 Proposals-Only Gardeners & PR Bridge** | Contradiction/duplicate detector (`Modb.Vec`), cited-dependency drift detector, signed `POST /api/webhooks/github` PR-to-runbook proposal generator. | `routes/ai.mo`, `routes/collab.mo`, `frontend/src/pages/Workspace/Admin.tsx` |
+| **3.3 Visual `Modb.Replay` & DB Gallery/Timeline** | Point-in-time scrubber + selective actor undo simulation UI + Semantic Backlinks rail (`Modb.Vec`) + Gallery & Timeline DB views. | `routes/collab.mo`, `routes/workspace.mo`, `frontend/src/pages/Workspace/{Page,Admin,Database}.tsx` |
 
 ### Phase 4 — Enterprise AI Safety Moat
-*Goal: Make MoDB's structural AI safety guarantees accessible and verifiable to enterprise security teams.*
-
 | Workstream | Deliverables | Primary Touchpoints |
 | --- | --- | --- |
-| **4.1 `Modb.Taint` Lethal Trifecta Integration** | Tag untrusted imports (`Notion` / web clips / external hooks) in MoDB; enforce taint propagation checks across `Modb.World`, `/mcp`, and outbound `Arvo.Webhooks`; display Taint badges & policy audit blocks in UI. | `db.mo`, `routes/importer.mo`, `routes/mcp.mo`, `routes/collab.mo`, `frontend/src/` |
-| **4.2 One-Click `Modb.Erasure` Secret Purge** | Secret/PII detector hint + Admin/Owner **Cryptographic Erase** action scrubbing block/audit secrets while keeping hash-chain integrity intact. | `db.mo`, `routes/workspace.mo`, `routes/collab.mo`, `frontend/src/pages/Workspace/Admin.tsx` |
-| **4.3 Sub-Delegation Control Plane** | Interactive `Modb.Grants` hierarchy tree, live budget gauges (`calls_used / max_calls`), live SSE agent stream, and one-click kill switch in `/admin`. | `routes/workspace.mo`, `routes/collab.mo`, `frontend/src/pages/Workspace/Admin.tsx` |
+| **4.1 `Modb.Taint` Lethal Trifecta UI & Enforcement** | Auto-taint external imports/webhooks; route `/mcp` search through `hybrid_search_tainted` + `fork_session`; gate webhooks/writes via `authorize_action`; surface X-Ray taint shields. | `db.mo`, `routes/importer.mo`, `routes/mcp.mo`, `routes/collab.mo`, `frontend/src/` |
+| **4.2 One-Click `Modb.Erasure` Secret Purge** | Secret detection hints + Admin/Owner crypto-erase triggering `Modb.Erasure.erase_subject_locked` + downloadable `ErasureReceipt`. | `db.mo`, `routes/workspace.mo`, `frontend/src/pages/Workspace/Admin.tsx` |
+| **4.3 Sub-Delegation Control Plane** | Live `Modb.Grants` hierarchy visualizer, token call-budget gauges, live SSE stream, and instant kill switch. | `routes/workspace.mo`, `routes/collab.mo`, `frontend/src/pages/Workspace/Admin.tsx` |
 
 ---
 
-## 6. Upstream Coordination (`mo`, `modb`, `arvo`)
+## 7. Upstream Coordination (`mo`, `modb`, `arvo`)
 
-As with v1 ([upstream-roadmap.md](upstream-roadmap.md)), any missing runtime or library capability discovered across Phases 1–4 is implemented cleanly upstream rather than hacked around in app code:
-
-- **MoDB (`modb`)**: Already ships `Modb.World`, `Modb.Replay`, `Modb.Grants`, `Modb.Claims`, `Modb.Fts`, `Modb.Vec`, `Modb.Feeds`, `Modb.Views`, `Modb.Taint`, `Modb.Erasure`, and `Modb.Export`. Verify multi-bucket `World` invariants when mixing `Table` writes on pages + DB rows in one branch, and evaluate incremental `Modb.Views` materialization for live Rollups and Context Packs.
-- **Mo (`mo`)**: Keep monitoring batch/hot-path allocations (`Bytes` primitives, streaming JSON/SSE throughput, file-watch ergonomics for `vellum sync`).
-- **Arvo (`arvo`)**: Keep `Arvo.Mcp` resources/tools ergonomics aligned for dynamic `vellum://packs/<slug>` URIs and local-disk storage option alongside `Arvo.S3`.
+As with v1 ([upstream-roadmap.md](upstream-roadmap.md)), upstream primitives are extended cleanly rather than papered over:
+- **MoDB (`modb`):** Leverage existing `Modb.World`, `Modb.Replay`, `Modb.Grants`, `Modb.Claims`, `Modb.Fts`, `Modb.Vec`, `Modb.Feeds`, `Modb.Views` (`ReadProgram` + `describe_for_caller`), `Modb.Taint`, `Modb.Erasure`, and `Modb.Export`. Validate multi-bucket `Modb.World` landing invariants for unified page + database branches.
+- **Mo (`mo`):** Keep optimizing hot-path allocations, streaming HTTP/SSE ergonomics, and file-watching primitives if needed by `vellum sync`.
+- **Arvo (`arvo`):** Support dynamic `Arvo.Mcp` resources (`vellum://packs/<slug>`, `vellum://index`), clean local-disk blob backend parity alongside `Arvo.S3`, and personal-mode local auth helpers.
 
 ---
 
-## 7. Open Design Decisions for Phase 1 (`/grill-me` Checklist)
+## 8. Under Active Exploration — Branch 6: RLM-Native Deep Research & Living Summaries
 
-Before writing Phase 1 code, lock these concrete UX and schema decisions:
-
-1. **Solo Mode Security Boundary:** Should `--solo` enforce loopback-only binding (`127.0.0.1`) at startup and prompt/require OIDC or a local passphrase/token if someone tries `--bind 0.0.0.0`?
-2. **Default Workspace Surface on Launch:** Should `/` open to a crisp command dashboard (recent docs, pinned databases, active Change Proposals, Context Packs) or jump directly into a Notion/Obsidian-style last-opened page + collapsible sidebar?
-3. **Slash Commands & TipTap Editing UX:** Should clicking anywhere on a block seamlessly enter inline editing without showing per-block borders in reading mode (document canvas feel), with hover drag handles (`⋮⋮`) and provenance dots (`● Human` / `◆ Agent`) cleanly docked in the margin?
-4. **What-If Scenario Scope in Phase 1:** Start with **Database Scenarios** (forking a DB's rows + rollups inside `/d/:id`) in Phase 1, then generalize the exact same `Modb.World` multi-op engine to **Workspace Scenarios** (N pages + M DBs) in Phase 2?
-5. **Embedded Database Views Schema:** Add `DatabaseViewEmbed(database_id, view_id, height_mode)` to `BlockKind` (requires checking `domain/blocks.mo` anchored Markdown projection round-trip, e.g., `<!-- db_embed:db_...:vw_... -->`).
+We are actively evaluating combining **per-page and per-database Living Compact Summaries** (auto-refreshed via `Modb.Feeds`) with a **Recursive Language Model (RLM)** workspace runtime (inspired by MIT CSAIL's RLM architecture by Zhang, Kraska & Khattab):
+- **Core concept:** Instead of compacting or stuffing millions of tokens into a fixed context window ("context rot"), the workspace acts as a **programmable environment**: agents inspect ultra-compact living summaries/metadata first, then execute programmatic slicing/filtering/aggregation and targeted recursive sub-LLM inspection (`llm.ask(slice, question)`) over only the exact candidate blocks and rows.
+- **Why Vellum + `Mo` + `MoDB` fits uniquely:** `Modb.Views.ReadProgram` already enforces work-budgeted (`max_rows_scanned`, `max_ops`, `max_result_rows`), grant-scoped ad-hoc queries; `Modb.Taint.execute_read_program_tainted` + `fork_session` propagate taint into sub-queries; and `Mo`'s `#![forbid(unsafe_code)]` capability-confined VM eliminates unsafe Python/Docker REPL execution.
+- *(Status: Pending design alignment in chat before assigning to Roadmap Phases 2–3.)*
