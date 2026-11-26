@@ -3,12 +3,102 @@ import { Check, ChevronDown, ChevronRight, GitPullRequest, XCircle } from "lucid
 import { useCallback, useEffect, useState } from "react";
 import WorkspaceLayout from "../../components/WorkspaceLayout";
 import { ApiError, apiFetch } from "../../lib/api";
-import type { Collection, DatabaseDef, ProposalMeta } from "../../lib/types";
+import type {
+  BlockDiffEntry,
+  BlockKind,
+  Collection,
+  DatabaseDef,
+  ProposalDiffResponse,
+  ProposalMeta,
+} from "../../lib/types";
 
 interface ProposalsPageProps {
   collections: Collection[];
   databases?: DatabaseDef[];
   proposals: ProposalMeta[];
+}
+
+function formatBlockKind(kind: BlockKind | null): string {
+  if (!kind) return "None";
+  if (typeof kind === "string") {
+    if (kind === "paragraph") return "Paragraph";
+    if (kind === "bullet_list_item") return "Bullet";
+    if (kind === "quote") return "Quote";
+    if (kind === "divider") return "Divider";
+    return kind;
+  }
+  if ("heading" in kind) return `H${kind.heading.level}`;
+  if ("ordered_list_item" in kind) return `List (${kind.ordered_list_item.start}.)`;
+  if ("task_item" in kind) return kind.task_item.checked ? "Task [x]" : "Task [ ]";
+  if ("callout" in kind) return `Callout (${kind.callout.tone})`;
+  if ("code_block" in kind) return `Code (${kind.code_block.language || "text"})`;
+  if ("image" in kind) return "Image";
+  if ("file_embed" in kind) return "File";
+  if ("page_link" in kind) return "Page Link";
+  return "Block";
+}
+
+function splitDiffLines(markdown: string | null): string[] {
+  if (markdown === null) return [];
+  if (markdown === "") return [""];
+  return markdown.split("\n");
+}
+
+function BlockDiffCard({ entry }: { entry: BlockDiffEntry }) {
+  const beforeLines = splitDiffLines(entry.before_markdown);
+  const afterLines = splitDiffLines(entry.after_markdown);
+  const badgeClasses =
+    entry.change === "added"
+      ? "bg-emerald-100 text-emerald-800 border-emerald-200"
+      : entry.change === "removed"
+        ? "bg-red-100 text-red-800 border-red-200"
+        : "bg-amber-100 text-amber-800 border-amber-200";
+  const kindLabel =
+    entry.before_kind && entry.after_kind
+      ? JSON.stringify(entry.before_kind) === JSON.stringify(entry.after_kind)
+        ? formatBlockKind(entry.after_kind)
+        : `${formatBlockKind(entry.before_kind)} → ${formatBlockKind(entry.after_kind)}`
+      : formatBlockKind(entry.after_kind ?? entry.before_kind);
+
+  return (
+    <div className="rounded-xl border border-stone-200 bg-white overflow-hidden">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-stone-200 bg-stone-50 px-3.5 py-2 text-xs">
+        <div className="flex items-center gap-2">
+          <span
+            className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${badgeClasses}`}
+          >
+            {entry.change}
+          </span>
+          <span className="font-mono text-stone-700">{entry.block_id}</span>
+        </div>
+        <span className="rounded bg-stone-200/70 px-2 py-0.5 font-mono text-[11px] text-stone-700">
+          {kindLabel}
+        </span>
+      </div>
+      <div className="divide-y divide-stone-100 font-mono text-xs leading-relaxed">
+        {entry.before_markdown !== null && (
+          <div className="bg-red-50/75 text-red-950 px-3.5 py-2 space-y-0.5">
+            {beforeLines.map((line, i) => (
+              <div key={i} className="flex gap-2 whitespace-pre-wrap break-words">
+                <span className="select-none text-red-500 font-semibold shrink-0">-</span>
+                <span>{line || " "}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        {entry.after_markdown !== null && (
+          <div className="bg-emerald-50/75 text-emerald-950 px-3.5 py-2 space-y-0.5">
+            {afterLines.map((line, i) => (
+              <div key={i} className="flex gap-2 whitespace-pre-wrap break-words">
+                <span className="select-none text-emerald-600 font-semibold shrink-0">+</span>
+                <span>{line || " "}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
 export default function ProposalsView({
@@ -21,7 +111,7 @@ export default function ProposalsView({
     "all"
   );
   const [expandedId, setExpandedId] = useState<string | null>(null);
-  const [diffs, setDiffs] = useState<Record<string, unknown>>({});
+  const [diffs, setDiffs] = useState<Record<string, ProposalDiffResponse>>({});
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -38,10 +128,8 @@ export default function ProposalsView({
     if (diffs[propId]) return;
     setError(null);
     try {
-      const res = await apiFetch<{ proposal: ProposalMeta; bucket_diffs: unknown }>(
-        `/api/proposals/${propId}/diff`
-      );
-      setDiffs((prev) => ({ ...prev, [propId]: res.bucket_diffs }));
+      const res = await apiFetch<ProposalDiffResponse>(`/api/proposals/${propId}/diff`);
+      setDiffs((prev) => ({ ...prev, [propId]: res }));
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not load proposal diff");
     }
@@ -221,10 +309,51 @@ export default function ProposalsView({
                 </div>
 
                 {isExpanded && (
-                  <div className="rounded-xl border border-stone-200 bg-stone-950 text-stone-100 p-4 overflow-x-auto">
-                    <pre className="text-xs font-mono leading-relaxed">
-                      {JSON.stringify(diffs[p.id] ?? "Loading diff...", null, 2)}
-                    </pre>
+                  <div className="space-y-3 pt-1">
+                    {!diffs[p.id] ? (
+                      <div className="rounded-xl border border-stone-200 bg-stone-50 p-4 text-xs text-stone-500">
+                        Loading diff...
+                      </div>
+                    ) : (
+                      <>
+                        <div className="rounded-xl border border-stone-200 bg-stone-50/70 p-3.5 space-y-2.5">
+                          <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                            <span className="font-semibold text-stone-800">
+                              Proposed Content Diff
+                              {diffs[p.id].page_title ? ` — ${diffs[p.id].page_title}` : ""}
+                            </span>
+                            <span className="text-stone-500">
+                              {(diffs[p.id].block_diffs ?? []).length}{" "}
+                              {(diffs[p.id].block_diffs ?? []).length === 1 ? "block" : "blocks"}{" "}
+                              changed
+                            </span>
+                          </div>
+                          {(diffs[p.id].block_diffs ?? []).length === 0 ? (
+                            <div className="text-xs text-stone-500 italic">
+                              No block-level markdown edits recorded in this branch yet.
+                            </div>
+                          ) : (
+                            <div className="space-y-2.5">
+                              {(diffs[p.id].block_diffs ?? []).map((bd) => (
+                                <BlockDiffCard key={bd.block_id} entry={bd} />
+                              ))}
+                            </div>
+                          )}
+                        </div>
+
+                        <details className="rounded-xl border border-stone-200 bg-stone-950 text-stone-100">
+                          <summary className="cursor-pointer select-none px-4 py-2.5 text-xs font-medium text-stone-300 hover:text-white">
+                            Raw MoDB Bucket Diff ({diffs[p.id].bucket_diffs.length}{" "}
+                            {diffs[p.id].bucket_diffs.length === 1 ? "bucket" : "buckets"})
+                          </summary>
+                          <div className="border-t border-stone-800 p-4 overflow-x-auto">
+                            <pre className="text-xs font-mono leading-relaxed">
+                              {JSON.stringify(diffs[p.id].bucket_diffs, null, 2)}
+                            </pre>
+                          </div>
+                        </details>
+                      </>
+                    )}
                   </div>
                 )}
               </div>

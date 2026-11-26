@@ -69,9 +69,9 @@ export default function Login() {
               </p>
             </div>
 
-            {flash?.error && (
+            {(flash?.alert || flash?.error) && (
               <div className="rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-sm text-red-800">
-                {flash.error}
+                {flash.alert || flash.error}
               </div>
             )}
             {flash?.notice && (

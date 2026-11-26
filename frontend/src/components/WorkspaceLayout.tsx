@@ -414,11 +414,11 @@ export default function WorkspaceLayout({
             </div>
           </header>
 
-          {(flash?.notice || flash?.error) && (
+          {(flash?.notice || flash?.alert || flash?.error) && (
             <div className="px-6 pt-4">
-              {flash.error && (
+              {(flash.alert || flash.error) && (
                 <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-2.5 text-sm text-red-800">
-                  {flash.error}
+                  {flash.alert || flash.error}
                 </div>
               )}
               {flash.notice && (

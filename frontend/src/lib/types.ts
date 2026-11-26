@@ -20,6 +20,7 @@ export interface AuthUser {
 
 export interface FlashMessages {
   notice?: string | null;
+  alert?: string | null;
   error?: string | null;
   [key: string]: string | null | undefined;
 }
@@ -274,8 +275,9 @@ export interface DbRow {
 
 export interface EnrichedRow {
   row: DbRow;
-  title: string;
-  effective_cells: Record<string, CellValue>;
+  rollups?: Record<string, CellValue>;
+  title?: string;
+  effective_cells?: Record<string, CellValue>;
 }
 
 export type DbViewKind =
@@ -318,16 +320,18 @@ export interface DbViewDef {
 }
 
 export interface BoardGroup {
-  key: string;
+  group_key?: string;
+  key?: string;
   label: string;
   rows: EnrichedRow[];
 }
 
 export interface ViewQueryResult {
-  database_id: string;
-  view_id: string | null;
+  view?: DbViewDef;
+  database_id?: string;
+  view_id?: string | null;
   rows: EnrichedRow[];
-  board_groups: BoardGroup[];
+  board_groups?: BoardGroup[] | null;
   total_count: number;
 }
 
@@ -346,6 +350,30 @@ export interface ProposalMeta {
   updated_at: string;
   decided_by: string | null;
   decided_at: string | null;
+}
+
+export interface BlockDiffEntry {
+  block_id: string;
+  change: "added" | "removed" | "modified";
+  rank: string;
+  before_kind: BlockKind | null;
+  after_kind: BlockKind | null;
+  before_markdown: string | null;
+  after_markdown: string | null;
+}
+
+export interface BucketDiffSummary {
+  bucket: string;
+  added: number;
+  removed: number;
+  modified: number;
+}
+
+export interface ProposalDiffResponse {
+  proposal: ProposalMeta;
+  page_title?: string | null;
+  bucket_diffs: BucketDiffSummary[];
+  block_diffs?: BlockDiffEntry[];
 }
 
 export interface WebhookSubPublic {

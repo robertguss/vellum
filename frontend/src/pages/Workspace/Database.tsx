@@ -12,6 +12,7 @@ import type {
   FilterOp,
   PropertyDef,
   SelectOption,
+  SelectOptionColor,
   ViewQueryResult,
 } from "../../lib/types";
 
@@ -21,6 +22,58 @@ interface DatabasePageProps {
   database: DatabaseDef;
   views: DbViewDef[];
   rows: EnrichedRow[];
+}
+
+const SELECT_COLOR_CLASSES: Record<SelectOptionColor, string> = {
+  gray: "border-stone-200 bg-stone-100 text-stone-700",
+  blue: "border-blue-200 bg-blue-50 text-blue-700",
+  green: "border-emerald-200 bg-emerald-50 text-emerald-700",
+  amber: "border-amber-200 bg-amber-50 text-amber-800",
+  red: "border-red-200 bg-red-50 text-red-700",
+  purple: "border-purple-200 bg-purple-50 text-purple-700",
+};
+
+function getEffectiveCell(er: EnrichedRow, propId: string): CellValue {
+  return er.effective_cells?.[propId] ?? er.rollups?.[propId] ?? er.row.cells?.[propId] ?? "empty";
+}
+
+function getRowTitle(er: EnrichedRow, properties: PropertyDef[]): string {
+  if (er.title && er.title.trim()) return er.title;
+  const titleProp = properties.find((p) => p.kind === "title");
+  if (titleProp) {
+    const c = getEffectiveCell(er, titleProp.id);
+    if (c && typeof c === "object" && "text_val" in c && c.text_val.trim()) {
+      return c.text_val;
+    }
+  }
+  for (const p of properties) {
+    const c = getEffectiveCell(er, p.id);
+    if (c && typeof c === "object" && "text_val" in c && c.text_val.trim()) {
+      return c.text_val;
+    }
+  }
+  return er.row.id;
+}
+
+function formatNumberCell(raw: string, format: string): string {
+  const num = Number(raw);
+  if (!Number.isFinite(num)) return raw;
+  if (format === "currency") {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: "USD",
+      minimumFractionDigits: num % 1 === 0 ? 0 : 2,
+      maximumFractionDigits: 2,
+    }).format(num);
+  }
+  if (format === "percent") {
+    return `${new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(num)}%`;
+  }
+  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 4 }).format(num);
+}
+
+function isSafeHttpUrl(url: string): boolean {
+  return /^https?:\/\//i.test(url.trim());
 }
 
 function getSelectOptions(prop: PropertyDef): SelectOption[] {
@@ -36,7 +89,11 @@ function getSelectOptions(prop: PropertyDef): SelectOption[] {
 function renderCellDisplay(cell: CellValue | undefined, prop: PropertyDef): string {
   if (!cell || cell === "empty") return "—";
   if ("text_val" in cell) return cell.text_val;
-  if ("number_val" in cell) return cell.number_val;
+  if ("number_val" in cell) {
+    const fmt =
+      typeof prop.kind === "object" && "number" in prop.kind ? prop.kind.number.format : "plain";
+    return formatNumberCell(cell.number_val, fmt);
+  }
   if ("date_val" in cell) {
     return cell.date_val.end_date
       ? `${cell.date_val.start} → ${cell.date_val.end_date}`
@@ -242,14 +299,20 @@ export default function DatabaseView({
   const boardColumns = useMemo(() => {
     if (!selectProp) return [];
     const opts = getSelectOptions(selectProp);
-    const grouped: Array<{ id: string; label: string; items: EnrichedRow[] }> = opts.map((o) => ({
+    const grouped: Array<{
+      id: string;
+      label: string;
+      color: SelectOptionColor;
+      items: EnrichedRow[];
+    }> = opts.map((o) => ({
       id: o.id,
       label: o.label,
+      color: o.color,
       items: [],
     }));
     const uncategorized: EnrichedRow[] = [];
     for (const r of rows) {
-      const c = r.effective_cells[selectProp.id];
+      const c = getEffectiveCell(r, selectProp.id);
       const optId = c && typeof c === "object" && "select_val" in c ? c.select_val.option_id : null;
       const target = optId ? grouped.find((g) => g.id === optId) : undefined;
       if (target) {
@@ -259,7 +322,7 @@ export default function DatabaseView({
       }
     }
     if (uncategorized.length > 0) {
-      grouped.push({ id: "", label: "Unassigned", items: uncategorized });
+      grouped.push({ id: "", label: "Unassigned", color: "gray", items: uncategorized });
     }
     return grouped;
   }, [rows, selectProp]);
@@ -268,7 +331,7 @@ export default function DatabaseView({
     if (!dateProp) return [];
     const byDate = new Map<string, EnrichedRow[]>();
     for (const r of rows) {
-      const c = r.effective_cells[dateProp.id];
+      const c = getEffectiveCell(r, dateProp.id);
       const d =
         c && typeof c === "object" && "date_val" in c ? c.date_val.start : "Unscheduled";
       const list = byDate.get(d) ?? [];
@@ -445,55 +508,134 @@ export default function DatabaseView({
                 </tr>
               </thead>
               <tbody className="divide-y divide-stone-100">
-                {rows.map((er) => (
-                  <tr key={er.row.id} className="hover:bg-stone-50/70">
-                    {database.properties.map((p) => {
-                      const opts = getSelectOptions(p);
-                      const curCell = er.effective_cells[p.id];
-                      const curOptId =
-                        curCell && typeof curCell === "object" && "select_val" in curCell
-                          ? curCell.select_val.option_id
-                          : "";
-                      return (
-                        <td key={p.id} className="px-4 py-2.5">
-                          {opts.length > 0 && typeof p.kind === "object" && "select" in p.kind ? (
-                            <select
-                              value={curOptId}
-                              onChange={(e) =>
-                                void handleUpdateRowCell(
-                                  er,
-                                  p.id,
-                                  e.target.value
-                                    ? { select_val: { option_id: e.target.value } }
-                                    : "empty"
-                                )
-                              }
-                              className="rounded border border-stone-200 bg-white px-2 py-1 text-xs"
-                            >
-                              <option value="">—</option>
-                              {opts.map((o) => (
-                                <option key={o.id} value={o.id}>
-                                  {o.label}
-                                </option>
-                              ))}
-                            </select>
-                          ) : (
-                            <span className="text-stone-800">{renderCellDisplay(curCell, p)}</span>
-                          )}
-                        </td>
-                      );
-                    })}
-                    <td className="px-4 py-2.5 text-right">
-                      <Link
-                        href={`/p/${er.row.page_id}`}
-                        className="inline-flex items-center gap-1 text-xs text-blue-600 hover:underline"
-                      >
-                        Open
-                        <ExternalLink className="h-3 w-3" />
-                      </Link>
-                    </td>
-                  </tr>
-                ))}
+                {rows.map((er) => {
+                  const rowTitle = getRowTitle(er, database.properties);
+                  return (
+                    <tr key={er.row.id} className="hover:bg-stone-50/70">
+                      {database.properties.map((p) => {
+                        const opts = getSelectOptions(p);
+                        const curCell = getEffectiveCell(er, p.id);
+                        const curOptId =
+                          curCell && typeof curCell === "object" && "select_val" in curCell
+                            ? curCell.select_val.option_id
+                            : "";
+                        const selectedOpt = curOptId ? opts.find((o) => o.id === curOptId) : undefined;
+                        const pillCls = selectedOpt
+                          ? SELECT_COLOR_CLASSES[selectedOpt.color]
+                          : "border-stone-200 bg-white text-stone-700";
+
+                        return (
+                          <td key={p.id} className="px-4 py-2.5 whitespace-nowrap">
+                            {p.kind === "title" ? (
+                              <Link
+                                href={`/p/${er.row.page_id}`}
+                                className="font-medium text-stone-900 hover:text-blue-700 hover:underline"
+                              >
+                                {rowTitle}
+                              </Link>
+                            ) : opts.length > 0 && typeof p.kind === "object" && "select" in p.kind ? (
+                              <select
+                                value={curOptId}
+                                disabled={busy}
+                                onChange={(e) =>
+                                  void handleUpdateRowCell(
+                                    er,
+                                    p.id,
+                                    e.target.value
+                                      ? { select_val: { option_id: e.target.value } }
+                                      : "empty"
+                                  )
+                                }
+                                className={`rounded-full border px-2.5 py-0.5 text-xs font-medium outline-none cursor-pointer ${pillCls}`}
+                              >
+                                <option value="">—</option>
+                                {opts.map((o) => (
+                                  <option key={o.id} value={o.id}>
+                                    {o.label}
+                                  </option>
+                                ))}
+                              </select>
+                            ) : opts.length > 0 &&
+                              typeof p.kind === "object" &&
+                              "multi_select" in p.kind ? (
+                              <div className="flex flex-wrap gap-1">
+                                {curCell &&
+                                typeof curCell === "object" &&
+                                "multi_select_val" in curCell &&
+                                curCell.multi_select_val.option_ids.length > 0 ? (
+                                  curCell.multi_select_val.option_ids.map((id) => {
+                                    const opt = opts.find((o) => o.id === id);
+                                    const cls = opt
+                                      ? SELECT_COLOR_CLASSES[opt.color]
+                                      : SELECT_COLOR_CLASSES.gray;
+                                    return (
+                                      <span
+                                        key={id}
+                                        className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${cls}`}
+                                      >
+                                        {opt?.label ?? id}
+                                      </span>
+                                    );
+                                  })
+                                ) : (
+                                  <span className="text-stone-400">—</span>
+                                )}
+                              </div>
+                            ) : p.kind === "checkbox" ? (
+                              <label className="inline-flex items-center gap-2 cursor-pointer">
+                                <input
+                                  type="checkbox"
+                                  disabled={busy}
+                                  checked={
+                                    typeof curCell === "object" && "bool_val" in curCell
+                                      ? curCell.bool_val
+                                      : false
+                                  }
+                                  onClick={(e) => e.stopPropagation()}
+                                  onChange={(e) =>
+                                    void handleUpdateRowCell(er, p.id, {
+                                      bool_val: e.target.checked,
+                                    })
+                                  }
+                                  className="h-4 w-4 rounded border-stone-300 text-stone-900 focus:ring-stone-500"
+                                />
+                              </label>
+                            ) : p.kind === "url" &&
+                              curCell &&
+                              typeof curCell === "object" &&
+                              "url_val" in curCell &&
+                              isSafeHttpUrl(curCell.url_val) ? (
+                              <a
+                                href={curCell.url_val}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="text-xs text-blue-600 hover:underline"
+                              >
+                                {curCell.url_val}
+                              </a>
+                            ) : typeof p.kind === "object" &&
+                              ("number" in p.kind || "rollup" in p.kind) ? (
+                              <span className="font-mono text-xs tabular-nums text-stone-800">
+                                {renderCellDisplay(curCell, p)}
+                              </span>
+                            ) : (
+                              <span className="text-stone-800">{renderCellDisplay(curCell, p)}</span>
+                            )}
+                          </td>
+                        );
+                      })}
+                      <td className="px-4 py-2.5 text-right whitespace-nowrap">
+                        <Link
+                          href={`/p/${er.row.page_id}`}
+                          className="inline-flex items-center gap-1 text-xs text-blue-600 hover:underline"
+                        >
+                          Open
+                          <ExternalLink className="h-3 w-3" />
+                        </Link>
+                      </td>
+                    </tr>
+                  );
+                })}
                 {rows.length === 0 && (
                   <tr>
                     <td
@@ -517,55 +659,112 @@ export default function DatabaseView({
               </div>
             )}
             {selectProp &&
-              boardColumns.map((col) => (
-                <div
-                  key={col.id || "none"}
-                  className="rounded-2xl border border-stone-200 bg-stone-50/70 p-3 space-y-2.5"
-                >
-                  <div className="flex items-center justify-between px-1 text-xs font-semibold text-stone-700">
-                    <span>{col.label}</span>
-                    <span className="rounded-full bg-stone-200 px-2 py-0.5 text-[10px]">
-                      {col.items.length}
-                    </span>
-                  </div>
-                  <div className="space-y-2">
-                    {col.items.map((er) => (
-                      <div
-                        key={er.row.id}
-                        className="rounded-xl border border-stone-200 bg-white p-3 shadow-2xs space-y-2"
+              boardColumns.map((col) => {
+                const summaryProps = database.properties
+                  .filter((p) => p.kind !== "title" && p.id !== selectProp.id)
+                  .slice(0, 3);
+                return (
+                  <div
+                    key={col.id || "none"}
+                    className="rounded-2xl border border-stone-200 bg-stone-50/70 p-3 space-y-2.5"
+                  >
+                    <div className="flex items-center justify-between px-1 text-xs font-semibold text-stone-700">
+                      <span
+                        className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-[11px] font-medium ${SELECT_COLOR_CLASSES[col.color]}`}
                       >
-                        <Link
-                          href={`/p/${er.row.page_id}`}
-                          className="text-sm font-medium text-stone-900 hover:underline block"
+                        {col.label}
+                      </span>
+                      <span className="rounded-full bg-stone-200 px-2 py-0.5 text-[10px] text-stone-700">
+                        {col.items.length}
+                      </span>
+                    </div>
+                    <div className="space-y-2">
+                      {col.items.map((er) => (
+                        <div
+                          key={er.row.id}
+                          className="rounded-xl border border-stone-200 bg-white p-3.5 shadow-2xs space-y-2.5"
                         >
-                          {er.title || "(Untitled row)"}
-                        </Link>
-                        <div className="flex flex-wrap gap-1">
-                          {getSelectOptions(selectProp).map((opt) => (
-                            <button
-                              key={opt.id}
-                              type="button"
-                              disabled={busy || col.id === opt.id}
-                              onClick={() =>
-                                void handleUpdateRowCell(er, selectProp.id, {
-                                  select_val: { option_id: opt.id },
-                                })
-                              }
-                              className={`rounded px-2 py-0.5 text-[10px] border ${
-                                col.id === opt.id
-                                  ? "border-blue-300 bg-blue-50 text-blue-800 font-semibold"
-                                  : "border-stone-200 text-stone-500 hover:bg-stone-50"
-                              }`}
-                            >
-                              {opt.label}
-                            </button>
-                          ))}
+                          <Link
+                            href={`/p/${er.row.page_id}`}
+                            className="text-sm font-medium text-stone-900 hover:text-blue-700 hover:underline block"
+                          >
+                            {getRowTitle(er, database.properties)}
+                          </Link>
+
+                          {summaryProps.length > 0 && (
+                            <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                              {summaryProps.map((sp) => {
+                                const c = getEffectiveCell(er, sp.id);
+                                if (!c || c === "empty") return null;
+                                if (typeof c === "object" && "select_val" in c) {
+                                  const opt = getSelectOptions(sp).find(
+                                    (o) => o.id === c.select_val.option_id
+                                  );
+                                  const cls = opt
+                                    ? SELECT_COLOR_CLASSES[opt.color]
+                                    : SELECT_COLOR_CLASSES.gray;
+                                  return (
+                                    <span
+                                      key={sp.id}
+                                      className={`rounded-full border px-2 py-0.5 text-[10px] font-medium ${cls}`}
+                                    >
+                                      {opt?.label ?? c.select_val.option_id}
+                                    </span>
+                                  );
+                                }
+                                if (typeof c === "object" && "bool_val" in c) {
+                                  return (
+                                    <span
+                                      key={sp.id}
+                                      className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                                        c.bool_val
+                                          ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                                          : "bg-stone-100 text-stone-500 border border-stone-200"
+                                      }`}
+                                    >
+                                      {c.bool_val ? `✓ ${sp.name}` : `○ ${sp.name}`}
+                                    </span>
+                                  );
+                                }
+                                return (
+                                  <span
+                                    key={sp.id}
+                                    className="rounded bg-stone-100 px-1.5 py-0.5 text-[10px] text-stone-600"
+                                  >
+                                    {sp.name}: {renderCellDisplay(c, sp)}
+                                  </span>
+                                );
+                              })}
+                            </div>
+                          )}
+
+                          <div className="flex flex-wrap gap-1 pt-0.5">
+                            {getSelectOptions(selectProp).map((opt) => (
+                              <button
+                                key={opt.id}
+                                type="button"
+                                disabled={busy || col.id === opt.id}
+                                onClick={() =>
+                                  void handleUpdateRowCell(er, selectProp.id, {
+                                    select_val: { option_id: opt.id },
+                                  })
+                                }
+                                className={`rounded px-2 py-0.5 text-[10px] border transition ${
+                                  col.id === opt.id
+                                    ? `${SELECT_COLOR_CLASSES[opt.color]} font-semibold`
+                                    : "border-stone-200 text-stone-500 hover:bg-stone-50"
+                                }`}
+                              >
+                                {opt.label}
+                              </button>
+                            ))}
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                      ))}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
           </div>
         )}
 
@@ -590,7 +789,7 @@ export default function DatabaseView({
                         href={`/p/${er.row.page_id}`}
                         className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs font-medium text-stone-900 hover:bg-stone-100"
                       >
-                        {er.title || "(Untitled row)"}
+                        {getRowTitle(er, database.properties)}
                       </Link>
                     ))}
                   </div>

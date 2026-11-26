@@ -4,8 +4,22 @@ import Placeholder from "@tiptap/extension-placeholder";
 import TaskItem from "@tiptap/extension-task-item";
 import TaskList from "@tiptap/extension-task-list";
 import StarterKit from "@tiptap/starter-kit";
-import { Bot, GitPullRequest, Plus, Save, Sparkles, Trash2, User } from "lucide-react";
-import { useEffect, useState } from "react";
+import {
+  AlertTriangle,
+  Bot,
+  Check,
+  FileText,
+  GitPullRequest,
+  Info,
+  Lightbulb,
+  Plus,
+  Save,
+  ShieldAlert,
+  Sparkles,
+  Trash2,
+  User,
+} from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
 import { ApiError, apiFetch } from "../lib/api";
 import type { Block, BlockKind, BlockOp, Page, ProposalMeta } from "../lib/types";
 
@@ -24,25 +38,6 @@ function escapeHtml(raw: string): string {
     .replace(/"/g, "&quot;");
 }
 
-function blockKindLabel(kind: BlockKind): string {
-  if (typeof kind === "string") {
-    if (kind === "paragraph") return "Paragraph";
-    if (kind === "bullet_list_item") return "Bullet";
-    if (kind === "quote") return "Quote";
-    if (kind === "divider") return "Divider";
-    return kind;
-  }
-  if ("heading" in kind) return `H${kind.heading.level}`;
-  if ("ordered_list_item" in kind) return `${kind.ordered_list_item.start}.`;
-  if ("task_item" in kind) return kind.task_item.checked ? "Task [x]" : "Task [ ]";
-  if ("callout" in kind) return `Callout (${kind.callout.tone})`;
-  if ("code_block" in kind) return `Code (${kind.code_block.language || "text"})`;
-  if ("image" in kind) return "Image";
-  if ("file_embed" in kind) return "File";
-  if ("page_link" in kind) return "PageLink";
-  return "Block";
-}
-
 function blockKindOptionValue(kind: BlockKind): string {
   if (kind === "paragraph") return "paragraph";
   if (kind === "bullet_list_item") return "bullet_list_item";
@@ -51,6 +46,7 @@ function blockKindOptionValue(kind: BlockKind): string {
   if (typeof kind === "object" && "heading" in kind) {
     return `h${kind.heading.level}`;
   }
+  if (typeof kind === "object" && "callout" in kind) return "callout";
   if (typeof kind === "object" && "code_block" in kind) return "code_block";
   if (typeof kind === "object" && "task_item" in kind) return "task_item";
   return "paragraph";
@@ -68,6 +64,8 @@ function optionValueToBlockKind(val: string): BlockKind {
       return "bullet_list_item";
     case "quote":
       return "quote";
+    case "callout":
+      return { callout: { tone: "info", icon: null } };
     case "task_item":
       return { task_item: { checked: false } };
     case "code_block":
@@ -77,6 +75,295 @@ function optionValueToBlockKind(val: string): BlockKind {
     default:
       return "paragraph";
   }
+}
+
+function isSafeLinkHref(href: string): boolean {
+  return /^https?:\/\//i.test(href) || (href.startsWith("/") && !href.startsWith("//"));
+}
+
+function renderInlineMarkdown(text: string): ReactNode[] {
+  const tokenRe = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*|\[[^\]\n]+\]\([^)\s]+\))/g;
+  const out: ReactNode[] = [];
+  let lastIdx = 0;
+  let match: RegExpExecArray | null;
+  let keyIdx = 0;
+  while ((match = tokenRe.exec(text)) !== null) {
+    if (match.index > lastIdx) {
+      out.push(text.slice(lastIdx, match.index));
+    }
+    const tok = match[0];
+    if (tok.startsWith("`") && tok.endsWith("`")) {
+      out.push(
+        <code
+          key={keyIdx++}
+          className="rounded bg-stone-100 px-1.5 py-0.5 font-mono text-[0.85em] text-stone-800 border border-stone-200/80"
+        >
+          {tok.slice(1, -1)}
+        </code>
+      );
+    } else if (tok.startsWith("**") && tok.endsWith("**")) {
+      out.push(
+        <strong key={keyIdx++} className="font-semibold text-stone-950">
+          {tok.slice(2, -2)}
+        </strong>
+      );
+    } else if (tok.startsWith("*") && tok.endsWith("*")) {
+      out.push(
+        <em key={keyIdx++} className="italic">
+          {tok.slice(1, -1)}
+        </em>
+      );
+    } else if (tok.startsWith("[")) {
+      const m = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(tok);
+      if (m && isSafeLinkHref(m[2])) {
+        const [, label, href] = m;
+        if (href.startsWith("/")) {
+          out.push(
+            <Link
+              key={keyIdx++}
+              href={href}
+              onClick={(e) => e.stopPropagation()}
+              className="text-blue-600 underline decoration-blue-300 hover:text-blue-800"
+            >
+              {label}
+            </Link>
+          );
+        } else {
+          out.push(
+            <a
+              key={keyIdx++}
+              href={href}
+              target="_blank"
+              rel="noreferrer"
+              onClick={(e) => e.stopPropagation()}
+              className="text-blue-600 underline decoration-blue-300 hover:text-blue-800"
+            >
+              {label}
+            </a>
+          );
+        }
+      } else {
+        out.push(tok);
+      }
+    } else {
+      out.push(tok);
+    }
+    lastIdx = match.index + tok.length;
+  }
+  if (lastIdx < text.length) {
+    out.push(text.slice(lastIdx));
+  }
+  return out;
+}
+
+function getCalloutPalette(toneRaw: string) {
+  const tone = toneRaw.trim().toLowerCase();
+  if (tone === "warning" || tone === "warn" || tone === "amber" || tone === "important") {
+    return {
+      container: "border-l-4 border-amber-500 bg-amber-50/75 text-amber-950",
+      title: "text-amber-900",
+      Icon: AlertTriangle,
+    };
+  }
+  if (tone === "caution" || tone === "danger" || tone === "error" || tone === "red") {
+    return {
+      container: "border-l-4 border-red-500 bg-red-50/75 text-red-950",
+      title: "text-red-900",
+      Icon: ShieldAlert,
+    };
+  }
+  if (tone === "tip" || tone === "success" || tone === "green") {
+    return {
+      container: "border-l-4 border-emerald-500 bg-emerald-50/75 text-emerald-950",
+      title: "text-emerald-900",
+      Icon: Lightbulb,
+    };
+  }
+  return {
+    container: "border-l-4 border-blue-500 bg-blue-50/75 text-blue-950",
+    title: "text-blue-900",
+    Icon: Info,
+  };
+}
+
+function CalloutBox({
+  tone,
+  title,
+  body,
+}: {
+  tone: string;
+  title?: string;
+  body: string;
+}) {
+  const palette = getCalloutPalette(tone);
+  const Icon = palette.Icon;
+  return (
+    <div className={`rounded-r-xl px-4 py-3 text-sm space-y-1 ${palette.container}`}>
+      <div className={`flex items-center gap-2 font-semibold text-xs uppercase tracking-wide ${palette.title}`}>
+        <Icon className="h-3.5 w-3.5 shrink-0" />
+        <span>{title || tone || "Note"}</span>
+      </div>
+      {body && (
+        <div className="leading-relaxed whitespace-pre-wrap">{renderInlineMarkdown(body)}</div>
+      )}
+    </div>
+  );
+}
+
+function RenderedBlockBody({
+  block,
+  saving,
+  onToggleTask,
+}: {
+  block: Block;
+  saving: boolean;
+  onToggleTask: (b: Block) => void;
+}) {
+  const { kind, markdown } = block;
+
+  if (typeof kind === "object" && "heading" in kind) {
+    const lvl = Math.min(3, Math.max(1, kind.heading.level));
+    const cls =
+      lvl === 1
+        ? "text-2xl font-bold tracking-tight text-stone-950 pt-1"
+        : lvl === 2
+          ? "text-lg font-semibold tracking-tight text-stone-950 pt-0.5"
+          : "text-base font-semibold text-stone-900";
+    if (lvl === 1) return <h1 className={cls}>{renderInlineMarkdown(markdown)}</h1>;
+    if (lvl === 2) return <h2 className={cls}>{renderInlineMarkdown(markdown)}</h2>;
+    return <h3 className={cls}>{renderInlineMarkdown(markdown)}</h3>;
+  }
+
+  if (kind === "bullet_list_item") {
+    return (
+      <div className="flex items-start gap-2.5 text-sm leading-relaxed text-stone-800 py-0.5">
+        <span className="mt-2 h-1.5 w-1.5 rounded-full bg-stone-500 shrink-0" />
+        <div className="flex-1 whitespace-pre-wrap">{renderInlineMarkdown(markdown)}</div>
+      </div>
+    );
+  }
+
+  if (typeof kind === "object" && "ordered_list_item" in kind) {
+    return (
+      <div className="flex items-start gap-2.5 text-sm leading-relaxed text-stone-800 py-0.5">
+        <span className="font-mono text-xs font-semibold text-stone-500 mt-0.5 shrink-0">
+          {kind.ordered_list_item.start}.
+        </span>
+        <div className="flex-1 whitespace-pre-wrap">{renderInlineMarkdown(markdown)}</div>
+      </div>
+    );
+  }
+
+  if (typeof kind === "object" && "task_item" in kind) {
+    const checked = kind.task_item.checked;
+    return (
+      <div className="flex items-start gap-2.5 text-sm py-0.5">
+        <button
+          type="button"
+          disabled={saving}
+          aria-label={checked ? "Mark task incomplete" : "Mark task complete"}
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggleTask(block);
+          }}
+          className={`mt-0.5 h-4 w-4 rounded border flex items-center justify-center shrink-0 transition ${
+            checked
+              ? "border-emerald-600 bg-emerald-600 text-white"
+              : "border-stone-300 bg-white hover:border-stone-500"
+          }`}
+        >
+          {checked && <Check className="h-3 w-3 stroke-[2.5]" />}
+        </button>
+        <div
+          className={`flex-1 leading-relaxed whitespace-pre-wrap ${
+            checked ? "line-through text-stone-400" : "text-stone-800"
+          }`}
+        >
+          {renderInlineMarkdown(markdown)}
+        </div>
+      </div>
+    );
+  }
+
+  if (typeof kind === "object" && "callout" in kind) {
+    const lines = markdown.split("\n");
+    const first = lines[0] ?? "";
+    const rest = lines.slice(1).join("\n").trim();
+    return (
+      <CalloutBox
+        tone={kind.callout.tone}
+        title={rest ? first : kind.callout.tone}
+        body={rest || first}
+      />
+    );
+  }
+
+  if (kind === "quote") {
+    const lines = markdown.split("\n");
+    const alertMatch = /^\[!(WARNING|CAUTION|IMPORTANT|TIP|NOTE|INFO)\]\s*(.*)$/i.exec(
+      (lines[0] ?? "").trim()
+    );
+    if (alertMatch) {
+      const tone = alertMatch[1];
+      const heading = alertMatch[2].trim();
+      const body = lines.slice(1).join("\n").trim();
+      return <CalloutBox tone={tone} title={heading || tone} body={body} />;
+    }
+    return (
+      <blockquote className="border-l-3 border-stone-300 pl-3.5 py-0.5 text-sm italic leading-relaxed text-stone-600 whitespace-pre-wrap">
+        {renderInlineMarkdown(markdown)}
+      </blockquote>
+    );
+  }
+
+  if (typeof kind === "object" && "code_block" in kind) {
+    return (
+      <div className="rounded-xl border border-stone-800 bg-stone-950 text-stone-100 overflow-hidden">
+        <div className="flex items-center justify-between border-b border-stone-800 px-3.5 py-1.5 text-[10px] font-mono uppercase tracking-wider text-stone-400">
+          <span>{kind.code_block.language || "text"}</span>
+        </div>
+        <pre className="p-3.5 text-xs font-mono leading-relaxed overflow-x-auto">
+          <code>{markdown}</code>
+        </pre>
+      </div>
+    );
+  }
+
+  if (kind === "divider") {
+    return <hr className="my-2 border-stone-200" />;
+  }
+
+  if (typeof kind === "object" && "page_link" in kind) {
+    return (
+      <Link
+        href={`/p/${kind.page_link.target_page_id}`}
+        onClick={(e) => e.stopPropagation()}
+        className="inline-flex items-center gap-2 rounded-lg border border-stone-200 bg-stone-50 px-3 py-1.5 text-sm font-medium text-blue-700 hover:bg-stone-100"
+      >
+        <FileText className="h-3.5 w-3.5" />
+        <span>{markdown || kind.page_link.target_page_id}</span>
+      </Link>
+    );
+  }
+
+  if (typeof kind === "object" && ("image" in kind || "file_embed" in kind)) {
+    const label =
+      "image" in kind
+        ? kind.image.caption || kind.image.attachment_id
+        : kind.file_embed.filename;
+    return (
+      <div className="inline-flex items-center gap-2 rounded-lg border border-stone-200 bg-stone-50 px-3 py-1.5 text-xs text-stone-700">
+        <FileText className="h-3.5 w-3.5 text-stone-500" />
+        <span>{label}</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="text-sm leading-relaxed text-stone-800 whitespace-pre-wrap py-0.5">
+      {renderInlineMarkdown(markdown)}
+    </div>
+  );
 }
 
 function blockToHtml(kind: BlockKind, markdown: string): string {
@@ -194,6 +481,43 @@ export default function BlockEditor({
       setStatusMsg(`Saved block ${b.id}`);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to save block");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleToggleTaskCheckbox(b: Block) {
+    if (typeof b.kind !== "object" || !("task_item" in b.kind)) return;
+    setSaving(true);
+    setError(null);
+    setStatusMsg(null);
+    try {
+      const nextChecked = !b.kind.task_item.checked;
+      const ops: BlockOp[] = [
+        {
+          replace_block: {
+            block_id: b.id,
+            expected_version: b.version,
+            kind: { task_item: { checked: nextChecked } },
+            markdown: b.markdown,
+          },
+        },
+      ];
+      const res = await apiFetch<{ blocks: Block[]; anchored_markdown: string }>(
+        `/api/pages/${page.id}/blocks`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({
+            ops,
+            expected_versions: { [b.id]: b.version },
+            reason: nextChecked ? `checked task ${b.id}` : `unchecked task ${b.id}`,
+          }),
+        }
+      );
+      onBlocksUpdated(res.blocks, res.anchored_markdown);
+      setStatusMsg(nextChecked ? `Completed task ${b.id}` : `Reopened task ${b.id}`);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to update task");
     } finally {
       setSaving(false);
     }
@@ -387,13 +711,22 @@ export default function BlockEditor({
                   <div className="flex items-center justify-between gap-2">
                     <select
                       value={blockKindOptionValue(draft.kind)}
-                      onChange={(e) =>
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        const nextKind =
+                          val === "callout" &&
+                          typeof draft.kind === "object" &&
+                          "callout" in draft.kind
+                            ? draft.kind
+                            : optionValueToBlockKind(val);
                         setDrafts((prev) => ({
                           ...prev,
-                          [b.id]: { ...draft, kind: optionValueToBlockKind(e.target.value) },
-                        }))
-                      }
-                      className="rounded border border-stone-200 bg-stone-50 px-2 py-0.5 text-[11px] font-medium text-stone-600"
+                          [b.id]: { ...draft, kind: nextKind },
+                        }));
+                      }}
+                      className={`rounded border border-stone-200 bg-stone-50 px-2 py-0.5 text-[11px] font-medium text-stone-600 transition ${
+                        isActive ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+                      }`}
                     >
                       <option value="paragraph">Paragraph</option>
                       <option value="h1">Heading 1</option>
@@ -401,6 +734,7 @@ export default function BlockEditor({
                       <option value="h3">Heading 3</option>
                       <option value="bullet_list_item">Bullet Item</option>
                       <option value="task_item">Task Item</option>
+                      <option value="callout">Callout</option>
                       <option value="quote">Quote</option>
                       <option value="code_block">Code Block</option>
                       <option value="divider">Divider</option>
@@ -468,12 +802,11 @@ export default function BlockEditor({
                       className="w-full rounded-lg border border-stone-300 px-3 py-2 text-sm font-mono outline-none focus:border-blue-500"
                     />
                   ) : (
-                    <div className="text-sm text-stone-800 whitespace-pre-wrap py-0.5">
-                      <span className="text-[11px] font-mono text-stone-400 mr-2">
-                        [{blockKindLabel(b.kind)}]
-                      </span>
-                      {b.markdown}
-                    </div>
+                    <RenderedBlockBody
+                      block={b}
+                      saving={saving}
+                      onToggleTask={(blk) => void handleToggleTaskCheckbox(blk)}
+                    />
                   )}
 
                   {b.provenance.citations.length > 0 && (
@@ -509,6 +842,7 @@ export default function BlockEditor({
           <option value="h2">Heading 2</option>
           <option value="bullet_list_item">Bullet</option>
           <option value="task_item">Task Item</option>
+          <option value="callout">Callout</option>
           <option value="quote">Quote</option>
           <option value="code_block">Code Block</option>
         </select>
