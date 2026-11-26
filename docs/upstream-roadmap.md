@@ -18,7 +18,7 @@ flowchart LR
   end
 
   subgraph MoDB["Track B: robertguss/modb"]
-    D1["PR D1: Modb.Fts (Transactional BM25 Index)"]
+    D1["PR D1: Modb.Fts (Implemented: feat/modb-fts)"]
     D2["PR D2: Dynamic Cell Indexes & Relations Helper"]
     D3["PR D3: Multi-Worker Web Concurrency Benchmarks"]
     D4["PR D4: Modb.Vector (Hybrid RRF Search)"]
@@ -26,8 +26,8 @@ flowchart LR
 
   subgraph Arvo["Track C: robertguss/arvo"]
     A1["PR A1: Pure-MoDB Storage Backend (Shipped v0.2.0)"]
-    A2["PR A2: Arvo.Oidc (Code + PKCE + Fake OIDC)"]
-    A3["PR A3: Arvo.S3 (Pure-Mo AWS SigV4 Presigned URLs)"]
+    A2["PR A2: Arvo.Oidc (Implemented: feat/oidc-and-s3)"]
+    A3["PR A3: Arvo.S3 (Implemented: feat/oidc-and-s3)"]
     A4["PR A4: Arvo.Mcp (Streamable HTTP /mcp + Modb.Views Onboarding)"]
     A5["PR A5: Arvo.Sse + Arvo.Webhooks"]
   end
@@ -117,14 +117,12 @@ Verified against `mo v0.3.0` (`#![forbid(unsafe_code)]`, 17-crate Rust workspace
 
 ## Track B: Upstream PRs in `modb` (`/home/exedev/Projects/modb`)
 
-### PR D1 — `Modb.Fts` (Transactional Pure-Mo BM25 Full-Text Index)
+### PR D1 — `Modb.Fts` (Transactional Pure-Mo BM25 Full-Text Index) *(Implemented on `modb` branch `feat/modb-fts`, commit `81f9364`)*
 
-- **Scope:** New `src/modb/fts.mo` module built directly on `Modb.Table` composite keys.
-- **Features:**
-  - Unicode-aware tokenizer, normalization, stopword filter, positional/frequency postings (`_fts_postings`), and document length stats (`_fts_doc_stats`).
-  - Transactional `tx_index_document`, `tx_remove_document`, `tx_reindex_blocks` executing inside the caller's `WriteTx` (zero stale search index; crash-safe via MoDB's dual-fsync CoW commit).
-  - Ranked `search(store, query, limit, filter_fn)` using BM25 + prefix-scan matching on trailing tokens for `Cmd+K` instant search.
-- **Verification:** Deterministic crash-simulation + differential tests against a reference inverted index + latency benchmarks on 10,000+ documents.
+- **Delivered:**
+  - Pure-Mo BM25+ transactional inverted index in `src/modb/fts.mo` (`tx_index_document`, `tx_remove_document`, `index_documents`, `search`, `search_filtered`) built over `Modb` and `Modb.Table.encode_composite_key`.
+  - Unicode/Latin-1 word folding, prefix typeahead (`prefix_last_term?`, `max_prefix_expansions`), exact integer corpus stats, and fail-closed `allow_doc` + `required_scope` filtering before scoring.
+- **Verification:** `tests/test-fts.mo` (`6 passed`) + `src/modb/fts.mo` (`32 passed`) covering BM25 ranking, bucket cleanliness, 150-op differential fuzzing vs reference BM25, and 45-trial `Modb.commit_and_crash` atomicity.
 
 ### PR D2 — Dynamic Multi-Value Cell Indexes & Cross-Table Relations
 
@@ -154,24 +152,19 @@ Verified against `mo v0.3.0` (`#![forbid(unsafe_code)]`, 17-crate Rust workspace
   - Added companion package `packages/arvo-modb/` (`Arvo.Modb.Sessions`, `Arvo.Modb.Jobs`) and `examples/arvo-modb-starter/` using pure MoDB (`ReadFiles`-only `load_read_only` for `GET` routes, atomic `WriteTx`-composable job enqueueing, zero SQLite).
   - Migrations, hash-chained audits, commit-time invariants, and selective-undo replay map natively onto `Modb.Ledger` and `Modb.Replay`.
 
-### PR A2 — `Arvo.Oidc` (OIDC / OAuth2 + PKCE + Deterministic Fake)
+### PR A2 — `Arvo.Oidc` (OIDC / OAuth2 + PKCE + Deterministic Fake) *(Implemented on `arvo` branch `feat/oidc-and-s3`)*
 
-- **Scope:** New `lib/arvo/oidc.mo` module.
-- **Features:**
-  - `.well-known/openid-configuration` discovery with TTL caching.
-  - Authorization URL builder with PKCE (`S256` via `Crypto.sha256` + `to_base64url`), `state`, and `nonce`.
-  - Encrypted short-lived AEAD state cookie (`Crypto.seal`/`open` + `SecureRandom`).
-  - Direct-TLS code exchange and `/userinfo` fetching via `Network.allow_hosts`.
-  - Preset configs for Google Workspace, GitHub, Okta, Entra ID, and generic OIDC (like local Dex).
-  - Built-in deterministic fake OIDC server helper for `Arvo.WebTest`.
+- **Delivered (`lib/arvo/oidc.mo`):**
+  - OpenID Connect discovery (`discover`), `google_endpoints()`, Authorization Code + PKCE (`S256`) `start_login`, AEAD-sealed `AuthState` cookie, and fail-closed `complete_callback`.
+  - Validates `state` (`Crypto.constant_time_eq?`), state expiry, `id_token` (`iss`, `aud`, `exp`, constant-time `nonce`, `sub`), `/userinfo` `sub` consistency, `email_verified`, and constant-time `email_domain_allowed?`.
+  - Deterministic `Network.fake` + `build_unsigned_test_jwt` test suite including RFC 7636 Appendix B S256 vector (`49 passed`).
 
-### PR A3 — `Arvo.S3` (Pure-Mo AWS SigV4 Presigner)
+### PR A3 — `Arvo.S3` (Pure-Mo AWS SigV4 Presigner) *(Implemented on `arvo` branch `feat/oidc-and-s3`)*
 
-- **Scope:** New `lib/arvo/s3.mo` module.
-- **Features:**
-  - Pure-Mo AWS Signature Version 4 signing (`HMAC-SHA256` key derivation `AWS4` + date/region/service/`aws4_request`) for presigned `PUT`, `GET`, and `DELETE` URLs, plus signed server-to-S3 background reads/writes (for Notion ZIP imports and attachment garbage collection).
-  - Path-style & virtual-hosted-style endpoints supporting AWS S3, Cloudflare R2, and MinIO.
-- **Verification:** Official AWS SigV4 Test Suite vectors embedded directly in `mo test` `examples`/`test` blocks.
+- **Delivered (`lib/arvo/s3.mo`):**
+  - Pure-Mo `AWS4-HMAC-SHA256` presigned URLs (`presign_get`, `presign_put`, `presign_delete`) and signed `Http.Request` builder (`sign_request`) supporting virtual-hosted AWS S3 and path-style MinIO / R2 endpoints.
+  - Strict object-key traversal rejection, 1s–7d expiry validation, optional `Content-Type`/`Content-Length`/`x-amz-content-sha256` constraints, and STS `session_token` support.
+  - Verified against official AWS SigV4 presigned `GET` and Authorization-header `GET` (`Range: bytes=0-9`) test vectors (`15 passed`).
 
 ### PR A4 — `Arvo.Mcp` (Reusable Streamable HTTP `/mcp` Server)
 
@@ -193,7 +186,7 @@ Verified against `mo v0.3.0` (`#![forbid(unsafe_code)]`, 17-crate Rust workspace
 
 | Stage | Goal | Upstream Gates Required | Vellum Deliverables |
 | --- | --- | --- | --- |
-| **Stage 0: Foundations** | Prove MoDB-backed Arvo + auth + blobs + search primitives | **PR A1 (shipped)**, PR A2, PR A3, PR D1 | MoDB-backed `Arvo.Modb.Sessions`/`Jobs`, `Arvo.Oidc` + Dex local dev, `Arvo.S3` + MinIO, `Modb.Fts` BM25 benchmarks |
+| **Stage 0: Foundations** | Prove MoDB-backed Arvo + auth + blobs + search primitives | **PR A1 (shipped v0.2.0), PR D1 (`modb: feat/modb-fts`), PR A2 & A3 (`arvo: feat/oidc-and-s3`)** | MoDB-backed `Arvo.Modb.Sessions`/`Jobs`, `Arvo.Oidc`, `Arvo.S3`, and `Modb.Fts` BM25 search implemented & tested *(ready for Stage 1 workspace scaffolding)* |
 | **Stage 1: Core Workspace** | Usable fast wiki replacing Outline | Stage 0 gates | Workspaces, Collections, nested Pages, TipTap ↔ Block-ID/Markdown engine, `Modb.Fts` `Cmd+K` search, S3 attachments, `Modb.Ledger` revision history + Undo |
 | **Stage 2: Relational Databases** | Replace Notion Databases | **PR D2, PR D3** *(+ M3 as profiled)* | Typed schemas (`Decimal`, `Date`, `Select`, `Relation`, `Rollup`), dynamic cell indexes, **Table / Kanban Board / Calendar** views, filters & sorts, row-as-page editing |
 | **Stage 3: AI-Native & Realtime** | First-class agents + live collaboration | **PR M1, PR M2, PR A4, PR A5** | `/mcp` (`Arvo.Mcp`), `Modb.Grants` + token console, `Modb.Claims` live block/row leases over SSE, `Modb.World` Change Proposals diff inbox, `Modb.Replay` Selective Undo UI, webhooks, streaming Ask Workspace + inline `/ai` + gardening jobs |
