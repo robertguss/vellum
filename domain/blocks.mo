@@ -7,7 +7,7 @@ to_anchored_markdown,
 parse_markdown_blocks,
 blocks_plain_text,
 apply_block_ops
-use Domain.Types{AuthorKind, Block, BlockKind, BlockOp, Provenance}
+use Domain.Types{AuthorKind, Block, BlockKind, BlockOp, Citation, Provenance}
 
 alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
 
@@ -107,8 +107,45 @@ fn rank_between(prev: Option(Text), next: Option(Text)) : Text
   Text.from_chars(out)
 end
 
+fn block_before_or_eq?(a: Block, b: Block) : Bool
+  a.rank < b.rank or (a.rank == b.rank and a.id <= b.id)
+end
+
+fn blocks_sorted?(blocks: List(Block)) : Bool
+  return true if blocks.size <= 1
+  var prev = case blocks.first
+    Some(b): b
+    None: return true
+  end
+  var i = 1
+  while i < blocks.size
+    cur = case blocks.get(i)
+      Some(b): b
+      None: return true
+    end
+    return false if not block_before_or_eq?(prev, cur)
+    prev = cur
+    i += 1
+  end
+  true
+end
+
+fn insert_block_sorted(blocks: List(Block), blk: Block) : List(Block)
+  var ins = 0
+  while ins < blocks.size
+    cur = case blocks.get(ins)
+      Some(b): b
+      None: break
+    end
+    break if not block_before_or_eq?(cur, blk)
+    ins += 1
+  end
+  blocks.take(ins).append(blk).concat(blocks.drop(ins))
+end
+
 ## Orders blocks stably by lexicographic `rank` ascending, breaking ties by `id`.
 fn sort_blocks(blocks: List(Block)) : List(Block)
+  return blocks if blocks_sorted?(blocks)
   blocks.sort_by(fn(b) b.id end).sort_by(fn(b) b.rank end)
 end
 
@@ -507,7 +544,7 @@ fn apply_block_ops(
           provenance: prov,
           version: old_b.version + 1
         )
-        cur = sort_blocks(cur.set(idx, updated) or cur)
+        cur = cur.set(idx, updated) or cur
       InsertBlockAfter(
         after_block_id: after_opt,
         parent_block_id: parent_opt,
@@ -530,14 +567,14 @@ fn apply_block_ops(
           provenance: prov,
           version: 1
         )
-        cur = sort_blocks(cur.append(inserted))
+        cur = insert_block_sorted(cur, inserted)
       DeleteBlock(block_id: bid, expected_version: exp_v):
         idx = try find_block_idx(cur, bid).or_fail("block '#{bid}' not found")
         old_b = cur.get(idx) or stop "block idx"
         if old_b.version != exp_v
           return Error("block '#{bid}' version mismatch: expected #{exp_v}, found #{old_b.version}")
         end
-        cur = sort_blocks(cur.remove_at(idx) or cur)
+        cur = cur.remove_at(idx) or cur
       MoveBlock(block_id: bid, new_parent_id: new_parent, after_block_id: after_opt):
         idx = try find_block_idx(cur, bid).or_fail("block '#{bid}' not found")
         old_b = cur.get(idx) or stop "block idx"
@@ -553,7 +590,7 @@ fn apply_block_ops(
           provenance: prov,
           version: old_b.version + 1
         )
-        cur = sort_blocks(without.append(moved))
+        cur = insert_block_sorted(without, moved)
       AttachCitations(block_id: bid, citations: cites):
         idx = try find_block_idx(cur, bid).or_fail("block '#{bid}' not found")
         old_b = cur.get(idx) or stop "block idx"
@@ -586,7 +623,7 @@ fn apply_block_ops(
           provenance: next_prov,
           version: old_b.version + 1
         )
-        cur = sort_blocks(cur.set(idx, updated) or cur)
+        cur = cur.set(idx, updated) or cur
     end
   end
   Ok(cur)
@@ -677,4 +714,51 @@ test "lossless anchored Markdown round-trip and surgical BlockOp patching"
 
   stale_op = [ReplaceBlock(block_id: "blk_02", expected_version: 1, kind: None, markdown: "stale")]
   assert apply_block_ops(patched, stale_op, "pag_1", prov, []) is Error(_)
+
+  # sort_blocks fast-path, (rank, id) tie-breaking, MoveBlock, AttachCitations, and DeleteBlock
+  assert sort_blocks(patched) == patched
+  tie_b = Block(
+    id: "blk_z",
+    page_id: "pag_1",
+    parent_block_id: None,
+    rank: "i0005",
+    kind: Paragraph,
+    markdown: "Z",
+    provenance: prov,
+    version: 1
+  )
+  tie_a = Block(
+    id: "blk_a",
+    page_id: "pag_1",
+    parent_block_id: None,
+    rank: "i0005",
+    kind: Paragraph,
+    markdown: "A",
+    provenance: prov,
+    version: 1
+  )
+  tied_sorted = sort_blocks([tie_b, tie_a])
+  assert tied_sorted == [tie_a, tie_b]
+  assert sort_blocks(tied_sorted) == tied_sorted
+  assert insert_block_sorted([tie_a], tie_b) == [tie_a, tie_b]
+  assert insert_block_sorted([tie_b], tie_a) == [tie_a, tie_b]
+
+  cites = [
+    Citation(
+      source_kind: "url",
+      source_ref: "https://example.com",
+      label: "Spec",
+      excerpt: None
+    )
+  ]
+  extra_ops = [
+    MoveBlock(block_id: "blk_04", new_parent_id: None, after_block_id: Some("blk_01")),
+    AttachCitations(block_id: "blk_01", citations: cites),
+    DeleteBlock(block_id: "blk_03", expected_version: 1)
+  ]
+  assert apply_block_ops(patched, extra_ops, "pag_1", prov, []) is Ok(after_extra)
+  assert after_extra.size == 4
+  assert after_extra == sort_blocks(after_extra)
+  assert (after_extra.get(1) or stop "moved").id == "blk_04"
+  assert (after_extra.get(0) or stop "cited").provenance.citations == cites
 end

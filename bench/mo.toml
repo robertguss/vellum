@@ -1,0 +1,9 @@
+[package]
+name = "vellum-bench"
+version = "0.1.0"
+
+[dependencies]
+arvo = { path = "../../arvo" }
+arvo-modb = { path = "../../arvo/packages/arvo-modb" }
+modb = { path = "../../modb" }
+vellum = { path = "..", src = "." }
