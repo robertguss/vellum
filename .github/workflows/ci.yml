@@ -54,6 +54,12 @@ jobs:
         with:
           repository: robertguss/arvo
           path: arvo
+      - name: Select Arvo branch (PR stack if open, else main)
+        run: |
+          if git ls-remote --exit-code https://github.com/robertguss/arvo.git refs/heads/feat/mcp-webhooks-sse >/dev/null 2>&1; then
+            git -C arvo fetch --depth 1 https://github.com/robertguss/arvo.git feat/mcp-webhooks-sse
+            git -C arvo checkout -B ci-arvo FETCH_HEAD
+          fi
       - name: Checkout Mo compiler
         uses: actions/checkout@v4
         with:
