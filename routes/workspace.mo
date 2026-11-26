@@ -19,6 +19,7 @@ create_comment,
 presign_attachment,
 commit_attachment,
 download_attachment,
+upload_local_attachment,
 mint_agent_token,
 revoke_grant,
 audit_index,
@@ -33,6 +34,7 @@ use Arvo.Modb.Jobs
 use Arvo.Modb.Sessions
 use Arvo.S3
 use Arvo.Webhooks
+use Crypto
 use Db
 use Domain.Blocks
 use Domain.Collab{WebhookJobPayload}
@@ -131,14 +133,6 @@ fn json_ok(status: Int, body: Json) : Api.Response
   )
 end
 
-fn guest_redirect_or_401(req: Api.Request) : Result(Api.Response, AppError)
-  if Auth.wants_json?(req)
-    Error(Unauthenticated)
-  else
-    Ok(Inertia.redirect("/login"))
-  end
-end
-
 fn make_provenance(auth: AuthContext, reason: Option(Text), now: Time) : Provenance
   author_kind = case auth.principal.kind
     Human: HumanAuthor
@@ -187,6 +181,23 @@ fn map_s3_error(err: S3.S3Error) : AppError
     S3.InvalidConfig(reason: _) | S3.InvalidHeader(name: _): ServerFailed(reason: err.to_text)
     S3.InvalidKey(reason: _) | S3.InvalidExpiry(seconds: _): BadInput(reason: err.to_text)
   end
+end
+
+fn map_file_error(err: FileError) : AppError
+  case err
+    NotFound(path: p): Missing(entity: "attachment_file", id: p)
+    NotAllowed(path: _): Forbidden(reason: err.to_text)
+    NotText(path: _) | Failed(path: _, reason: _): ServerFailed(reason: err.to_text)
+  end
+end
+
+fn dangerous_inline_mime?(ct: Text) : Bool
+  lower = ct.trim.ascii_lowercase
+  lower.contains?("html") or
+    lower.contains?("svg") or
+    lower.contains?("xml") or
+    lower.contains?("javascript") or
+    lower.contains?("ecmascript")
 end
 
 fn map_block_op_error(msg: Text) : AppError
@@ -263,8 +274,7 @@ fn render_inertia_page(
   if Inertia.check_version(req, icfg) is Some(ver_res)
     return Ok(ver_res)
   end
-  key = try Auth.app_secret_key(env)
-  (shared, had_flash?) = Auth.shared_props(req, Some(auth), key)
+  (shared, had_flash?) = try Auth.shared_props_for(req, Some(auth), rf, env)
   res = Inertia.render(req, icfg, component, props, shared)
   Ok(Flash.clear_if_present(res, had_flash?, Auth.secure_cookies?(env)))
 end
@@ -276,7 +286,7 @@ fn home(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: Env) : 
 )
   a = case auth
     Some(x): x
-    None: return guest_redirect_or_401(req)
+    None: return Auth.guest_redirect_or_401(req, env)
   end
   if not Policy.action_permitted?(a, "read")
     return Error(Forbidden(reason: "grant '#{a.grant_id}' does not permit 'read'"))
@@ -346,7 +356,7 @@ fn show_collection(req: Api.Request, slug: Text, auth: Option(AuthContext), rf: 
 )
   a = case auth
     Some(x): x
-    None: return guest_redirect_or_401(req)
+    None: return Auth.guest_redirect_or_401(req, env)
   end
   if not rf.exists?(Db.ledger_db_path)
     return Error(Missing(entity: "collection", id: slug))
@@ -473,7 +483,7 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
 )
   a = case auth
     Some(x): x
-    None: return guest_redirect_or_401(req)
+    None: return Auth.guest_redirect_or_401(req, env)
   end
   if not rf.exists?(Db.ledger_db_path)
     return Error(Missing(entity: "page", id: id))
@@ -1007,7 +1017,7 @@ fn create_comment(
   )
 end
 
-## `POST /api/attachments/presign` — Issues an AWS SigV4 presigned `PUT` URL and records pending metadata in MoDB.
+## `POST /api/attachments/presign` — Issues an AWS SigV4 presigned `PUT` URL (or signed local-disk upload URL in Solo/Personal modes) and records pending metadata in MoDB.
 fn presign_attachment(
   req: Api.Request,
   auth: AuthContext,
@@ -1031,19 +1041,47 @@ fn presign_attachment(
   else
     "write_direct"
   end
-  s3_cfg = try Auth.s3_config(env)
+  use_local? = try Auth.use_local_attachments(env)
   now = clock.now
   att_id = "att_#{Id.ulid(rng, clock)}"
   clean_name = sanitize_filename_segment(input.filename)
-  raw_key = "workspaces/#{Db.default_workspace_id}/pages/#{input.page_id}/#{att_id}/#{clean_name}"
-  s3_key = try S3.sanitize_object_key(raw_key).map_error(map_s3_error)
-  put_opts = S3.PresignPutOptions(
-    expires_seconds: 900,
-    content_type: Some(ct),
-    content_length: Some(input.size_bytes),
-    sha256_hex: input.sha256_hex
-  )
-  signed = try S3.presign_put(s3_cfg, s3_key, put_opts, now).map_error(map_s3_error)
+  sha_norm = case input.sha256_hex
+    Some(s) if not s.trim.empty?: s.trim.ascii_lowercase
+    Some(_) | None: ""
+  end
+  sha_opt = if sha_norm.empty?: None else: Some(sha_norm)
+
+  (bucket_name, object_key, upload_url, method_str, hdrs_json, expires_at) = if use_local?
+    key = try Auth.ensure_app_secret_key(files, rng, env)
+    exp_sec = Webhooks.unix_seconds(now) + 900
+    local_key = "attachments/#{att_id}/#{clean_name}"
+    sig = Auth.local_attachment_sig(key, att_id, exp_sec, input.size_bytes, sha_norm)
+    (
+      "local",
+      local_key,
+      "/api/attachments/#{att_id}/upload?exp=#{exp_sec}&sig=#{sig}",
+      "PUT",
+      Json.Array([Json.Object({"name": Json.String("Content-Type"), "value": Json.String(ct)})]),
+      now + 15.minutes
+    )
+  else
+    s3_cfg = try Auth.s3_config(env)
+    raw_key = "workspaces/#{Db.default_workspace_id}/pages/#{input.page_id}/#{att_id}/#{clean_name}"
+    s3_key = try S3.sanitize_object_key(raw_key).map_error(map_s3_error)
+    put_opts = S3.PresignPutOptions(
+      expires_seconds: 900,
+      content_type: Some(ct),
+      content_length: Some(input.size_bytes),
+      sha256_hex: sha_opt
+    )
+    signed = try S3.presign_put(s3_cfg, s3_key, put_opts, now).map_error(map_s3_error)
+    hdrs = Json.Array(
+      signed.required_headers.map(fn(h)
+        Json.Object({"name": Json.String(h.0), "value": Json.String(h.1)})
+      end)
+    )
+    (s3_cfg.bucket, s3_key, signed.url, signed.method, hdrs, signed.expires_at)
+  end
 
   att = Attachment(
     id: att_id,
@@ -1053,9 +1091,9 @@ fn presign_attachment(
     filename: input.filename.trim,
     content_type: ct,
     size_bytes: input.size_bytes,
-    sha256_hex: input.sha256_hex or "",
-    s3_bucket: s3_cfg.bucket,
-    s3_key: s3_key,
+    sha256_hex: sha_norm,
+    s3_bucket: bucket_name,
+    s3_key: object_key,
     status: "pending",
     created_at: now
   )
@@ -1093,36 +1131,131 @@ fn presign_attachment(
     end
   )
 
-  hdrs_json = Json.Array(
-    signed.required_headers.map(fn(h)
-      Json.Object({"name": Json.String(h.0), "value": Json.String(h.1)})
-    end)
-  )
   Ok(
     json_ok(
       201,
       Json.Object({
         "attachment": saved.to_json,
-        "upload_url": Json.String(signed.url),
-        "method": Json.String(signed.method),
+        "upload_url": Json.String(upload_url),
+        "method": Json.String(method_str),
         "required_headers": hdrs_json,
-        "expires_at": signed.expires_at.to_json
+        "expires_at": expires_at.to_json
       })
     )
   )
 end
 
-## `POST /api/attachments/:id/commit` — Marks an uploaded S3 attachment `"ready"`.
+## `PUT /api/attachments/:id/upload` — Accepts HMAC-signed local attachment uploads when S3 is unconfigured (Solo/Personal modes).
+fn upload_local_attachment(
+  req: Api.Request,
+  id: Text,
+  files: Files,
+  clock: Clock,
+  env: Env
+) : Result(Api.Response, AppError)
+  if not files.read_only.exists?(Db.ledger_db_path)
+    return Error(Missing(entity: "attachment", id: id))
+  end
+  exp_raw = case req.query_param("exp")
+    Some(s): s
+    None: return Error(Forbidden(reason: "missing exp query parameter"))
+  end
+  exp_sec = case exp_raw.trim.to_int
+    Some(n): n
+    None: return Error(Forbidden(reason: "invalid exp query parameter"))
+  end
+  sig = case req.query_param("sig")
+    Some(s) if not s.trim.empty?: s.trim
+    Some(_) | None: return Error(Forbidden(reason: "missing sig query parameter"))
+  end
+  if Webhooks.unix_seconds(clock.now) > exp_sec
+    return Error(Forbidden(reason: "signed local upload URL has expired"))
+  end
+  key = case try Auth.resolve_app_secret_key(files.read_only, env)
+    Some(k): k
+    None: return Error(Forbidden(reason: "application secret key is uninitialized"))
+  end
+
+  att = try Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      a = case try Table.get(Ledger.store(db), Db.attachments_table(), id).map_error(
+        Db.map_table_error
+      )
+        Some(x): x
+        None: return Error(Missing(entity: "attachment", id: id))
+      end
+      Ok(a)
+    end
+  )
+  if att.s3_bucket != "local"
+    return Error(BadInput(reason: "attachment '#{id}' uses S3 object storage, not local upload"))
+  end
+  if att.status != "pending"
+    return Error(Conflict(reason: "attachment '#{id}' is '#{att.status}', not 'pending'"))
+  end
+  if not Auth.verify_local_attachment_sig(key, att.id, exp_sec, att.size_bytes, att.sha256_hex, sig)
+    return Error(Forbidden(reason: "invalid local attachment upload signature"))
+  end
+  if req.body.size != att.size_bytes or req.body.size > 52428800
+    return Error(
+      BadInput(reason: "expected #{att.size_bytes} bytes, received #{req.body.size} bytes")
+    )
+  end
+  if not att.sha256_hex.empty?
+    actual_sha = Crypto.sha256(req.body).to_hex.bytes
+    if not Crypto.constant_time_eq?(actual_sha, att.sha256_hex.ascii_lowercase.bytes)
+      return Error(BadInput(reason: "uploaded attachment SHA-256 digest mismatch"))
+    end
+  end
+
+  try files.make_folder("attachments/#{att.id}").map_error(map_file_error)
+  try files.write_bytes(att.s3_key, req.body).map_error(map_file_error)
+  Ok(
+    json_ok(
+      200,
+      Json.Object({
+        "ok": Json.Boolean(true),
+        "attachment_id": Json.String(att.id),
+        "size_bytes": Json.int(req.body.size)
+      })
+    )
+  )
+end
+
+## `POST /api/attachments/:id/commit` — Marks an uploaded S3 or local-disk attachment `"ready"`.
 fn commit_attachment(req: Api.Request, id: Text, auth: AuthContext, files: Files, clock: Clock) : Result(
   Attachment,
   AppError
 )
   try Auth.require_session_csrf(req, auth)
+  if not files.read_only.exists?(Db.ledger_db_path)
+    return Error(Missing(entity: "attachment", id: id))
+  end
   upload_action = if Policy.action_permitted?(auth, "upload_attachment")
     "upload_attachment"
   else
     "write_direct"
   end
+  pre_att = try Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      case try Table.get(Ledger.store(db), Db.attachments_table(), id).map_error(Db.map_table_error)
+        Some(a): Ok(a)
+        None: Error(Missing(entity: "attachment", id: id))
+      end
+    end
+  )
+  if pre_att.s3_bucket == "local" and not files.read_only.exists?(pre_att.s3_key)
+    return Error(BadInput(reason: "local attachment payload has not been uploaded yet"))
+  end
+
   now = clock.now
   meta = Ledger.WriteMeta(
     principal: auth.principal.handle,
@@ -1173,7 +1306,7 @@ fn commit_attachment(req: Api.Request, id: Text, auth: AuthContext, files: Files
   )
 end
 
-## `GET /api/attachments/:id/download` — Enforces collection grant & redirects (`302`) to short-lived S3 presigned GET URL.
+## `GET /api/attachments/:id/download` — Enforces collection grant & redirects (`302`) to S3 or serves local file safely.
 fn download_attachment(id: Text, auth: AuthContext, rf: ReadFiles, clock: Clock, env: Env) : Result(
   Api.Response,
   AppError
@@ -1202,6 +1335,24 @@ fn download_attachment(id: Text, auth: AuthContext, rf: ReadFiles, clock: Clock,
   )
   if att.status != "ready"
     return Error(Conflict(reason: "attachment '#{id}' is not ready for download"))
+  end
+
+  if att.s3_bucket == "local"
+    payload = try rf.read_bytes(att.s3_key).map_error(map_file_error)
+    disp = if dangerous_inline_mime?(att.content_type): "attachment" else: "inline"
+    safe_name = sanitize_filename_segment(att.filename)
+    return Ok(
+      Api.response(
+        200,
+        [
+          ("Content-Type", att.content_type),
+          ("Content-Disposition", "#{disp}; filename=\"#{safe_name}\""),
+          ("Cache-Control", "private, no-store"),
+          ("X-Content-Type-Options", "nosniff")
+        ],
+        payload
+      )
+    )
   end
 
   s3_cfg = try Auth.s3_config(env)
@@ -1376,7 +1527,7 @@ fn proposals_page(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, en
 )
   a = case auth
     Some(x): x
-    None: return guest_redirect_or_401(req)
+    None: return Auth.guest_redirect_or_401(req, env)
   end
   if not Policy.action_permitted?(a, "read")
     return Error(Forbidden(reason: "grant '#{a.grant_id}' does not permit 'read'"))
@@ -1438,7 +1589,7 @@ fn admin_page(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: E
 )
   a = case auth
     Some(x): x
-    None: return guest_redirect_or_401(req)
+    None: return Auth.guest_redirect_or_401(req, env)
   end
   if not Policy.action_permitted?(a, "read")
     return Error(Forbidden(reason: "grant '#{a.grant_id}' does not permit 'read'"))

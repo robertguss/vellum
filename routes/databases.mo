@@ -371,12 +371,7 @@ fn show_database(req: Api.Request, id: Text, auth: Option(AuthContext), rf: Read
 )
   a = case auth
     Some(x): x
-    None:
-      if Auth.wants_json?(req)
-        return Error(Unauthenticated)
-      else
-        return Ok(Inertia.redirect("/login"))
-      end
+    None: return Auth.guest_redirect_or_401(req, env)
   end
   if not rf.exists?(Db.ledger_db_path)
     return Error(Missing(entity: "database", id: id))
@@ -434,8 +429,7 @@ fn show_database(req: Api.Request, id: Text, auth: Option(AuthContext), rf: Read
   if Inertia.check_version(req, icfg) is Some(ver_res)
     return Ok(ver_res)
   end
-  key = try Auth.app_secret_key(env)
-  (shared, had_flash?) = Auth.shared_props(req, Some(a), key)
+  (shared, had_flash?) = try Auth.shared_props_for(req, Some(a), rf, env)
   res = Inertia.render(
     req,
     icfg,
