@@ -25,7 +25,7 @@ flowchart LR
   end
 
   subgraph Arvo["Track C: robertguss/arvo"]
-    A1["PR A1: Pure-MoDB Storage Backend (Session, Jobs, Audit, Migrations)"]
+    A1["PR A1: Pure-MoDB Storage Backend (Shipped v0.2.0)"]
     A2["PR A2: Arvo.Oidc (Code + PKCE + Fake OIDC)"]
     A3["PR A3: Arvo.S3 (Pure-Mo AWS SigV4 Presigned URLs)"]
     A4["PR A4: Arvo.Mcp (Streamable HTTP /mcp + Modb.Views Onboarding)"]
@@ -147,14 +147,12 @@ Verified against `mo v0.3.0` (`#![forbid(unsafe_code)]`, 17-crate Rust workspace
 
 ## Track C: Upstream PRs in `arvo` (`/home/exedev/Projects/arvo`)
 
-### PR A1 — Pure-MoDB Storage Backend for Arvo Core
+### PR A1 — Pure-MoDB Storage Backend for Arvo Core *(Shipped in `arvo v0.2.0`, `robertguss/arvo#2`)*
 
-- **Current Gap Verified:**
-  - `lib/arvo/session.mo` (`Sqlite.Database`, `arvo_sessions`), `lib/arvo/jobs.mo` (`arvo_jobs`), `lib/arvo/audit.mo` (`arvo_events`), and `lib/arvo/migrations.mo` (`_arvo_migrations`) all hardcode `Sqlite` today.
-- **Required Upgrade:**
-  1. Refactor `Arvo.Session`, `Arvo.Jobs`, `Arvo.Audit`, and `Arvo.Migrations` to run natively on **MoDB** (`Modb.Store` / `Modb.Ledger.Db`), mapping `arvo_sessions` (with unique SHA-256 `token_hash` index), `arvo_jobs` (with composite `(state, run_at)` readiness index + `Modb.with_exclusive_lock` claiming), `arvo_migrations`, and bridging `Arvo.Audit` onto `Modb.Ledger`.
-  2. Preserve full `Arvo.WebTest` zero-socket in-memory testing parity using `Files.in_memory({})`.
-  3. Keep existing SQLite behavior intact (either behind clean adapter modules or alongside `Arvo.Modb.*`) so `hearth-arvo` and `paideia-arvo` never regress.
+- **Delivered:**
+  - Decoupled core Arvo web modules (`Cookie`, `Session` crypto, `Csrf`, `Flash`, `Form`, `Inertia`, `Changeset`, `Auth`, `WebTest`, plus new `Arvo.Id` ULID generator) from SQLite.
+  - Added companion package `packages/arvo-modb/` (`Arvo.Modb.Sessions`, `Arvo.Modb.Jobs`) and `examples/arvo-modb-starter/` using pure MoDB (`ReadFiles`-only `load_read_only` for `GET` routes, atomic `WriteTx`-composable job enqueueing, zero SQLite).
+  - Migrations, hash-chained audits, commit-time invariants, and selective-undo replay map natively onto `Modb.Ledger` and `Modb.Replay`.
 
 ### PR A2 — `Arvo.Oidc` (OIDC / OAuth2 + PKCE + Deterministic Fake)
 
@@ -195,7 +193,7 @@ Verified against `mo v0.3.0` (`#![forbid(unsafe_code)]`, 17-crate Rust workspace
 
 | Stage | Goal | Upstream Gates Required | Vellum Deliverables |
 | --- | --- | --- | --- |
-| **Stage 0: Foundations** | Prove MoDB-backed Arvo + auth + blobs + search primitives | **PR A1, PR A2, PR A3, PR D1** | MoDB-backed `Arvo.Session`/`Jobs`, `Arvo.Oidc` + Dex local dev, `Arvo.S3` + MinIO, `Modb.Fts` BM25 benchmarks |
+| **Stage 0: Foundations** | Prove MoDB-backed Arvo + auth + blobs + search primitives | **PR A1 (shipped)**, PR A2, PR A3, PR D1 | MoDB-backed `Arvo.Modb.Sessions`/`Jobs`, `Arvo.Oidc` + Dex local dev, `Arvo.S3` + MinIO, `Modb.Fts` BM25 benchmarks |
 | **Stage 1: Core Workspace** | Usable fast wiki replacing Outline | Stage 0 gates | Workspaces, Collections, nested Pages, TipTap ↔ Block-ID/Markdown engine, `Modb.Fts` `Cmd+K` search, S3 attachments, `Modb.Ledger` revision history + Undo |
 | **Stage 2: Relational Databases** | Replace Notion Databases | **PR D2, PR D3** *(+ M3 as profiled)* | Typed schemas (`Decimal`, `Date`, `Select`, `Relation`, `Rollup`), dynamic cell indexes, **Table / Kanban Board / Calendar** views, filters & sorts, row-as-page editing |
 | **Stage 3: AI-Native & Realtime** | First-class agents + live collaboration | **PR M1, PR M2, PR A4, PR A5** | `/mcp` (`Arvo.Mcp`), `Modb.Grants` + token console, `Modb.Claims` live block/row leases over SSE, `Modb.World` Change Proposals diff inbox, `Modb.Replay` Selective Undo UI, webhooks, streaming Ask Workspace + inline `/ai` + gardening jobs |
