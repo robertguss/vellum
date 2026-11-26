@@ -4,6 +4,31 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p public/assets
 
+if [[ -d frontend/node_modules ]]; then
+  (
+    cd frontend
+    npm run typecheck
+    npm run build
+  )
+  node -e '
+    const fs = require("fs");
+    const manifest = JSON.parse(fs.readFileSync("public/manifest.json", "utf8"));
+    const entry = manifest["src/main.tsx"];
+    if (!entry || !entry.file) {
+      throw new Error("public/manifest.json missing src/main.tsx entry");
+    }
+    if (!fs.existsSync("public/" + entry.file)) {
+      throw new Error("Missing built asset: public/" + entry.file);
+    }
+    for (const css of entry.css || []) {
+      if (!fs.existsSync("public/" + css)) {
+        throw new Error("Missing built CSS asset: public/" + css);
+      }
+    }
+    console.log("Verified Vite manifest & assets:", entry.file);
+  '
+fi
+
 mo check domain/types.mo
 mo check domain/blocks.mo
 mo check domain/policy.mo
@@ -28,4 +53,4 @@ mo test domain/notion-import.mo
 mo test db.mo
 mo test main.mo
 
-echo "All Vellum Stage 1, Stage 2, Stage 3, and Stage 4 checks and tests passed."
+echo "All Vellum Stage 1-5 checks, frontend build checks, and tests passed."

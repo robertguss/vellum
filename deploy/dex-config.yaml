@@ -1,0 +1,25 @@
+issuer: http://127.0.0.1:5556/dex
+storage:
+  type: memory
+web:
+  http: 0.0.0.0:5556
+oauth2:
+  skipApprovalScreen: true
+enablePasswordDB: true
+staticPasswords:
+  - email: "ada@acme.io"
+    # bcrypt hash for password: "vellum-dev-password"
+    hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"
+    username: "ada"
+    userID: "user-ada"
+  - email: "bob@acme.io"
+    hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"
+    username: "bob"
+    userID: "user-bob"
+staticClients:
+  - id: vellum-web
+    name: "Vellum Local Dev"
+    secret: vellum-dev-oidc-secret
+    redirectURIs:
+      - "http://localhost:8080/auth/oidc/callback"
+      - "http://127.0.0.1:8080/auth/oidc/callback"
