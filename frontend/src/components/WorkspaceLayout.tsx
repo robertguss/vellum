@@ -22,6 +22,8 @@ import type {
   Collection,
   CollectionWritePolicy,
   DatabaseDef,
+  SearchMode,
+  SearchResponse,
   SearchResultItem,
   SharedPageProps,
 } from "../lib/types";
@@ -64,9 +66,11 @@ export default function WorkspaceLayout({
     onClaimsChange?.(claims);
   }, [claims, onClaimsChange]);
 
-  // Cmd+K BM25 search modal
+  // Cmd+K Hybrid (BM25 + Modb.Vec) search modal
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  const [searchMode, setSearchMode] = useState<SearchMode>("hybrid");
+  const [searchBackend, setSearchBackend] = useState<"neural" | "sketch" | "none" | null>(null);
   const [searchResults, setSearchResults] = useState<SearchResultItem[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
 
@@ -121,23 +125,26 @@ export default function WorkspaceLayout({
     const trimmed = searchQuery.trim();
     if (!trimmed) {
       setSearchResults([]);
+      setSearchBackend(null);
       return;
     }
     const timer = window.setTimeout(async () => {
       setSearchLoading(true);
       try {
-        const res = await apiFetch<{ results: SearchResultItem[] }>(
-          `/api/search?q=${encodeURIComponent(trimmed)}&limit=15`
+        const res = await apiFetch<SearchResponse>(
+          `/api/search?q=${encodeURIComponent(trimmed)}&limit=15&mode=${searchMode}`
         );
         setSearchResults(res.results ?? []);
+        setSearchBackend(res.vector_backend ?? null);
       } catch {
         setSearchResults([]);
+        setSearchBackend(null);
       } finally {
         setSearchLoading(false);
       }
     }, 180);
     return () => window.clearTimeout(timer);
-  }, [searchOpen, searchQuery]);
+  }, [searchOpen, searchQuery, searchMode]);
 
   async function handleAskAi(e: React.FormEvent) {
     e.preventDefault();
@@ -437,7 +444,7 @@ export default function WorkspaceLayout({
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search pages & database rows (grant-filtered BM25)..."
+                placeholder="Search pages & database rows (Hybrid RRF + BM25)..."
                 className="flex-1 text-sm outline-none bg-transparent"
               />
               <button
@@ -447,6 +454,39 @@ export default function WorkspaceLayout({
               >
                 <X className="h-4 w-4" />
               </button>
+            </div>
+            <div className="flex items-center justify-between gap-2 border-b border-stone-100 bg-stone-50/70 px-4 py-2">
+              <div className="inline-flex items-center rounded-lg border border-stone-200 bg-white p-0.5 text-[11px] font-medium">
+                {(
+                  [
+                    ["hybrid", "Hybrid"],
+                    ["bm25", "Keyword"],
+                    ["semantic", "Semantic"],
+                  ] as const
+                ).map(([modeVal, label]) => (
+                  <button
+                    key={modeVal}
+                    type="button"
+                    onClick={() => setSearchMode(modeVal)}
+                    className={`rounded-md px-2.5 py-0.5 transition ${
+                      searchMode === modeVal
+                        ? "bg-stone-900 text-white"
+                        : "text-stone-600 hover:text-stone-900"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {searchBackend && (
+                <span className="rounded-full border border-stone-200 bg-white px-2 py-0.5 font-mono text-[10px] text-stone-500">
+                  {searchBackend === "neural"
+                    ? "Neural Vec"
+                    : searchBackend === "sketch"
+                      ? "Sketch Vec"
+                      : "BM25 Only"}
+                </span>
+              )}
             </div>
             <div className="max-h-80 overflow-y-auto divide-y divide-stone-100">
               {searchLoading && (
@@ -459,27 +499,56 @@ export default function WorkspaceLayout({
                   No permitted workspace matches found.
                 </div>
               )}
-              {searchResults.map((hit) => (
-                <button
-                  key={hit.page_id}
-                  type="button"
-                  onClick={() => {
-                    setSearchOpen(false);
-                    router.visit(`/p/${hit.page_id}`);
-                  }}
-                  className="w-full text-left px-4 py-3 hover:bg-stone-50 flex items-center justify-between gap-4 transition"
-                >
-                  <div className="min-w-0">
-                    <div className="text-sm font-medium text-stone-900 truncate">
-                      {hit.title}
+              {searchResults.map((hit) => {
+                const hasFts = hit.fts_rank !== null && hit.fts_rank !== undefined;
+                const hasVec = hit.vec_rank !== null && hit.vec_rank !== undefined;
+                const matchBadge =
+                  hasFts && hasVec
+                    ? { label: "Hybrid", cls: "bg-teal-50 text-teal-800 border-teal-200" }
+                    : hasVec
+                      ? { label: "Semantic", cls: "bg-indigo-50 text-indigo-800 border-indigo-200" }
+                      : { label: "BM25", cls: "bg-stone-100 text-stone-700 border-stone-200" };
+                return (
+                  <button
+                    key={hit.page_id}
+                    type="button"
+                    onClick={() => {
+                      setSearchOpen(false);
+                      router.visit(`/p/${hit.page_id}`);
+                    }}
+                    className="w-full text-left px-4 py-3 hover:bg-stone-50 flex items-center justify-between gap-4 transition"
+                  >
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-medium text-stone-900 truncate">
+                          {hit.title}
+                        </span>
+                        <span
+                          className={`shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-medium ${matchBadge.cls}`}
+                        >
+                          {matchBadge.label}
+                        </span>
+                      </div>
+                      <div className="text-xs text-stone-500 mt-0.5 flex flex-wrap items-center gap-x-2">
+                        {hit.matched_terms.length > 0 && (
+                          <span>
+                            Matched: {hit.matched_terms.join(", ")} · {hit.matched_fields.join(", ")}
+                          </span>
+                        )}
+                        {hit.matched_terms.length === 0 && hasVec && (
+                          <span>Semantic similarity match</span>
+                        )}
+                        {typeof hit.vec_score === "number" && (
+                          <span className="font-mono text-[11px] text-stone-400">
+                            cos {hit.vec_score.toFixed(2)}
+                          </span>
+                        )}
+                      </div>
                     </div>
-                    <div className="text-xs text-stone-500 mt-0.5">
-                      Matched: {hit.matched_terms.join(", ")} · {hit.matched_fields.join(", ")}
-                    </div>
-                  </div>
-                  <ChevronRight className="h-4 w-4 text-stone-400 shrink-0" />
-                </button>
-              ))}
+                    <ChevronRight className="h-4 w-4 text-stone-400 shrink-0" />
+                  </button>
+                );
+              })}
             </div>
           </div>
         </div>

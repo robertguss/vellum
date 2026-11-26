@@ -4,6 +4,7 @@ module Routes.Importer
 expose ImportNotionInput(..), import_notion
 use Api
 use Arvo.Id
+use Arvo.Modb.Jobs
 use Db
 use Domain.Blocks
 use Domain.DatabaseModel{DatabaseDef, DbRow, DbViewDef, DbViewKind}
@@ -217,6 +218,25 @@ fn import_notion(
     "row_count": Json.int(total_rows)
   })
 
+  var idx_jobs = []
+  for (pg, _blks) in prepared_pages
+    idx_jobs = idx_jobs.append(
+      Jobs.prepare(rng, clock, "vellum.page.indexed", Json.Object({"page_id": Json.String(pg.id)}))
+    )
+  end
+  for (_def, _host_pg, _view_def, rows_and_pages) in prepared_dbs
+    for (_r, rp) in rows_and_pages
+      idx_jobs = idx_jobs.append(
+        Jobs.prepare(
+          rng,
+          clock,
+          "vellum.page.indexed",
+          Json.Object({"page_id": Json.String(rp.id)})
+        )
+      )
+    end
+  end
+
   _committed = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
@@ -260,6 +280,10 @@ fn import_notion(
         for (r, rp) in rows_and_pages
           cur = try Db.tx_put_db_row(cur, def, r, rp, [])
         end
+      end
+      for job_rec in idx_jobs
+        (next_tx, _jid) = try Jobs.tx_put(cur, job_rec).map_error(Db.map_table_error)
+        cur = next_tx
       end
       Ok((cur, Unit))
     end

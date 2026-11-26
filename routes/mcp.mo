@@ -18,6 +18,7 @@ use Modb.Grants
 use Modb.Ledger
 use Modb.Table
 use Modb.World
+use Routes.Ai
 
 fn vellum_server_info() : Mcp.ServerInfo
   Mcp.ServerInfo(
@@ -50,9 +51,13 @@ fn vellum_tools() : List(Mcp.ToolDef)
     ),
     Mcp.ToolDef(
       name: "vellum.search",
-      description: "BM25 full-text search across accessible pages and database rows.",
+      description: "Hybrid BM25 + semantic Modb.Vec search across accessible pages and database rows.",
       input_schema: Mcp.object_schema(
-        {"q": str_prop("Search query"), "collection_id": str_prop("Optional collection filter")},
+        {
+          "q": str_prop("Search query"),
+          "collection_id": str_prop("Optional collection filter"),
+          "mode": str_prop("Optional mode: 'hybrid' (default), 'bm25', or 'semantic'")
+        },
         ["q"]
       ),
       read_only?: true
@@ -224,7 +229,9 @@ fn handle_tool_call(
   auth: AuthContext,
   files: Files,
   rng: SecureRandom,
-  clock: Clock
+  clock: Clock,
+  env: Env,
+  net: Network
 ) : Result(Api.Response, AppError)
   now = clock.now
 
@@ -306,18 +313,33 @@ fn handle_tool_call(
       return Ok(Mcp.tool_error(id, "'q' must not be empty"))
     end
     col_filter = args.text_at("collection_id")
-    hits = try Ledger.read_locked(
+    mode_arg = args.text_at("mode")
+    out = case Ai.execute_workspace_search(
       files.read_only,
-      Db.ledger_db_path,
-      Db.vellum_schema(),
-      Db.map_ledger_error,
-      fn(db) Db.search_pages(Ledger.store(db), auth, q, 20, true, col_filter) end
+      auth,
+      q,
+      20,
+      true,
+      col_filter,
+      mode_arg,
+      env,
+      net
     )
+      Ok(o): o
+      Error(BadInput(reason: msg)): return Ok(Mcp.tool_error(id, msg))
+      Error(e): return Error(e)
+    end
     return Ok(
       Mcp.tool_ok(
         id,
-        "Found #{hits.size} search hits.",
-        Some(Json.Object({"results": hits.to_json}))
+        "Found #{out.results.size} #{out.mode} (#{out.vector_backend}) search hits.",
+        Some(
+          Json.Object({
+            "results": out.results.to_json,
+            "mode": Json.String(out.mode),
+            "vector_backend": Json.String(out.vector_backend)
+          })
+        )
       )
     )
   end
@@ -869,10 +891,15 @@ fn handle_resource_read(id: Mcp.RpcId, uri: Text, auth: AuthContext, rf: ReadFil
 end
 
 ## `POST /mcp` — Authenticated Streamable HTTP MCP endpoint for external AI agents.
-fn handle_mcp(req: Api.Request, auth: AuthContext, files: Files, rng: SecureRandom, clock: Clock) : Result(
-  Api.Response,
-  AppError
-)
+fn handle_mcp(
+  req: Api.Request,
+  auth: AuthContext,
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock,
+  env: Env,
+  net: Network
+) : Result(Api.Response, AppError)
   case Mcp.dispatch(req, vellum_server_info(), vellum_tools(), vellum_resources())
     Mcp.Respond(res): Ok(res)
     Mcp.CallTool(id: rpc_id, name: tool_name, arguments: args): handle_tool_call(
@@ -882,7 +909,9 @@ fn handle_mcp(req: Api.Request, auth: AuthContext, files: Files, rng: SecureRand
       auth,
       files,
       rng,
-      clock
+      clock,
+      env,
+      net
     )
     Mcp.ReadResource(id: rpc_id, uri: uri): handle_resource_read(rpc_id, uri, auth, files.read_only)
   end

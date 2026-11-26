@@ -20,6 +20,7 @@ use Api
 use Arvo.Flash
 use Arvo.Id
 use Arvo.Inertia
+use Arvo.Modb.Jobs
 use Date
 use Db
 use Domain.Blocks
@@ -724,6 +725,12 @@ fn create_row(
     Some(_) | None: []
   end
 
+  idx_job = Jobs.prepare(
+    rng,
+    clock,
+    "vellum.page.indexed",
+    Json.Object({"page_id": Json.String(page_id)})
+  )
   meta = Ledger.WriteMeta(
     principal: auth.principal.handle,
     action: "db_row.create",
@@ -789,7 +796,8 @@ fn create_row(
         version: 1
       )
       t2 = try Db.tx_put_db_row(t1, def, row, page, blocks)
-      Ok((t2, (row, page)))
+      (t3, _jid) = try Jobs.tx_put(t2, idx_job).map_error(Db.map_table_error)
+      Ok((t3, (row, page)))
     end
   )
   row_ev = Json.Object({
@@ -806,7 +814,7 @@ fn create_row(
   )
 end
 
-## `PATCH /api/databases/:id/rows/:row_id` — Updates row cells with optimistic version checks, syncing `vlm_db_cells`, backing `Page`, and `Modb.Fts`.
+## `PATCH /api/databases/:id/rows/:row_id` — Updates row cells with optimistic version checks, syncing `vlm_db_cells`, backing `Page`, and `Modb.Fts` + `Modb.Vec`.
 fn update_row(
   req: Api.Request,
   id: Text,
@@ -814,10 +822,12 @@ fn update_row(
   auth: AuthContext,
   input: UpdateRowInput,
   files: Files,
+  rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
   now = clock.now
+  stub_job = Jobs.prepare(rng, clock, "vellum.page.indexed", Json.Null)
   meta = Ledger.WriteMeta(
     principal: auth.principal.handle,
     action: "db_row.update",
@@ -905,7 +915,22 @@ fn update_row(
         version: old_page.version + 1
       )
       t2 = try Db.tx_put_db_row(t1, def, bumped_row, bumped_page, existing_blocks)
-      Ok((t2, (bumped_row, bumped_page)))
+      idx_job = Jobs.JobRecord(
+        id: stub_job.id,
+        queue: stub_job.queue,
+        job_name: stub_job.job_name,
+        payload_json: Json.Object({"page_id": Json.String(bumped_page.id)}).to_text,
+        state: stub_job.state,
+        attempts: stub_job.attempts,
+        max_attempts: stub_job.max_attempts,
+        run_at: stub_job.run_at,
+        locked_at: stub_job.locked_at,
+        last_error: stub_job.last_error,
+        created_at: stub_job.created_at,
+        updated_at: stub_job.updated_at
+      )
+      (t3, _jid) = try Jobs.tx_put(t2, idx_job).map_error(Db.map_table_error)
+      Ok((t3, (bumped_row, bumped_page)))
     end
   )
   row_ev = Json.Object({

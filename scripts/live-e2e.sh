@@ -83,6 +83,45 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ lastBody }));
     return;
   }
+  if (req.method === "POST" && req.url === "/v1/embeddings") {
+    if (req.headers.authorization !== "Bearer test-live-vellum-key") {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "unauthorized" }));
+      return;
+    }
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf8");
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        res.writeHead(400);
+        res.end("bad json");
+        return;
+      }
+      const dims = Number.isInteger(body.dimensions) && body.dimensions > 0 ? body.dimensions : 8;
+      const txt = String(body.input ?? "").toLowerCase();
+      const vec = new Array(dims).fill(0);
+      const isKeyTopic =
+        txt.includes("runbook") ||
+        txt.includes("gateway") ||
+        txt.includes("quorum") ||
+        txt.includes("credential") ||
+        txt.includes("renewal") ||
+        txt.includes("secret");
+      vec[isKeyTopic ? 0 : 1] = 1.0;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          object: "list",
+          data: [{ object: "embedding", index: 0, embedding: vec }],
+        })
+      );
+    });
+    return;
+  }
   if (req.method === "POST" && req.url === "/v1/chat/completions") {
     if (req.headers.authorization !== "Bearer test-live-vellum-key") {
       res.writeHead(401, { "Content-Type": "application/json" });
@@ -152,6 +191,9 @@ export VELLUM_AI_API_KEY="test-live-vellum-key"
 export VELLUM_AI_PROVIDER="openai"
 export VELLUM_AI_BASE_URL="http://127.0.0.1:${MOCK_LLM_PORT}/v1/chat/completions"
 export VELLUM_AI_MODEL="gpt-4o-mini"
+export VELLUM_EMBED_BASE_URL="http://127.0.0.1:${MOCK_LLM_PORT}/v1/embeddings"
+export VELLUM_EMBED_MODEL="text-embedding-3-small"
+export VELLUM_EMBED_DIMENSIONS="8"
 
 mo serve "$ROOT_DIR/main.mo" \
   --bind 127.0.0.1 \
@@ -366,6 +408,37 @@ assert.ok(
   searchRes.json.results.some((hit) => hit.page_id === pageId),
   "Live BM25 search returned created page"
 );
+
+// Create a secret collection + page (sharing semantic topic vector [1,0,...] with Live Deployment Runbook)
+// so background arvo.jobs.drain (10s schedule) indexes both into Modb.Vec during steps 5-9.
+const secretColRes = await apiJson("/api/collections", {
+  method: "POST",
+  body: JSON.stringify({
+    slug: "secret-exec",
+    name: "Secret Exec",
+    description: "Confidential executive keys",
+    icon: null,
+    write_policy: "direct_with_audit",
+    freshness_ttl_days: 30,
+  }),
+});
+assert.equal(secretColRes.res.status, 201, secretColRes.text);
+const secretColId = secretColRes.json.id;
+
+const secretPgRes = await apiJson("/api/pages", {
+  method: "POST",
+  body: JSON.stringify({
+    collection_id: secretColId,
+    parent_page_id: null,
+    title: "Executive Secret Vault",
+    markdown: "Master token custody zxqvault.",
+    icon: null,
+    freshness_ttl_days: null,
+    reason: "secret semantic test page",
+  }),
+});
+assert.equal(secretPgRes.res.status, 201, secretPgRes.text);
+const secretPageId = secretPgRes.json.page.id;
 console.log("✓ Collection, Page creation & live BM25 FTS verified");
 
 // 5. Real VersityGW S3 SigV4 presigned PUT + commit + presigned GET download
@@ -783,6 +856,78 @@ assert.ok(
   `Expected incremental token streaming over >=200ms (got ${doneMs - firstCitationMs}ms since citation, total ${doneMs - askStartMs}ms)`
 );
 console.log("✓ Live Ask Workspace HTTP-to-SSE incremental token streaming verified");
+
+// 10. Live Neural Embedding Outbox Indexing (`arvo.jobs.drain`) + Hybrid Semantic Search + Fail-Closed Grant Isolation
+let neuralOwnerRes = null;
+const pollDeadline = Date.now() + 20000;
+while (Date.now() < pollDeadline) {
+  const probe = await apiJson("/api/search?q=credential+renewal+protocol&mode=semantic&limit=10");
+  assert.equal(probe.res.status, 200, probe.text);
+  const probeIds = (probe.json?.results ?? []).map((h) => h.page_id);
+  if (
+    probe.json?.vector_backend === "neural" &&
+    probeIds.includes(pageId) &&
+    probeIds.includes(secretPageId)
+  ) {
+    neuralOwnerRes = probe.json;
+    break;
+  }
+  await new Promise((r) => setTimeout(r, 500));
+}
+assert.ok(neuralOwnerRes, "Expected arvo.jobs.drain to populate vellum_neural_8 vector index");
+
+// Verify BM25-only mode returns zero hits & vector_backend === "none" on zero lexical overlap query
+const bm25Zero = await apiJson("/api/search?q=credential+renewal+protocol&mode=bm25&limit=10");
+assert.equal(bm25Zero.res.status, 200);
+assert.equal(bm25Zero.json.mode, "bm25");
+assert.equal(bm25Zero.json.vector_backend, "none");
+assert.equal((bm25Zero.json.results ?? []).length, 0);
+
+// Scoped agent (allowed ONLY on colId) searches semantically via /api/search & /mcp vellum.search -> sees pageId, NEVER secretPageId
+for (const mode of ["semantic", "hybrid"]) {
+  const agSearch = await fetch(
+    `${BASE}/api/search?q=credential+renewal+protocol&mode=${mode}&limit=10`,
+    { headers: { Authorization: `Bearer ${rawTok}` } }
+  );
+  assert.equal(agSearch.status, 200);
+  const agSearchJson = await agSearch.json();
+  assert.equal(agSearchJson.vector_backend, "neural");
+  const agIds = (agSearchJson.results ?? []).map((h) => h.page_id);
+  assert.ok(agIds.includes(pageId), `Agent ${mode} search includes permitted page`);
+  assert.ok(!agIds.includes(secretPageId), `Agent ${mode} search NEVER leaks secret page`);
+
+  const mcpSem = await mcpCall(10 + (mode === "hybrid" ? 1 : 0), "tools/call", {
+    name: "vellum.search",
+    arguments: { q: "credential renewal protocol", mode },
+  });
+  assert.equal(mcpSem.result?.isError, false);
+  assert.equal(mcpSem.result?.structuredContent?.vector_backend, "neural");
+  const mcpIds = (mcpSem.result?.structuredContent?.results ?? []).map((h) => h.page_id);
+  assert.ok(mcpIds.includes(pageId), `MCP ${mode} search includes permitted page`);
+  assert.ok(!mcpIds.includes(secretPageId), `MCP ${mode} search NEVER leaks secret page`);
+}
+
+// Scoped agent Ask Workspace (SSE) with zero-lexical-overlap semantic question retrieves & cites ONLY permitted runbook
+const semAskRes = await fetch(`${BASE}/api/ai/ask`, {
+  method: "POST",
+  headers: {
+    Accept: "text/event-stream",
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${rawTok}`,
+  },
+  body: JSON.stringify({
+    question: "credential renewal protocol",
+    collection_id: null,
+    max_sources: 5,
+    stream: true,
+  }),
+});
+assert.equal(semAskRes.status, 200);
+const semAskText = await semAskRes.text();
+assert.ok(semAskText.includes(pageId), "Semantic Ask Workspace cites permitted Live Deployment Runbook");
+assert.ok(!semAskText.includes(secretPageId), "Semantic Ask Workspace NEVER cites Executive Secret Vault");
+assert.ok(!semAskText.includes("zxqvault"), "Semantic Ask Workspace NEVER leaks secret page text");
+console.log("✓ Live Modb.Vec neural outbox indexing, Hybrid RRF /api/search + /mcp, and Semantic Ask RAG verified");
 EOF
 
 echo "All Live Vellum E2E checks against mo serve + Dex + VersityGW S3 passed."

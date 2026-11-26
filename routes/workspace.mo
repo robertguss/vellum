@@ -60,6 +60,7 @@ use Modb{Store, WriteTx}
 use Modb.Grants
 use Modb.Ledger
 use Modb.Table
+use Routes.Ai
 use Routes.Auth
 
 ## JSON payload for `POST /api/collections`.
@@ -715,6 +716,12 @@ fn patch_blocks(
 
   now = clock.now
   prov = make_provenance(auth, input.reason, now)
+  idx_job = Jobs.prepare(
+    rng,
+    clock,
+    "vellum.page.indexed",
+    Json.Object({"page_id": Json.String(id)})
+  )
   meta = Ledger.WriteMeta(
     principal: auth.principal.handle,
     action: "page.patch_blocks",
@@ -780,7 +787,8 @@ fn patch_blocks(
         version: old_page.version + 1
       )
       t2 = try Db.tx_save_page_and_blocks(t1, bumped_page, updated_blocks)
-      Ok((t2, (bumped_page, updated_blocks)))
+      (t3, _jid) = try Jobs.tx_put(t2, idx_job).map_error(Db.map_table_error)
+      Ok((t3, (bumped_page, updated_blocks)))
     end
   )
 
@@ -891,32 +899,44 @@ fn verify_page(req: Api.Request, id: Text, auth: AuthContext, files: Files, cloc
   )
 end
 
-## `GET /api/search` — Fail-closed grant-filtered BM25 full-text search (`ReadFiles`-only).
-fn search(req: Api.Request, auth: AuthContext, rf: ReadFiles) : Result(Api.Response, AppError)
+## `GET /api/search` — Fail-closed grant-filtered Hybrid (BM25 + `Modb.Vec` RRF), `bm25`, or `semantic` search (`ReadFiles`-only).
+fn search(
+  req: Api.Request,
+  auth: AuthContext,
+  rf: ReadFiles,
+  env: Env,
+  net: Network
+) : Result(Api.Response, AppError)
   if not Policy.action_permitted?(auth, "read")
     return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'read'"))
   end
   q = (req.query_param("q") or "").trim
-  if q.empty?
-    return Ok(json_ok(200, Json.Object({"results": Json.Array([])})))
-  end
-  if not rf.exists?(Db.ledger_db_path)
-    return Ok(json_ok(200, Json.Object({"results": Json.Array([])})))
-  end
-
   limit = parse_limit(req.query_param("limit"), 20, 100)
   col_filter = case req.query_param("collection_id")
     Some(c) if not c.trim.empty?: Some(c.trim)
     Some(_) | None: None
   end
-  hits = try Ledger.read_locked(
+  out = try Ai.execute_workspace_search(
     rf,
-    Db.ledger_db_path,
-    Db.vellum_schema(),
-    Db.map_ledger_error,
-    fn(db) Db.search_pages(Ledger.store(db), auth, q, limit, true, col_filter) end
+    auth,
+    q,
+    limit,
+    true,
+    col_filter,
+    req.query_param("mode"),
+    env,
+    net
   )
-  Ok(json_ok(200, Json.Object({"results": hits.to_json})))
+  Ok(
+    json_ok(
+      200,
+      Json.Object({
+        "results": out.results.to_json,
+        "mode": Json.String(out.mode),
+        "vector_backend": Json.String(out.vector_backend)
+      })
+    )
+  )
 end
 
 ## `POST /api/pages/:id/comments` — Creates a page or block comment.
@@ -1493,8 +1513,19 @@ fn admin_page(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: E
   )
 end
 
-## Periodic `mo serve` job handler draining indexing + signed webhook jobs and pruning expired MoDB sessions.
-fn drain_jobs(_payload: Json, files: Files, clock: Clock, net: Network) : Result(Unit, AppError)
+fn extract_indexed_page_id(payload_json: Text) : Result(Text, Text)
+  parsed = try Json.decode_strict[Json](payload_json.bytes).map_error(fn(e) e.to_text end)
+  case parsed.text_at("page_id")
+    Some(pid) if not pid.trim.empty?: Ok(pid.trim)
+    Some(_) | None: Error("vellum.page.indexed payload missing non-empty 'page_id'")
+  end
+end
+
+## Periodic `mo serve` job handler draining neural embedding + signed webhook jobs and pruning expired MoDB sessions.
+fn drain_jobs(_payload: Json, files: Files, clock: Clock, env: Env, net: Network) : Result(
+  Unit,
+  AppError
+)
   if files.read_only.exists?(Db.sessions_db_path)
     _pruned = try Sessions.prune_expired(files, Db.sessions_db_path, clock).map_error(
       Db.map_table_error
@@ -1563,9 +1594,142 @@ fn drain_jobs(_payload: Json, files: Files, clock: Clock, net: Network) : Result
               end
           end
         else
-          try Jobs.complete(files, Db.ledger_db_path, clock, job.id, job.attempts).map_error(
-            Db.map_table_error
-          )
+          case Ai.embed_config(env)
+            None: try Jobs.complete(files, Db.ledger_db_path, clock, job.id, job.attempts)
+              .map_error(Db.map_table_error)
+            Some(ecfg):
+              case extract_indexed_page_id(job.payload_json)
+                Error(bad): try Jobs.fail_or_retry(
+                  files,
+                  Db.ledger_db_path,
+                  clock,
+                  job.id,
+                  job.attempts,
+                  bad
+                ).map_error(Db.map_table_error)
+                Ok(pid):
+                  embed_input_res = Ledger.read_locked(
+                    files.read_only,
+                    Db.ledger_db_path,
+                    Db.vellum_schema(),
+                    Db.map_ledger_error,
+                    fn(db)
+                      store = Ledger.store(db)
+                      case try Table.get(store, Db.pages_table(), pid).map_error(
+                        Db.map_table_error
+                      )
+                        Some(pg) if pg.archived_at == None:
+                          blks = try Db.load_page_blocks(store, pg.id)
+                          extra = case pg.kind
+                            Document: None
+                            DatabaseRow(database_id: db_id, row_id: row_id):
+                              case try Table.get(store, Db.databases_table(), db_id).map_error(
+                                Db.map_table_error
+                              )
+                                Some(def):
+                                  case try Table.get(store, Db.db_rows_table(), row_id).map_error(
+                                    Db.map_table_error
+                                  )
+                                    Some(row): Some(DatabaseModel.row_plain_text(def, row))
+                                    None: None
+                                  end
+                                None: None
+                              end
+                          end
+                          txt = Db.page_embedding_text(pg, blks, extra)
+                          if txt.trim.empty?
+                            Ok(None)
+                          else
+                            Ok(Some(txt))
+                          end
+                        Some(_) | None: Ok(None)
+                      end
+                    end
+                  )
+                  case embed_input_res
+                    Error(le): try Jobs.fail_or_retry(
+                      files,
+                      Db.ledger_db_path,
+                      clock,
+                      job.id,
+                      job.attempts,
+                      le.to_text
+                    ).map_error(Db.map_table_error)
+                    Ok(None):
+                      _rm = try Ledger.transact_locked(
+                        files,
+                        Db.ledger_db_path,
+                        Db.vellum_schema(),
+                        Ledger.WriteMeta(
+                          principal: "system:jobs",
+                          action: "page.embed_removed",
+                          reason: "clear neural vector for missing or archived page #{pid}",
+                          at: clock.now
+                        ),
+                        "cleared neural embedding for #{pid}",
+                        Json.Object({"page_id": Json.String(pid)}),
+                        Db.map_ledger_error,
+                        fn(tx)
+                          t1 = try Db.tx_remove_page_vectors(tx, pid)
+                          Ok((t1, Unit))
+                        end
+                      )
+                      try Jobs.complete(files, Db.ledger_db_path, clock, job.id, job.attempts)
+                        .map_error(Db.map_table_error)
+                    Ok(Some(embed_txt)):
+                      # Call OpenAI-compatible `/v1/embeddings` strictly OUTSIDE any MoDB ledger lock.
+                      case Ai.fetch_embedding(ecfg, embed_txt, net)
+                        Error(ee): try Jobs.fail_or_retry(
+                          files,
+                          Db.ledger_db_path,
+                          clock,
+                          job.id,
+                          job.attempts,
+                          ee.to_text
+                        ).map_error(Db.map_table_error)
+                        Ok(vec_vals):
+                          _stored = try Ledger.transact_locked(
+                            files,
+                            Db.ledger_db_path,
+                            Db.vellum_schema(),
+                            Ledger.WriteMeta(
+                              principal: "system:jobs",
+                              action: "page.embed_indexed",
+                              reason: "index neural embedding for page #{pid}",
+                              at: clock.now
+                            ),
+                            "indexed neural vector (#{ecfg.dimensions}d) for #{pid}",
+                            Json.Object({
+                              "page_id": Json.String(pid),
+                              "dimensions": Json.int(ecfg.dimensions),
+                              "model": Json.String(ecfg.model)
+                            }),
+                            Db.map_ledger_error,
+                            fn(tx)
+                              case try Table.tx_get(tx, Db.pages_table(), pid).map_error(
+                                Db.map_table_error
+                              )
+                                Some(live_pg) if live_pg.archived_at == None:
+                                  t1 = try Db.tx_put_page_neural_vector(
+                                    tx,
+                                    live_pg.id,
+                                    live_pg.collection_id,
+                                    ecfg.dimensions,
+                                    vec_vals
+                                  )
+                                  Ok((t1, Unit))
+                                Some(_) | None:
+                                  t1 = try Db.tx_remove_page_vectors(tx, pid)
+                                  Ok((t1, Unit))
+                              end
+                            end
+                          )
+                          try Jobs.complete(files, Db.ledger_db_path, clock, job.id, job.attempts)
+                            .map_error(Db.map_table_error)
+                      end
+                  end
+              end
+          end
         end
         processed += 1
     end

@@ -177,6 +177,8 @@ export interface Attachment {
   created_at: string;
 }
 
+export type SearchMode = "hybrid" | "bm25" | "semantic";
+
 export interface SearchResultItem {
   page_id: string;
   collection_id: string;
@@ -184,6 +186,15 @@ export interface SearchResultItem {
   score: number;
   matched_terms: string[];
   matched_fields: string[];
+  fts_rank?: number | null;
+  vec_rank?: number | null;
+  vec_score?: number | null;
+}
+
+export interface SearchResponse {
+  results: SearchResultItem[];
+  mode?: SearchMode;
+  vector_backend?: "neural" | "sketch" | "none";
 }
 
 export interface AuditFeedItem {

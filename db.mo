@@ -1,11 +1,16 @@
 ## 100% Pure MoDB persistence layer for Vellum (`sessions.modb` + `vellum.modb`).
-## Zero SQLite anywhere: combines `Modb.Table`, `Modb.Ledger`, `Modb.Grants`, and `Modb.Fts`.
+## Zero SQLite anywhere: combines `Modb.Table`, `Modb.Ledger`, `Modb.Grants`, `Modb.Fts`, and `Modb.Vec`.
 module Db
 expose sessions_db_path,
 ledger_db_path,
 default_workspace_id,
 default_collection_id,
+sketch_vec_dims,
+sketch_min_vec_score,
 fts_index,
+sketch_vec_index,
+neural_vec_index,
+page_neural_dims_table,
 workspaces_table,
 principals_table,
 principals_by_email,
@@ -29,13 +34,19 @@ map_table_error,
 map_ledger_error,
 map_grants_error,
 map_fts_error,
+map_vec_error,
 not_found_ledger?,
 verify_grant_chain_read_only,
+page_embedding_text,
 tx_index_page,
 tx_save_page_and_blocks,
 tx_delete_page_and_blocks,
+tx_put_page_neural_vector,
+tx_remove_page_vectors,
+neural_vec_populated,
 load_page_blocks,
 search_pages,
+search_pages_hybrid,
 tx_upsert_human_principal,
 tx_mint_agent,
 databases_table,
@@ -105,16 +116,34 @@ use Modb.Grants
 use Modb.Ledger
 use Modb.Replay
 use Modb.Table
+use Modb.Vec
 use Modb.World
 
 sessions_db_path = "sessions.modb"
 ledger_db_path = "vellum.modb"
 default_workspace_id = "ws_default"
 default_collection_id = "col_general"
+sketch_vec_dims = 256
+sketch_min_vec_score = 0.28.to_float
 
 ## Handle to the transactional BM25 index inside `vellum.modb`.
 fn fts_index() : Fts.FtsIndex
   Fts.index("vellum")
+end
+
+## Handle to the zero-dependency 256-dim Q16 Cosine subword sketch vector index inside `vellum.modb`.
+fn sketch_vec_index() : Vec.VecIndex
+  Vec.index("vellum_sketch", sketch_vec_dims)
+end
+
+## Dimension-namespaced handle to the neural embedding vector index inside `vellum.modb`.
+fn neural_vec_index(dims: Int) : Vec.VecIndex
+  Vec.index("vellum_neural_#{dims}", dims)
+end
+
+## Tracks each page's currently indexed neural embedding dimension for atomic cleanup across dimension changes.
+fn page_neural_dims_table() : Table.Table(Text, Int)
+  Table.text_key[Int]("vlm_page_neural_dims")
 end
 
 ## Typed `Modb.Table` descriptors (constructed in functions to avoid top-level `E1150`).
@@ -285,6 +314,17 @@ fn map_fts_error(err: Fts.FtsError) : AppError
   case err
     Fts.InvalidConfig(reason: _) | Fts.InvalidDocument(reason: _): BadInput(reason: err.to_text)
     Fts.Storage(_) | Fts.TableFailure(_): ServerFailed(reason: err.to_text)
+  end
+end
+
+## Converts `Modb.Vec` errors to `AppError`.
+fn map_vec_error(err: Vec.VecError) : AppError
+  case err
+    Vec.InvalidConfig(reason: _) | Vec.InvalidVector(reason: _) | Vec.DimensionMismatch(
+      expected: _,
+      actual: _
+    ): BadInput(reason: Vec.to_text(err))
+    Vec.Storage(_) | Vec.TableFailure(_) | Vec.FtsFailure(_): ServerFailed(reason: Vec.to_text(err))
   end
 end
 
@@ -555,7 +595,25 @@ fn verify_grant_chain_read_only(store: Store, grant_id: Text, now: Time) : Resul
   end
 end
 
-## Indexes `page` and its `blocks` into `Modb.Fts` inside `tx`.
+## Builds canonical embedding input text combining title, optional structured fields, and block body text.
+fn page_embedding_text(page: Page, blocks: List(Block), extra_text: Option(Text)) : Text
+  var parts = []
+  t = page.title.trim
+  if not t.empty?
+    parts = parts.append(t)
+  end
+  case extra_text
+    Some(et) if not et.trim.empty?: parts = parts.append(et.trim)
+    Some(_) | None: Unit
+  end
+  body = Blocks.blocks_plain_text(blocks).trim
+  if not body.empty?
+    parts = parts.append(body)
+  end
+  parts.join("\n")
+end
+
+## Indexes `page` and its `blocks` into both `Modb.Fts` and `Modb.Vec` (sketch index) inside `tx`.
 fn tx_index_page(tx: WriteTx, page: Page, blocks: List(Block)) : Result(WriteTx, AppError)
   doc = Fts.DocumentInput(
     doc_id: page.id,
@@ -565,10 +623,53 @@ fn tx_index_page(tx: WriteTx, page: Page, blocks: List(Block)) : Result(WriteTx,
       Fts.FieldInput(name: "body", text: Blocks.blocks_plain_text(blocks), weight: 1)
     ]
   )
-  Fts.tx_index_document(tx, fts_index(), doc).map_error(map_fts_error)
+  t1 = try Fts.tx_index_document(tx, fts_index(), doc).map_error(map_fts_error)
+  embed_txt = page_embedding_text(page, blocks, None)
+  vec_inp = Vec.VectorInput(
+    doc_id: page.id,
+    scope: page.collection_id,
+    values: Vec.text_sketch_embedding(embed_txt, sketch_vec_dims)
+  )
+  Vec.tx_put_vector(t1, sketch_vec_index(), vec_inp).map_error(map_vec_error)
 end
 
-## Atomically persists `page`, replaces its blocks, and updates `Modb.Fts` inside `tx`.
+## Atomically stores (or replaces across dimension/collection changes) a page's neural embedding vector.
+fn tx_put_page_neural_vector(
+  tx: WriteTx,
+  page_id: Text,
+  collection_id: Text,
+  dims: Int,
+  values: List(Float)
+) : Result(WriteTx, AppError)
+  var cur = tx
+  case try Table.tx_get(cur, page_neural_dims_table(), page_id).map_error(map_table_error)
+    Some(old_dims) if old_dims != dims: cur = try Vec.tx_remove_vector(
+      cur,
+      neural_vec_index(old_dims),
+      page_id
+    ).map_error(map_vec_error)
+    Some(_) | None: Unit
+  end
+  vec_inp = Vec.VectorInput(doc_id: page_id, scope: collection_id, values: values)
+  cur = try Vec.tx_put_vector(cur, neural_vec_index(dims), vec_inp).map_error(map_vec_error)
+  Table.put(cur, page_neural_dims_table(), page_id, dims).map_error(map_table_error)
+end
+
+## Atomically removes `page_id` from both sketch and neural vector indexes inside `tx`.
+fn tx_remove_page_vectors(tx: WriteTx, page_id: Text) : Result(WriteTx, AppError)
+  var cur = try Vec.tx_remove_vector(tx, sketch_vec_index(), page_id).map_error(map_vec_error)
+  case try Table.tx_get(cur, page_neural_dims_table(), page_id).map_error(map_table_error)
+    Some(old_dims):
+      cur = try Vec.tx_remove_vector(cur, neural_vec_index(old_dims), page_id).map_error(
+        map_vec_error
+      )
+      cur = try Table.delete(cur, page_neural_dims_table(), page_id).map_error(map_table_error)
+      Ok(cur)
+    None: Ok(cur)
+  end
+end
+
+## Atomically persists `page`, replaces its blocks, and updates `Modb.Fts` + `Modb.Vec` inside `tx`.
 fn tx_save_page_and_blocks(tx: WriteTx, page: Page, blocks: List(Block)) : Result(WriteTx, AppError)
   btbl = blocks_table()
   bidx = blocks_by_page()
@@ -587,11 +688,12 @@ fn tx_save_page_and_blocks(tx: WriteTx, page: Page, blocks: List(Block)) : Resul
   if page.archived_at == None
     tx_index_page(cur, page, blocks)
   else
-    Fts.tx_remove_document(cur, fts_index(), page.id).map_error(map_fts_error)
+    t_fts = try Fts.tx_remove_document(cur, fts_index(), page.id).map_error(map_fts_error)
+    tx_remove_page_vectors(t_fts, page.id)
   end
 end
 
-## Atomically removes `page_id`, all of its blocks, and its FTS index entry inside `tx`.
+## Atomically removes `page_id`, all of its blocks, its FTS entry, and its vector index entries inside `tx`.
 fn tx_delete_page_and_blocks(tx: WriteTx, page_id: Text) : Result(WriteTx, AppError)
   btbl = blocks_table()
   bidx = blocks_by_page()
@@ -601,7 +703,14 @@ fn tx_delete_page_and_blocks(tx: WriteTx, page_id: Text) : Result(WriteTx, AppEr
     cur = try Table.delete(cur, btbl, bid).map_error(map_table_error)
   end
   cur = try Table.delete(cur, pages_table(), page_id).map_error(map_table_error)
-  Fts.tx_remove_document(cur, fts_index(), page_id).map_error(map_fts_error)
+  cur = try Fts.tx_remove_document(cur, fts_index(), page_id).map_error(map_fts_error)
+  tx_remove_page_vectors(cur, page_id)
+end
+
+## Returns whether the dimension-namespaced neural vector index has at least one indexed page.
+fn neural_vec_populated(store: Store, dims: Int) : Result(Bool, AppError)
+  st = try Vec.stats(store, neural_vec_index(dims)).map_error(map_vec_error)
+  Ok(st.doc_count > 0)
 end
 
 ## Loads and sorts all blocks belonging to `page_id` from a committed `Store`.
@@ -610,6 +719,21 @@ fn load_page_blocks(store: Store, page_id: Text) : Result(List(Block), AppError)
     map_table_error
   )
   Ok(Blocks.sort_blocks(rows.map(fn(p) p.1 end)))
+end
+
+fn make_allow_doc(auth: AuthContext) : fn(Text, Text) : Bool
+  allowed_cols = auth.allowed_collections
+  suspended = auth.principal.suspended
+  fn(_doc_id, scope)
+    if suspended
+      false
+    else
+      case allowed_cols
+        None: true
+        Some(scopes): scopes.contains?("workspace:*") or scopes.contains?("collection:#{scope}")
+      end
+    end
+  end
 end
 
 ## Executes grant-filtered BM25 search via `Modb.Fts`, never leaking unauthorized docs.
@@ -634,28 +758,14 @@ fn search_pages(
     prefix_last_term?: prefix_last?,
     required_scope: collection_filter
   )
-  allowed_cols = auth.allowed_collections
-  suspended = auth.principal.suspended
-  hits = try Fts.search_filtered(
-    store,
-    fts_index(),
-    query,
-    opts,
-    fn(_doc_id, scope)
-      if suspended
-        false
-      else
-        case allowed_cols
-          None: true
-          Some(scopes): scopes.contains?("workspace:*") or scopes.contains?("collection:#{scope}")
-        end
-      end
-    end
-  ).map_error(map_fts_error)
+  allow_doc = make_allow_doc(auth)
+  hits = try Fts.search_filtered(store, fts_index(), query, opts, allow_doc).map_error(
+    map_fts_error
+  )
 
   ptbl = pages_table()
   var out = []
-  for hit in hits
+  for (i, hit) in hits.enumerate
     case try Table.get(store, ptbl, hit.doc_id).map_error(map_table_error)
       Some(p) if p.archived_at == None: out = out.append(
         SearchResultItem(
@@ -664,9 +774,122 @@ fn search_pages(
           title: p.title,
           score: hit.score,
           matched_terms: hit.matched_terms,
-          matched_fields: hit.matched_fields
+          matched_fields: hit.matched_fields,
+          fts_rank: Some(i + 1),
+          vec_rank: None,
+          vec_score: None
         )
       )
+      Some(_) | None: Unit
+    end
+  end
+  Ok(out)
+end
+
+## Executes fail-closed grant-filtered search in `"hybrid"` (RRF BM25 + Vec), `"bm25"`, or `"semantic"` mode.
+fn search_pages_hybrid(
+  store: Store,
+  auth: AuthContext,
+  query: Text,
+  query_vec: Option(List(Float)),
+  vec_idx: Vec.VecIndex,
+  mode: Text,
+  limit: Int,
+  prefix_last?: Bool,
+  collection_filter: Option(Text),
+  min_vec_score: Option(Float)
+) : Result(List(SearchResultItem), AppError)
+  case collection_filter
+    Some(cid):
+      if not Policy.collection_permitted?(auth, cid)
+        return Ok([])
+      end
+    None: Unit
+  end
+
+  if mode == "bm25"
+    return search_pages(store, auth, query, limit, prefix_last?, collection_filter)
+  end
+
+  allow_doc = make_allow_doc(auth)
+  ptbl = pages_table()
+
+  if mode == "semantic"
+    qv = case query_vec
+      Some(v) if not v.empty?: v
+      Some(_) | None: return Ok([])
+    end
+    vopts = Vec.VecSearchOptions(
+      limit: limit,
+      required_scope: collection_filter,
+      min_score: min_vec_score
+    )
+    vhits = try Vec.search_filtered(store, vec_idx, qv, vopts, allow_doc).map_error(map_vec_error)
+    var out = []
+    for (i, vh) in vhits.enumerate
+      case try Table.get(store, ptbl, vh.doc_id).map_error(map_table_error)
+        Some(p) if p.archived_at == None: out = out.append(
+          SearchResultItem(
+            page_id: p.id,
+            collection_id: p.collection_id,
+            title: p.title,
+            score: vh.score,
+            matched_terms: [],
+            matched_fields: ["semantic"],
+            fts_rank: None,
+            vec_rank: Some(i + 1),
+            vec_score: Some(vh.score)
+          )
+        )
+        Some(_) | None: Unit
+      end
+    end
+    return Ok(out)
+  end
+
+  cand = if limit * 4 > 20: limit * 4 else: 20
+  hopts = Vec.HybridOptions(
+    limit: limit,
+    prefix_last_term?: prefix_last?,
+    required_scope: collection_filter,
+    rrf_k: 60,
+    fts_weight: 1.0.to_float,
+    vec_weight: 1.0.to_float,
+    candidate_limit: cand,
+    min_vec_score: min_vec_score
+  )
+  hhits = try Vec.hybrid_search_filtered(
+    store,
+    fts_index(),
+    vec_idx,
+    query,
+    query_vec,
+    hopts,
+    allow_doc
+  ).map_error(map_vec_error)
+
+  var out = []
+  for hh in hhits
+    case try Table.get(store, ptbl, hh.doc_id).map_error(map_table_error)
+      Some(p) if p.archived_at == None:
+        fields = if hh.matched_fields.empty? and hh.vec_rank != None
+          ["semantic"]
+        else
+          hh.matched_fields
+        end
+        out = out.append(
+          SearchResultItem(
+            page_id: p.id,
+            collection_id: p.collection_id,
+            title: p.title,
+            score: hh.score,
+            matched_terms: hh.matched_terms,
+            matched_fields: fields,
+            fts_rank: hh.fts_rank,
+            vec_rank: hh.vec_rank,
+            vec_score: hh.vec_score
+          )
+        )
       Some(_) | None: Unit
     end
   end
@@ -934,7 +1157,14 @@ fn tx_put_db_row(tx: WriteTx, def: DatabaseDef, row: DbRow, page: Page, blocks: 
         Fts.FieldInput(name: "body", text: combined, weight: 1)
       ]
     )
-    Fts.tx_index_document(t3, fts_index(), doc).map_error(map_fts_error)
+    t4 = try Fts.tx_index_document(t3, fts_index(), doc).map_error(map_fts_error)
+    embed_txt = page_embedding_text(page, blocks, Some(row_text))
+    vec_inp = Vec.VectorInput(
+      doc_id: page.id,
+      scope: page.collection_id,
+      values: Vec.text_sketch_embedding(embed_txt, sketch_vec_dims)
+    )
+    Vec.tx_put_vector(t4, sketch_vec_index(), vec_inp).map_error(map_vec_error)
   else
     Ok(t3)
   end
@@ -1456,4 +1686,327 @@ test "Db relational database composite cell indexes, rollup enrichment, and Ledg
     end
   )
   assert bad_rel_res is Error(BadInput(reason: _))
+end
+
+test "Db Modb.Vec hybrid RRF search, neural vector updates/dimension switches, archive cleanup, and fail-closed grants"
+  files = Files.in_memory({})
+  t0 = Time.parse("2026-11-26T12:00:00Z") or stop "t0"
+  schema = vellum_schema()
+  meta = Ledger.WriteMeta(
+    principal: "@ada",
+    action: "db.vec_test",
+    reason: "verify Modb.Vec hybrid RRF and fail-closed grant filtering",
+    at: t0
+  )
+
+  sec_col = Collection(
+    id: "col_secret",
+    workspace_id: default_workspace_id,
+    slug: "secret-exec",
+    name: "Secret Executive",
+    description: "",
+    icon: None,
+    write_policy: DirectWithAudit,
+    freshness_ttl_days: None,
+    sort_order: "z",
+    archived_at: None
+  )
+  pg_pub = Page(
+    id: "pg_pub_deploy",
+    collection_id: default_collection_id,
+    parent_page_id: None,
+    title: "Gateway Rollout Checklist",
+    icon: None,
+    cover_attachment_id: None,
+    kind: Document,
+    sort_order: "a",
+    database_id: None,
+    freshness_ttl_days: None,
+    verified_at: None,
+    verified_by: None,
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+  pg_other = Page(
+    id: "pg_pub_lunch",
+    collection_id: default_collection_id,
+    parent_page_id: None,
+    title: "Catering Menu Notes",
+    icon: None,
+    cover_attachment_id: None,
+    kind: Document,
+    sort_order: "b",
+    database_id: None,
+    freshness_ttl_days: None,
+    verified_at: None,
+    verified_by: None,
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+  pg_sec = Page(
+    id: "pg_sec_vault",
+    collection_id: "col_secret",
+    parent_page_id: None,
+    title: "Executive Master Password",
+    icon: None,
+    cover_attachment_id: None,
+    kind: Document,
+    sort_order: "c",
+    database_id: None,
+    freshness_ttl_days: None,
+    verified_at: None,
+    verified_by: None,
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+
+  seed = Ledger.transact_locked(
+    files,
+    ledger_db_path,
+    schema,
+    meta,
+    "seed hybrid vector test pages",
+    Json.Null,
+    map_ledger_error,
+    fn(tx)
+      t1 = try Table.put(tx, collections_table(), sec_col.id, sec_col).map_error(map_table_error)
+      t2 = try tx_save_page_and_blocks(t1, pg_pub, [])
+      t3 = try tx_save_page_and_blocks(t2, pg_other, [])
+      t4 = try tx_save_page_and_blocks(t3, pg_sec, [])
+      # Attach 4-d neural embeddings where BOTH pg_pub and pg_sec match query [1,0,0,0] identically
+      t5 = try tx_put_page_neural_vector(t4, pg_pub.id, pg_pub.collection_id, 4, [1.0, 0.0, 0.0, 0.0])
+      t6 = try tx_put_page_neural_vector(
+        t5,
+        pg_other.id,
+        pg_other.collection_id,
+        4,
+        [0.0, 1.0, 0.0, 0.0]
+      )
+      t7 = try tx_put_page_neural_vector(t6, pg_sec.id, pg_sec.collection_id, 4, [1.0, 0.0, 0.0, 0.0])
+      Ok((t7, Unit))
+    end
+  )
+  assert seed is Ok(Unit)
+
+  owner_auth = AuthContext(
+    principal: Principal(
+      id: "usr_ada",
+      kind: Human,
+      handle: "@ada",
+      display_name: "Ada",
+      email: Some("ada@acme.io"),
+      avatar_url: None,
+      role: Owner,
+      model_id: None,
+      root_grant_id: "gr_ada",
+      suspended: false,
+      created_at: t0,
+      last_seen_at: None
+    ),
+    grant_id: "gr_ada",
+    session: None,
+    allowed_collections: None,
+    allowed_actions: ["read", "write_direct"]
+  )
+  scoped_auth = AuthContext(
+    principal: Principal(
+      id: "agt_1",
+      kind: Agent,
+      handle: "@agent1",
+      display_name: "Scoped Agent",
+      email: None,
+      avatar_url: None,
+      role: Member,
+      model_id: Some("gpt-4o-mini"),
+      root_grant_id: "gr_agt_1",
+      suspended: false,
+      created_at: t0,
+      last_seen_at: None
+    ),
+    grant_id: "gr_agt_1",
+    session: None,
+    allowed_collections: Some(["collection:#{default_collection_id}"]),
+    allowed_actions: ["read"]
+  )
+
+  verify = Ledger.read_locked(
+    files.read_only,
+    ledger_db_path,
+    schema,
+    map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      has_n = try neural_vec_populated(store, 4)
+      return Error(BadInput(reason: "expected neural docs")) if not has_n
+
+      # Zero lexical overlap query ("zero_overlap_concept"): BM25 finds nothing, Semantic + Hybrid find both permitted & secret for Owner
+      owner_sem = try search_pages_hybrid(
+        store,
+        owner_auth,
+        "zero_overlap_concept",
+        Some([1.0, 0.0, 0.0, 0.0]),
+        neural_vec_index(4),
+        "semantic",
+        10,
+        true,
+        None,
+        Some(0.25.to_float)
+      )
+      return Error(BadInput(reason: "owner should see 2 semantic hits")) if owner_sem.size != 2
+
+      # Scoped agent MUST NOT see pg_sec_vault even though its cosine similarity is 1.0
+      ag_sem = try search_pages_hybrid(
+        store,
+        scoped_auth,
+        "zero_overlap_concept",
+        Some([1.0, 0.0, 0.0, 0.0]),
+        neural_vec_index(4),
+        "semantic",
+        10,
+        true,
+        None,
+        Some(0.25.to_float)
+      )
+      return Error(BadInput(reason: "agent leaked secret semantic hit")) if ag_sem.map(fn(h)
+        h.page_id
+      end) != [pg_pub.id]
+
+      ag_hyb = try search_pages_hybrid(
+        store,
+        scoped_auth,
+        "zero_overlap_concept",
+        Some([1.0, 0.0, 0.0, 0.0]),
+        neural_vec_index(4),
+        "hybrid",
+        10,
+        true,
+        None,
+        Some(0.25.to_float)
+      )
+      return Error(BadInput(reason: "agent hybrid mismatch")) if ag_hyb.map(fn(h) h.page_id end) != [
+        pg_pub.id
+      ]
+
+      ag_bm25 = try search_pages_hybrid(
+        store,
+        scoped_auth,
+        "zero_overlap_concept",
+        Some([1.0, 0.0, 0.0, 0.0]),
+        neural_vec_index(4),
+        "bm25",
+        10,
+        true,
+        None,
+        None
+      )
+      return Error(BadInput(reason: "expected 0 bm25 hits")) if not ag_bm25.empty?
+
+      # Hybrid RRF merges BM25 + Vector: query matches pg_other by keyword AND pg_pub by vector
+      rrf_hits = try search_pages_hybrid(
+        store,
+        scoped_auth,
+        "Catering",
+        Some([1.0, 0.0, 0.0, 0.0]),
+        neural_vec_index(4),
+        "hybrid",
+        10,
+        true,
+        None,
+        Some(0.25.to_float)
+      )
+      return Error(BadInput(reason: "expected both BM25 & Vec hits in RRF")) if rrf_hits.size != 2
+
+      # Sketch fallback index works with zero external embedding call
+      sk_hits = try search_pages_hybrid(
+        store,
+        scoped_auth,
+        "Gateway Rollout",
+        Some(Vec.text_sketch_embedding("Gateway Rollout", sketch_vec_dims)),
+        sketch_vec_index(),
+        "hybrid",
+        10,
+        true,
+        None,
+        Some(sketch_min_vec_score)
+      )
+      first_sk = try sk_hits.first.or_fail(BadInput(reason: "missing sketch hit"))
+      if first_sk.page_id != pg_pub.id or first_sk.fts_rank != Some(1) or first_sk.vec_rank != Some(1)
+        return Error(BadInput(reason: "expected dual fts_rank+vec_rank on Gateway Rollout"))
+      end
+      Ok(Unit)
+    end
+  )
+  assert verify is Ok(Unit)
+
+  # Archiving pg_pub removes both sketch and neural vectors; switching pg_other to 8-d cleans up old 4-d slot
+  archived_pub = Page(
+    id: pg_pub.id,
+    collection_id: pg_pub.collection_id,
+    parent_page_id: None,
+    title: pg_pub.title,
+    icon: None,
+    cover_attachment_id: None,
+    kind: Document,
+    sort_order: "a",
+    database_id: None,
+    freshness_ttl_days: None,
+    verified_at: None,
+    verified_by: None,
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: Some(t0),
+    version: 2
+  )
+  cleanup_res = Ledger.transact_locked(
+    files,
+    ledger_db_path,
+    schema,
+    meta,
+    "archive page and switch neural dim",
+    Json.Null,
+    map_ledger_error,
+    fn(tx)
+      t1 = try tx_save_page_and_blocks(tx, archived_pub, [])
+      t2 = try tx_put_page_neural_vector(
+        t1,
+        pg_other.id,
+        pg_other.collection_id,
+        8,
+        [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      )
+      Ok((t2, Unit))
+    end
+  )
+  assert cleanup_res is Ok(Unit)
+
+  verify_after = Ledger.read_locked(
+    files.read_only,
+    ledger_db_path,
+    schema,
+    map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      pub_doc = try Vec.get_doc(store, neural_vec_index(4), pg_pub.id).map_error(map_vec_error)
+      return Error(BadInput(reason: "expected archived pub neural vec gone")) if pub_doc != None
+      old_other = try Vec.get_doc(store, neural_vec_index(4), pg_other.id).map_error(map_vec_error)
+      return Error(BadInput(reason: "expected old 4d vector removed on 8d reindex")) if old_other !=
+        None
+      new_other = try Vec.get_doc(store, neural_vec_index(8), pg_other.id).map_error(map_vec_error)
+      return Error(BadInput(reason: "expected 8d vector present")) if new_other == None
+      rep = try Ledger.verify_all(db).map_error(map_ledger_error)
+      return Error(BadInput(reason: "expected 5 invariants")) if rep.invariants_checked != 5
+      Ok(Unit)
+    end
+  )
+  assert verify_after is Ok(Unit)
 end

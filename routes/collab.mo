@@ -761,6 +761,12 @@ fn accept_proposal(
     decided_by: Some(auth.principal.id),
     decided_at: Some(now)
   )
+  idx_job = Jobs.prepare(
+    rng,
+    clock,
+    "vellum.page.indexed",
+    Json.Object({"page_id": Json.String(pm.target_page_id)})
+  )
   hook_jobs = prepare_webhook_jobs(
     matching_subs,
     "proposal.accepted",
@@ -794,6 +800,8 @@ fn accept_proposal(
       var cur = try Table.put(t1, Db.proposals_table(), accepted.id, accepted).map_error(
         Db.map_table_error
       )
+      (cur_idx, _idx_jid) = try Jobs.tx_put(cur, idx_job).map_error(Db.map_table_error)
+      cur = cur_idx
       for job_rec in hook_jobs
         (next_tx, _jid) = try Jobs.tx_put(cur, job_rec).map_error(Db.map_table_error)
         cur = next_tx
