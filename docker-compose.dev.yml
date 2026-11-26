@@ -7,28 +7,15 @@ services:
     volumes:
       - ./deploy/dex-config.yaml:/etc/dex/config.yaml:ro
 
-  minio:
-    image: minio/minio:latest
-    command: ["server", "/data", "--console-address", ":9001"]
-    environment:
-      MINIO_ROOT_USER: vellum
-      MINIO_ROOT_PASSWORD: vellum-dev-secret-key
+  s3:
+    image: ghcr.io/versity/versitygw:latest
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - mkdir -p /data/buckets/vellum-uploads && exec versitygw --port :9000 --health /health --access vellum --secret vellum-dev-secret-key --region us-east-1 posix --nometa /data/buckets
     ports:
       - "9000:9000"
-      - "9001:9001"
     volumes:
-      - minio_data:/data
-
-  minio-init:
-    image: minio/mc:latest
-    depends_on:
-      - minio
-    entrypoint: >
-      /bin/sh -c "
-      until mc alias set local http://minio:9000 vellum vellum-dev-secret-key; do sleep 1; done;
-      mc mb --ignore-existing local/vellum-uploads;
-      mc anonymous set none local/vellum-uploads;
-      "
+      - s3_data:/data
 
 volumes:
-  minio_data:
+  s3_data:
