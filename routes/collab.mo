@@ -35,6 +35,7 @@ use Arvo.Modb.Jobs
 use Arvo.Sse
 use Arvo.Webhooks
 use Db
+use Domain.Blocks
 use Domain.Collab{ProposalMeta, WebhookJobPayload, WebhookSub, WorldPatchArgs}
 use Domain.Policy
 use Domain.Types{
@@ -42,6 +43,7 @@ use Domain.Types{
   AppError,
   AuthContext,
   AuthorKind,
+  Block,
   BlockOp,
   CollectionWritePolicy,
   Principal,
@@ -641,35 +643,166 @@ fn stage_proposal_ops(
   Ok(json_ok(200, Json.Object({"proposal": pm.to_json, "step_reply": step_reply})))
 end
 
-## `GET /api/proposals/:id/diff` — Inspects structural CoW diffs inside a proposal's `Modb.World` (`ReadFiles`-only).
+fn block_diff_json(
+  block_id: Text,
+  change: Text,
+  rank: Text,
+  before_blk: Option(Block),
+  after_blk: Option(Block)
+) : Json
+  before_kind_json = case before_blk
+    Some(b): b.kind.to_json
+    None: Json.Null
+  end
+  after_kind_json = case after_blk
+    Some(b): b.kind.to_json
+    None: Json.Null
+  end
+  before_md_json = case before_blk
+    Some(b): Json.String(b.markdown)
+    None: Json.Null
+  end
+  after_md_json = case after_blk
+    Some(b): Json.String(b.markdown)
+    None: Json.Null
+  end
+  Json.Object({
+    "block_id": Json.String(block_id),
+    "change": Json.String(change),
+    "rank": Json.String(rank),
+    "before_kind": before_kind_json,
+    "after_kind": after_kind_json,
+    "before_markdown": before_md_json,
+    "after_markdown": after_md_json
+  })
+end
+
+fn compute_block_diffs(before_blocks: List(Block), after_blocks: List(Block)) : List(Json)
+  var before_map = {}
+  for b in before_blocks
+    before_map = before_map.set(b.id, b)
+  end
+  var after_map = {}
+  for b in after_blocks
+    after_map = after_map.set(b.id, b)
+  end
+  var entries = []
+  for old_b in before_blocks
+    case after_map.get(old_b.id)
+      None:
+        entries = entries.append(
+          (old_b.rank, old_b.id, block_diff_json(old_b.id, "removed", old_b.rank, Some(old_b), None))
+        )
+      Some(cur_b):
+        if old_b.markdown != cur_b.markdown or old_b.kind != cur_b.kind
+          entries = entries.append(
+            (
+              cur_b.rank,
+              cur_b.id,
+              block_diff_json(cur_b.id, "modified", cur_b.rank, Some(old_b), Some(cur_b))
+            )
+          )
+        end
+    end
+  end
+  for cur_b in after_blocks
+    if before_map.get(cur_b.id) == None
+      entries = entries.append(
+        (cur_b.rank, cur_b.id, block_diff_json(cur_b.id, "added", cur_b.rank, None, Some(cur_b)))
+      )
+    end
+  end
+  entries.sort_by(fn(e) e.1 end).sort_by(fn(e) e.0 end).map(fn(e) e.2 end)
+end
+
+## `GET /api/proposals/:id/diff` — Inspects structural CoW diffs and human-readable block diffs inside a proposal's `Modb.World` (`ReadFiles`-only).
 fn diff_proposal(id: Text, auth: AuthContext, rf: ReadFiles) : Result(Api.Response, AppError)
   if not rf.exists?(Db.ledger_db_path)
     return Error(Missing(entity: "proposal", id: id))
   end
-  pm = try Ledger.read_locked(
+  (pm, page_title_opt, diffs, block_diffs) = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
     fn(db)
-      found = case try Table.get(Ledger.store(db), Db.proposals_table(), id).map_error(
-        Db.map_table_error
-      )
+      store = Ledger.store(db)
+      found = case try Table.get(store, Db.proposals_table(), id).map_error(Db.map_table_error)
         Some(p): p
         None: return Error(Missing(entity: "proposal", id: id))
       end
       try Policy.require_collection_access(auth, "read", found.collection_id)
-      Ok(found)
+
+      page_opt = try Table.get(store, Db.pages_table(), found.target_page_id).map_error(
+        Db.map_table_error
+      )
+      page_title_opt = page_opt.map(fn(p) p.title end)
+
+      diffs = try World.world_diff(db, Db.world_catalog(), found.world_id).map_error(
+        Db.map_world_error
+      )
+
+      block_diffs = case try World.get_world(store, found.world_id).map_error(Db.map_world_error)
+        None: []
+        Some(world):
+          before_blocks = case Modb.get_pin(store, world.base_pin_id)
+            Ok(Some(pin)):
+              base_tx = Modb.begin_write_from_root(store, pin.catalog_root)
+              base_rows = try Table.tx_lookup(
+                base_tx,
+                Db.blocks_table(),
+                Db.blocks_by_page(),
+                found.target_page_id
+              ).map_error(Db.map_table_error)
+              Blocks.sort_blocks(base_rows.map(fn(x) x.1 end))
+            Ok(None) | Error(_): try Db.load_page_blocks(store, found.target_page_id)
+          end
+          var after_blocks = before_blocks
+          for step in world.steps
+            case step
+              World.ReadStep(query: _, args: _, answer_hash: _, answer: _): Unit
+              World.CallStep(action: act_name, args: args_json, reason: _):
+                if act_name == "propose"
+                  case Json.decode_strict[WorldPatchArgs](args_json.to_text.bytes)
+                    Ok(parsed):
+                      if parsed.page_id == found.target_page_id
+                        case Blocks.apply_block_ops(
+                          after_blocks,
+                          parsed.ops,
+                          parsed.page_id,
+                          parsed.provenance,
+                          parsed.new_ids
+                        )
+                          Ok(next_blocks): after_blocks = next_blocks
+                          Error(_): Unit
+                        end
+                      end
+                    Error(_): Unit
+                  end
+                end
+            end
+          end
+          compute_block_diffs(before_blocks, after_blocks)
+      end
+
+      Ok((found, page_title_opt, diffs, block_diffs))
     end
   )
-  diffs = try World.world_diff_locked(
-    rf,
-    Db.ledger_db_path,
-    Db.vellum_schema(),
-    Db.world_catalog(),
-    pm.world_id
-  ).map_error(Db.map_world_error)
-  Ok(json_ok(200, Json.Object({"proposal": pm.to_json, "bucket_diffs": diffs.to_json})))
+  page_title_json = case page_title_opt
+    Some(t): Json.String(t)
+    None: Json.Null
+  end
+  Ok(
+    json_ok(
+      200,
+      Json.Object({
+        "proposal": pm.to_json,
+        "page_title": page_title_json,
+        "bucket_diffs": diffs.to_json,
+        "block_diffs": Json.Array(block_diffs)
+      })
+    )
+  )
 end
 
 ## `POST /api/proposals/:id/accept` — Validates & atomically lands a `Modb.World` proposal onto the live workspace.

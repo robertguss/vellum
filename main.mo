@@ -1988,6 +1988,25 @@ test "end-to-end Vellum Stage 3: /mcp, Claims leases, Modb.World proposals, Modb
   )
   assert mcp_diff_a.status == 200 and mcp_diff_a.text.contains?("vlm_blocks")
 
+  http_diff_a = ApiTest.send(
+    Main,
+    WebTest.prepare(owner, Api.get("/api/proposals/#{prop_a_id}/diff")),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert http_diff_a.status == 200
+  http_diff_json = must_json(http_diff_a.text)
+  assert (http_diff_json.list_at("bucket_diffs") or []).size >= 1
+  http_block_diffs = http_diff_json.list_at("block_diffs") or []
+  assert http_block_diffs.size == 1
+  first_bdiff = http_block_diffs.first or stop "first_bdiff"
+  assert first_bdiff.text_at("change") == Some("modified")
+  assert first_bdiff.text_at("before_markdown") == Some("Original gateway baseline rule.")
+  assert first_bdiff.text_at("after_markdown") == Some("Agent revised gateway rule.")
+
   # Live Page A is STILL untouched before acceptance!
   live_a_before = ApiTest.send(
     Main,
