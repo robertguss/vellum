@@ -37,8 +37,33 @@ tx_delete_page_and_blocks,
 load_page_blocks,
 search_pages,
 tx_upsert_human_principal,
-tx_mint_agent
+tx_mint_agent,
+databases_table,
+databases_by_collection,
+db_views_table,
+db_views_by_database,
+db_rows_table,
+db_rows_by_database,
+db_cells_bucket,
+encode_db_cell_prefix,
+encode_db_cell_key,
+lookup_row_ids_by_cell,
+tx_put_db_row,
+tx_delete_db_row,
+enrich_rows_with_rollups
 use Domain.Blocks
+use Domain.DatabaseModel{
+  CellValue,
+  DatabaseDef,
+  DbRow,
+  DbViewDef,
+  EnrichedRow,
+  PropertyDef,
+  PropertyKind,
+  RollupAgg,
+  SelectOption,
+  SelectOptionColor
+}
 use Domain.Policy
 use Domain.Types{
   AgentToken,
@@ -51,6 +76,7 @@ use Domain.Types{
   CollectionWritePolicy,
   Comment,
   Page,
+  PageKind,
   Principal,
   PrincipalKind,
   SearchResultItem,
@@ -152,6 +178,32 @@ fn attachments_table() : Table.Table(Text, Attachment)
   Table.text_key[Attachment]("vlm_attachments").with_index(attachments_by_page())
 end
 
+db_cells_bucket = "vlm_db_cells"
+
+fn databases_by_collection() : Table.Index(Text, DatabaseDef, Text)
+  Table.text_index[Text, DatabaseDef]("vlm_databases_by_collection", fn(d) d.collection_id end)
+end
+
+fn databases_table() : Table.Table(Text, DatabaseDef)
+  Table.text_key[DatabaseDef]("vlm_databases").with_index(databases_by_collection())
+end
+
+fn db_views_by_database() : Table.Index(Text, DbViewDef, Text)
+  Table.text_index[Text, DbViewDef]("vlm_db_views_by_database", fn(v) v.database_id end)
+end
+
+fn db_views_table() : Table.Table(Text, DbViewDef)
+  Table.text_key[DbViewDef]("vlm_db_views").with_index(db_views_by_database())
+end
+
+fn db_rows_by_database() : Table.Index(Text, DbRow, Text)
+  Table.text_index[Text, DbRow]("vlm_db_rows_by_database", fn(r) r.database_id end)
+end
+
+fn db_rows_table() : Table.Table(Text, DbRow)
+  Table.text_key[DbRow]("vlm_db_rows").with_index(db_rows_by_database())
+end
+
 ## Converts `Modb.Table` errors to `AppError`.
 fn map_table_error(err: Table.TableError) : AppError
   case err
@@ -230,12 +282,66 @@ fn init_v1_migration(tx: WriteTx) : Result(WriteTx, Table.TableError)
   Table.put(tx1, collections_table(), col.id, col)
 end
 
+fn check_single_db_row(
+  tx: WriteTx,
+  dbs_tbl: Table.Table(Text, DatabaseDef),
+  rows_tbl: Table.Table(Text, DbRow),
+  pages_tbl: Table.Table(Text, Page),
+  row: DbRow
+) : Result(Option(Text), Table.TableError)
+  return Ok(None) if row.archived_at != None
+  def = case try Table.tx_get(tx, dbs_tbl, row.database_id)
+    Some(d): d
+    None: return Ok(Some("db row '#{row.id}' references missing database '#{row.database_id}'"))
+  end
+  case DatabaseModel.validate_row_cells(def, row)
+    Some(msg): return Ok(Some("db row '#{row.id}' invalid: #{msg}"))
+    None: Unit
+  end
+  pg = case try Table.tx_get(tx, pages_tbl, row.page_id)
+    Some(p) if p.archived_at == None: p
+    Some(_) | None: return Ok(
+      Some("db row '#{row.id}' references missing or archived page '#{row.page_id}'")
+    )
+  end
+  expected_kind = DatabaseRow(database_id: row.database_id, row_id: row.id)
+  if pg.kind != expected_kind or pg.collection_id != def.collection_id
+    return Ok(Some("db row '#{row.id}' backing page '#{pg.id}' has mismatched kind/collection"))
+  end
+
+  for prop in def.properties
+    case prop.kind
+      Relation(target_db_id: tgt_db, inverse_prop_id: _):
+        case row.cells.get(prop.id)
+          Some(RelationVal(row_ids: rids)):
+            for rid in rids
+              case try Table.tx_get(tx, rows_tbl, rid)
+                Some(tr) if tr.database_id == tgt_db and tr.archived_at == None: Unit
+                Some(_) | None: return Ok(
+                  Some(
+                    "db row '#{row.id}' relation '#{prop.id}' points to missing target '#{rid}' in '#{tgt_db}'"
+                  )
+                )
+              end
+            end
+          Some(_) | None: Unit
+        end
+      Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
+        options: _
+      ) | Checkbox | Person | Url | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): Unit
+    end
+  end
+  Ok(None)
+end
+
 ## Declarative `Modb.Ledger` schema enforcing mandatory write reasons, v1 bootstrap,
-## and incremental `$O(\text{touched})$` invariants across collections, pages, and blocks.
+## and incremental `$O(\text{touched})$` invariants across collections, pages, blocks, and databases.
 fn vellum_schema() : Ledger.Schema
   cols = collections_table()
   pages = pages_table()
   blocks = blocks_table()
+  dbs = databases_table()
+  db_rows = db_rows_table()
   Ledger.schema(1).with_require_reason(true).with_migration(
     Ledger.migration(1, "initialize default workspace and general collection", init_v1_migration)
   ).with_invariant(
@@ -281,6 +387,41 @@ fn vellum_schema() : Ledger.Schema
           Some("block '#{id}' has invalid heading level or version < 1")
         else
           None
+        end
+      end
+    )
+  ).with_invariant(
+    Ledger.row_invariant(
+      "database_valid",
+      dbs,
+      fn(_id, d) DatabaseModel.validate_database_def(d) end
+    )
+  ).with_invariant(
+    Ledger.invariant(
+      "db_row_integrity",
+      fn(tx)
+        if Modb.tx_is_tracked?(tx) and not Modb.tx_bucket_deleted?(tx, db_rows.bucket)
+          for kb in Modb.tx_touched_puts(tx, db_rows.bucket)
+            case try Modb.tx_get(tx, db_rows.bucket, kb).map_error(fn(e) Table.Storage(e) end)
+              Some(raw):
+                row = try db_rows.decode_value(raw).map_error(fn(e) Table.DecodeValue(e) end)
+                case try check_single_db_row(tx, dbs, db_rows, pages, row)
+                  Some(detail): return Ok(Some(detail))
+                  None: Unit
+                end
+              None: Unit
+            end
+          end
+          Ok(None)
+        else
+          all_rows = try Table.tx_scan(tx, db_rows, None, None, 0)
+          for (_rid, row) in all_rows
+            case try check_single_db_row(tx, dbs, db_rows, pages, row)
+              Some(detail): return Ok(Some(detail))
+              None: Unit
+            end
+          end
+          Ok(None)
         end
       end
     )
@@ -608,6 +749,174 @@ fn tx_mint_agent(
   Ok((t3, principal, grant, tok))
 end
 
+## Null-escaped composite prefix `(db_id, prop_id, encoded_val)` for `vlm_db_cells`.
+fn encode_db_cell_prefix(db_id: Text, prop_id: Text, encoded_val: Text) : Bytes
+  tcodec = Table.text_codec()
+  p1 = Table.encode_composite_key(tcodec.encode(db_id), tcodec.encode(prop_id))
+  Table.encode_composite_key(p1, tcodec.encode(encoded_val))
+end
+
+## Full composite cell index key `(db_id, prop_id, encoded_val, row_id)` stored in `vlm_db_cells`.
+fn encode_db_cell_key(db_id: Text, prop_id: Text, encoded_val: Text, row_id: Text) : Bytes
+  tcodec = Table.text_codec()
+  prefix = encode_db_cell_prefix(db_id, prop_id, encoded_val)
+  Table.encode_composite_key(prefix, tcodec.encode(row_id))
+end
+
+## Queries `vlm_db_cells` by exact `(db_id, prop_id, encoded_val)` and returns matching `row_id`s.
+fn lookup_row_ids_by_cell(store: Store, db_id: Text, prop_id: Text, encoded_val: Text) : Result(
+  List(Text),
+  AppError
+)
+  tcodec = Table.text_codec()
+  prefix = encode_db_cell_prefix(db_id, prop_id, encoded_val)
+  lo = Table.encode_composite_key(prefix, Bytes.empty)
+  ff = 255.to_byte or stop "ff byte"
+  hi = Table.encode_composite_key(prefix, Bytes.from_list([ff]))
+  rows = try Modb.scan(store, db_cells_bucket, Some(lo), Some(hi), 0).map_error(fn(e)
+    ServerFailed(reason: e.to_text)
+  end)
+  var out = []
+  for (raw_k, _v) in rows
+    (ik, pk_bytes) = try Table.decode_composite_key(raw_k).map_error(map_table_error)
+    if ik == prefix
+      rid = try tcodec.decode(pk_bytes).map_error(map_table_error)
+      out = out.append(rid)
+    end
+  end
+  Ok(out)
+end
+
+fn tx_update_db_cell_index(tx: WriteTx, db_id: Text, old_row: Option(DbRow), new_row: Option(DbRow)) : Result(
+  WriteTx,
+  AppError
+)
+  var cur = tx
+  case old_row
+    Some(r):
+      for (pid, cval) in r.cells.entries
+        for (p_id, val_tok) in DatabaseModel.cell_index_tokens(pid, cval)
+          k = encode_db_cell_key(db_id, p_id, val_tok, r.id)
+          cur = try Modb.tx_delete(cur, db_cells_bucket, k).map_error(fn(e)
+            ServerFailed(reason: e.to_text)
+          end)
+        end
+      end
+    None: Unit
+  end
+  case new_row
+    Some(r) if r.archived_at == None:
+      for (pid, cval) in r.cells.entries
+        for (p_id, val_tok) in DatabaseModel.cell_index_tokens(pid, cval)
+          k = encode_db_cell_key(db_id, p_id, val_tok, r.id)
+          cur = try Modb.tx_put(cur, db_cells_bucket, k, Bytes.empty).map_error(fn(e)
+            ServerFailed(reason: e.to_text)
+          end)
+        end
+      end
+    Some(_) | None: Unit
+  end
+  Ok(cur)
+end
+
+## Atomically persists a `DbRow`, its `vlm_db_cells` composite indexes, its backing `Page` + `Block`s,
+## and combined title + properties + body text in `Modb.Fts`.
+fn tx_put_db_row(tx: WriteTx, def: DatabaseDef, row: DbRow, page: Page, blocks: List(Block)) : Result(
+  WriteTx,
+  AppError
+)
+  old_row = try Table.tx_get(tx, db_rows_table(), row.id).map_error(map_table_error)
+  t1 = try tx_update_db_cell_index(tx, def.id, old_row, Some(row))
+  t2 = try Table.put(t1, db_rows_table(), row.id, row).map_error(map_table_error)
+  t3 = try tx_save_page_and_blocks(t2, page, blocks)
+  if row.archived_at == None and page.archived_at == None
+    row_text = DatabaseModel.row_plain_text(def, row)
+    body_text = Blocks.blocks_plain_text(blocks)
+    combined = if row_text.empty?
+      body_text
+    else if body_text.empty?
+      row_text
+    else
+      "#{row_text}\n#{body_text}"
+    end
+    doc = Fts.DocumentInput(
+      doc_id: page.id,
+      scope: page.collection_id,
+      fields: [
+        Fts.FieldInput(name: "title", text: page.title, weight: 3),
+        Fts.FieldInput(name: "body", text: combined, weight: 1)
+      ]
+    )
+    Fts.tx_index_document(t3, fts_index(), doc).map_error(map_fts_error)
+  else
+    Ok(t3)
+  end
+end
+
+## Atomically deletes a `DbRow`, its `vlm_db_cells` entries, backing `Page` + `Block`s, and FTS entry.
+fn tx_delete_db_row(tx: WriteTx, def: DatabaseDef, row_id: Text) : Result(WriteTx, AppError)
+  old_row = case try Table.tx_get(tx, db_rows_table(), row_id).map_error(map_table_error)
+    Some(r): r
+    None: return Error(Missing(entity: "db_row", id: row_id))
+  end
+  t1 = try tx_update_db_cell_index(tx, def.id, Some(old_row), None)
+  t2 = try Table.delete(t1, db_rows_table(), row_id).map_error(map_table_error)
+  tx_delete_page_and_blocks(t2, old_row.page_id)
+end
+
+## Resolves all `Rollup` columns for `rows` of `def` by fetching referenced target rows from `Store`.
+fn enrich_rows_with_rollups(store: Store, def: DatabaseDef, rows: List(DbRow)) : Result(
+  List(EnrichedRow),
+  AppError
+)
+  var rollup_props = []
+  for p in def.properties
+    case p.kind
+      Rollup(relation_prop_id: rel_id, target_prop_id: tgt_id, agg: agg): rollup_props = rollup_props
+        .append((p.id, rel_id, tgt_id, agg))
+      Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
+        options: _
+      ) | Checkbox | Person | Url | Relation(target_db_id: _, inverse_prop_id: _): Unit
+    end
+  end
+
+  if rollup_props.empty?
+    return Ok(rows.map(fn(r) EnrichedRow(row: r, rollups: {}) end))
+  end
+
+  rtbl = db_rows_table()
+  var rel_cache = {}
+  var enriched = []
+  for r in rows
+    var roll_map = {}
+    for (roll_pid, rel_pid, tgt_pid, agg) in rollup_props
+      rel_ids = case r.cells.get(rel_pid)
+        Some(RelationVal(row_ids: rids)): rids
+        Some(_) | None: []
+      end
+      var tgt_cells = []
+      for rid in rel_ids
+        cached_opt = case rel_cache.get(rid)
+          Some(v): v
+          None:
+            fetched = try Table.get(store, rtbl, rid).map_error(map_table_error)
+            rel_cache = rel_cache.set(rid, fetched)
+            fetched
+        end
+        case cached_opt
+          Some(tr) if tr.archived_at == None: tgt_cells = tgt_cells.append(
+            tr.cells.get(tgt_pid) or Empty
+          )
+          Some(_) | None: Unit
+        end
+      end
+      roll_map = roll_map.set(roll_pid, DatabaseModel.compute_rollup(agg, tgt_cells))
+    end
+    enriched = enriched.append(EnrichedRow(row: r, rollups: roll_map))
+  end
+  Ok(enriched)
+end
+
 test "Db schema, JIT OIDC human provisioning, page/block FTS indexing, and agent minting"
   files = Files.in_memory({})
   rng = SecureRandom.seeded(100)
@@ -678,4 +987,289 @@ test "Db schema, JIT OIDC human provisioning, page/block FTS indexing, and agent
     end
   )
   assert res is Ok(Unit)
+end
+
+test "Db relational database composite cell indexes, rollup enrichment, and Ledger invariants"
+  files = Files.in_memory({})
+  t0 = Time.parse("2026-11-26T12:00:00Z") or stop "t0"
+  schema = vellum_schema()
+  meta = Ledger.WriteMeta(
+    principal: "@ada",
+    action: "db.test",
+    reason: "verify database invariants and composite indexes",
+    at: t0
+  )
+
+  tasks_def = DatabaseDef(
+    id: "db_tasks",
+    collection_id: default_collection_id,
+    page_id: "pg_db_tasks",
+    title: "Tasks",
+    description: "",
+    properties: [
+      PropertyDef(id: "title", name: "Title", kind: Title, required: true, sort_order: "a"),
+      PropertyDef(
+        id: "points",
+        name: "Points",
+        kind: Number(format: "plain"),
+        required: false,
+        sort_order: "b"
+      )
+    ],
+    version: 1
+  )
+  proj_def = DatabaseDef(
+    id: "db_proj",
+    collection_id: default_collection_id,
+    page_id: "pg_db_proj",
+    title: "Projects",
+    description: "",
+    properties: [
+      PropertyDef(id: "title", name: "Title", kind: Title, required: true, sort_order: "a"),
+      PropertyDef(
+        id: "status",
+        name: "Status",
+        kind: Select(
+          options: [
+            SelectOption(id: "active", label: "Active", color: Green),
+            SelectOption(id: "paused", label: "Paused", color: Gray)
+          ]
+        ),
+        required: true,
+        sort_order: "b"
+      ),
+      PropertyDef(
+        id: "tasks",
+        name: "Tasks",
+        kind: Relation(target_db_id: "db_tasks", inverse_prop_id: None),
+        required: false,
+        sort_order: "c"
+      ),
+      PropertyDef(
+        id: "total_pts",
+        name: "Total Pts",
+        kind: Rollup(relation_prop_id: "tasks", target_prop_id: "points", agg: SumValues),
+        required: false,
+        sort_order: "d"
+      )
+    ],
+    version: 1
+  )
+
+  p_host_t = Page(
+    id: "pg_db_tasks",
+    collection_id: default_collection_id,
+    parent_page_id: None,
+    title: "Tasks",
+    icon: None,
+    cover_attachment_id: None,
+    kind: Document,
+    sort_order: "a",
+    database_id: Some("db_tasks"),
+    freshness_ttl_days: None,
+    verified_at: None,
+    verified_by: None,
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+  p_host_p = Page(
+    id: "pg_db_proj",
+    collection_id: default_collection_id,
+    parent_page_id: None,
+    title: "Projects",
+    icon: None,
+    cover_attachment_id: None,
+    kind: Document,
+    sort_order: "b",
+    database_id: Some("db_proj"),
+    freshness_ttl_days: None,
+    verified_at: None,
+    verified_by: None,
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+
+  d1 = "0.1".to_decimal or stop "d1"
+  d2 = "0.2".to_decimal or stop "d2"
+  d3 = "0.3".to_decimal or stop "d3"
+
+  task1_pg = Page(
+    id: "pg_t1",
+    collection_id: default_collection_id,
+    parent_page_id: Some("pg_db_tasks"),
+    title: "Task One",
+    icon: None,
+    cover_attachment_id: None,
+    kind: DatabaseRow(database_id: "db_tasks", row_id: "row_t1"),
+    sort_order: "row_t1",
+    database_id: Some("db_tasks"),
+    freshness_ttl_days: None,
+    verified_at: None,
+    verified_by: None,
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+  task2_pg = Page(
+    id: "pg_t2",
+    collection_id: default_collection_id,
+    parent_page_id: Some("pg_db_tasks"),
+    title: "Task Two",
+    icon: None,
+    cover_attachment_id: None,
+    kind: DatabaseRow(database_id: "db_tasks", row_id: "row_t2"),
+    sort_order: "row_t2",
+    database_id: Some("db_tasks"),
+    freshness_ttl_days: None,
+    verified_at: None,
+    verified_by: None,
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+  proj1_pg = Page(
+    id: "pg_p1",
+    collection_id: default_collection_id,
+    parent_page_id: Some("pg_db_proj"),
+    title: "Launch Vellum",
+    icon: None,
+    cover_attachment_id: None,
+    kind: DatabaseRow(database_id: "db_proj", row_id: "row_p1"),
+    sort_order: "row_p1",
+    database_id: Some("db_proj"),
+    freshness_ttl_days: None,
+    verified_at: None,
+    verified_by: None,
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+
+  task1 = DbRow(
+    id: "row_t1",
+    database_id: "db_tasks",
+    page_id: "pg_t1",
+    cells: {"title": TextVal("Task One"), "points": NumberVal(d1)},
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+  task2 = DbRow(
+    id: "row_t2",
+    database_id: "db_tasks",
+    page_id: "pg_t2",
+    cells: {"title": TextVal("Task Two"), "points": NumberVal(d2)},
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+  proj1 = DbRow(
+    id: "row_p1",
+    database_id: "db_proj",
+    page_id: "pg_p1",
+    cells: {
+      "title": TextVal("Launch Vellum"),
+      "status": SelectVal(option_id: "active"),
+      "tasks": RelationVal(row_ids: ["row_t1", "row_t2"])
+    },
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+
+  seed_res = Ledger.transact_locked(
+    files,
+    ledger_db_path,
+    schema,
+    meta,
+    "seed related databases and rows",
+    Json.Object({"seed": Json.Boolean(true)}),
+    map_ledger_error,
+    fn(tx)
+      t1 = try Table.put(tx, pages_table(), p_host_t.id, p_host_t).map_error(map_table_error)
+      t2 = try Table.put(t1, pages_table(), p_host_p.id, p_host_p).map_error(map_table_error)
+      t3 = try Table.put(t2, databases_table(), tasks_def.id, tasks_def).map_error(map_table_error)
+      t4 = try Table.put(t3, databases_table(), proj_def.id, proj_def).map_error(map_table_error)
+      t5 = try tx_put_db_row(t4, tasks_def, task1, task1_pg, [])
+      t6 = try tx_put_db_row(t5, tasks_def, task2, task2_pg, [])
+      t7 = try tx_put_db_row(t6, proj_def, proj1, proj1_pg, [])
+      Ok((t7, Unit))
+    end
+  )
+  assert seed_res is Ok(Unit)
+
+  ## Composite vlm_db_cells lookup + exact Decimal rollup + Ledger verify_all (5 invariants)
+  check_res = Ledger.read_locked(
+    files.read_only,
+    ledger_db_path,
+    schema,
+    map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      by_status = try lookup_row_ids_by_cell(store, "db_proj", "status", "active")
+      return Error(BadInput(reason: "expected row_p1")) if by_status != ["row_p1"]
+      by_rel = try lookup_row_ids_by_cell(store, "db_proj", "tasks", "row_t2")
+      return Error(BadInput(reason: "expected reverse relation")) if by_rel != ["row_p1"]
+
+      enriched = try enrich_rows_with_rollups(store, proj_def, [proj1])
+      first_e = try enriched.first.or_fail(BadInput(reason: "missing enriched"))
+      if first_e.rollups.get("total_pts") != Some(NumberVal(d3))
+        return Error(BadInput(reason: "rollup decimal mismatch"))
+      end
+
+      rep = try Ledger.verify_all(db).map_error(map_ledger_error)
+      return Error(BadInput(reason: "expected 5 invariants")) if rep.invariants_checked != 5
+      Ok(Unit)
+    end
+  )
+  assert check_res is Ok(Unit)
+
+  ## Commit-time invariant rejects dangling relation target
+  bad_rel_proj = DbRow(
+    id: "row_p1",
+    database_id: "db_proj",
+    page_id: "pg_p1",
+    cells: {
+      "title": TextVal("Launch Vellum"),
+      "status": SelectVal(option_id: "active"),
+      "tasks": RelationVal(row_ids: ["row_nonexistent"])
+    },
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 2
+  )
+  bad_rel_res = Ledger.transact_locked(
+    files,
+    ledger_db_path,
+    schema,
+    meta,
+    "attempt dangling relation",
+    Json.Null,
+    map_ledger_error,
+    fn(tx)
+      t1 = try tx_put_db_row(tx, proj_def, bad_rel_proj, proj1_pg, [])
+      Ok((t1, Unit))
+    end
+  )
+  assert bad_rel_res is Error(BadInput(reason: _))
 end
