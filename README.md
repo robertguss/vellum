@@ -54,6 +54,15 @@ Reads `frontend` TypeScript checks (`tsc --noEmit`), Vite production manifest bu
 
 ---
 
+## Documentation & Roadmaps
+
+- [Vellum v2 Vision & AI-Native Platform Roadmap](docs/v2-vision-and-roadmap.md) — **Active north-star roadmap** covering Solo Mode, Git-style multi-page + DB `Modb.World` branches & What-If scenarios, AI-compiled database columns, Compiled Context Packs, autonomous knowledge gardening, `Modb.Taint` prompt-injection defense, and `Modb.Erasure`.
+- [Vellum v1 Architecture & Technical Specification](docs/vellum-spec.md)
+- [Upstream PR Roadmap (`mo`, `modb`, `arvo`)](docs/upstream-roadmap.md)
+- [Performance & Scale Benchmarks](docs/benchmarks.md)
+
+---
+
 ## License
 
 [MIT](LICENSE)
