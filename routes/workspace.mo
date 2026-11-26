@@ -22,6 +22,8 @@ download_attachment,
 mint_agent_token,
 revoke_grant,
 audit_index,
+proposals_page,
+admin_page,
 drain_jobs
 use Api
 use Arvo.Flash
@@ -34,6 +36,7 @@ use Arvo.Webhooks
 use Db
 use Domain.Blocks
 use Domain.Collab{WebhookJobPayload}
+use Domain.DatabaseModel{DatabaseDef}
 use Domain.Policy
 use Domain.Types{
   AppError,
@@ -236,6 +239,17 @@ fn permitted_collections(store: Store, auth: AuthContext) : Result(List(Collecti
   Ok(out)
 end
 
+fn permitted_databases(store: Store, auth: AuthContext) : Result(List(DatabaseDef), AppError)
+  rows = try Table.scan(store, Db.databases_table(), None, None, 200).map_error(Db.map_table_error)
+  var out = []
+  for (_id, d) in rows
+    if Policy.collection_permitted?(auth, d.collection_id)
+      out = out.append(d)
+    end
+  end
+  Ok(out)
+end
+
 fn render_inertia_page(
   req: Api.Request,
   auth: AuthContext,
@@ -267,8 +281,8 @@ fn home(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: Env) : 
     return Error(Forbidden(reason: "grant '#{a.grant_id}' does not permit 'read'"))
   end
 
-  (cols, pages, audit_feed) = if not rf.exists?(Db.ledger_db_path)
-    ([], [], [])
+  (cols, dbs, pages, audit_feed) = if not rf.exists?(Db.ledger_db_path)
+    ([], [], [], [])
   else
     try Ledger.read_locked(
       rf,
@@ -278,6 +292,7 @@ fn home(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: Env) : 
       fn(db)
         store = Ledger.store(db)
         c_list = try permitted_collections(store, a)
+        d_list = try permitted_databases(store, a)
         p_rows = try Table.scan(store, Db.pages_table(), None, None, 100).map_error(
           Db.map_table_error
         )
@@ -289,7 +304,7 @@ fn home(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: Env) : 
         end
         entries = try Ledger.audit_tail_store(store, 20).map_error(Db.map_ledger_error)
         feed = entries.map(audit_entry_to_feed)
-        Ok((c_list, visible_pages, feed))
+        Ok((c_list, d_list, visible_pages, feed))
       end
     )
   end
@@ -300,6 +315,7 @@ fn home(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: Env) : 
         200,
         Json.Object({
           "collections": cols.to_json,
+          "databases": dbs.to_json,
           "pages": pages.to_json,
           "audit_feed": audit_feed.to_json
         })
@@ -313,7 +329,12 @@ fn home(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: Env) : 
     rf,
     env,
     "Workspace/Home",
-    {"collections": cols.to_json, "pages": pages.to_json, "audit_feed": audit_feed.to_json}
+    {
+      "collections": cols.to_json,
+      "databases": dbs.to_json,
+      "pages": pages.to_json,
+      "audit_feed": audit_feed.to_json
+    }
   )
 end
 
@@ -330,7 +351,7 @@ fn show_collection(req: Api.Request, slug: Text, auth: Option(AuthContext), rf: 
     return Error(Missing(entity: "collection", id: slug))
   end
 
-  (cols, col, pages) = try Ledger.read_locked(
+  (cols, dbs, col, pages) = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -356,7 +377,8 @@ fn show_collection(req: Api.Request, slug: Text, auth: Option(AuthContext), rf: 
         end
       end
       c_list = try permitted_collections(store, a)
-      Ok((c_list, col, active_pages))
+      d_list = try permitted_databases(store, a)
+      Ok((c_list, d_list, col, active_pages))
     end
   )
 
@@ -369,7 +391,12 @@ fn show_collection(req: Api.Request, slug: Text, auth: Option(AuthContext), rf: 
     rf,
     env,
     "Workspace/Collection",
-    {"collections": cols.to_json, "collection": col.to_json, "pages": pages.to_json}
+    {
+      "collections": cols.to_json,
+      "databases": dbs.to_json,
+      "collection": col.to_json,
+      "pages": pages.to_json
+    }
   )
 end
 
@@ -451,7 +478,7 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
     return Error(Missing(entity: "page", id: id))
   end
 
-  (cols, col, page, blocks, comments, attachments) = try Ledger.read_locked(
+  page_bundle = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -475,10 +502,12 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
       att_rows = try Table.lookup(store, Db.attachments_table(), Db.attachments_by_page(), page.id)
         .map_error(Db.map_table_error)
       c_list = try permitted_collections(store, a)
-      Ok((c_list, col, page, blks, cmt_rows.map(fn(x) x.1 end), att_rows.map(fn(x) x.1 end)))
+      d_list = try permitted_databases(store, a)
+      Ok((c_list, d_list, col, page, blks, cmt_rows.map(fn(x) x.1 end), att_rows.map(fn(x) x.1 end)))
     end
   )
 
+  (cols, dbs, col, page, blocks, comments, attachments) = page_bundle
   anchored_md = Blocks.to_anchored_markdown(blocks)
   if Auth.wants_json?(req)
     return Ok(
@@ -504,6 +533,7 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
     "Workspace/Page",
     {
       "collections": cols.to_json,
+      "databases": dbs.to_json,
       "collection": col.to_json,
       "page": page.to_json,
       "blocks": blocks.to_json,
@@ -1282,6 +1312,150 @@ fn audit_index(req: Api.Request, auth: AuthContext, rf: ReadFiles) : Result(Api.
     end
   )
   Ok(json_ok(200, Json.Object({"audit_feed": feed.to_json})))
+end
+
+## `GET /proposals` — Renders the Change Proposals Review Inbox (`ReadFiles`-only).
+fn proposals_page(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: Env) : Result(
+  Api.Response,
+  AppError
+)
+  a = case auth
+    Some(x): x
+    None: return guest_redirect_or_401(req)
+  end
+  if not Policy.action_permitted?(a, "read")
+    return Error(Forbidden(reason: "grant '#{a.grant_id}' does not permit 'read'"))
+  end
+
+  (cols, dbs, proposals) = if not rf.exists?(Db.ledger_db_path)
+    ([], [], [])
+  else
+    try Ledger.read_locked(
+      rf,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      Db.map_ledger_error,
+      fn(db)
+        store = Ledger.store(db)
+        c_list = try permitted_collections(store, a)
+        d_list = try permitted_databases(store, a)
+        p_rows = try Table.scan(store, Db.proposals_table(), None, None, 200).map_error(
+          Db.map_table_error
+        )
+        var out = []
+        for (_id, p) in p_rows
+          if Policy.collection_permitted?(a, p.collection_id)
+            out = out.append(p)
+          end
+        end
+        Ok((c_list, d_list, out))
+      end
+    )
+  end
+
+  if Auth.wants_json?(req)
+    return Ok(
+      json_ok(
+        200,
+        Json.Object({
+          "collections": cols.to_json,
+          "databases": dbs.to_json,
+          "proposals": proposals.to_json
+        })
+      )
+    )
+  end
+
+  render_inertia_page(
+    req,
+    a,
+    rf,
+    env,
+    "Workspace/Proposals",
+    {"collections": cols.to_json, "databases": dbs.to_json, "proposals": proposals.to_json}
+  )
+end
+
+## `GET /admin` — Renders the Agents/Grants, Gardening, Importer, Selective Undo & Webhooks Console (`ReadFiles`-only).
+fn admin_page(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: Env) : Result(
+  Api.Response,
+  AppError
+)
+  a = case auth
+    Some(x): x
+    None: return guest_redirect_or_401(req)
+  end
+  if not Policy.action_permitted?(a, "read")
+    return Error(Forbidden(reason: "grant '#{a.grant_id}' does not permit 'read'"))
+  end
+
+  (cols, dbs, feed, hooks) = if not rf.exists?(Db.ledger_db_path)
+    ([], [], [], [])
+  else
+    try Ledger.read_locked(
+      rf,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      Db.map_ledger_error,
+      fn(db)
+        store = Ledger.store(db)
+        c_list = try permitted_collections(store, a)
+        d_list = try permitted_databases(store, a)
+        entries = try Ledger.audit_tail_store(store, 30).map_error(Db.map_ledger_error)
+        audit_items = entries.map(audit_entry_to_feed)
+        can_webhooks = (a.principal.role == Owner or a.principal.role == Admin) and
+          Policy.action_permitted?(a, "manage_grants")
+        hook_items = if can_webhooks
+          w_rows = try Table.scan(store, Db.webhooks_table(), None, None, 100).map_error(
+            Db.map_table_error
+          )
+          w_rows.map(fn(pair)
+            w = pair.1
+            Json.Object({
+              "id": Json.String(w.id),
+              "workspace_id": Json.String(w.workspace_id),
+              "collection_id": w.collection_id.to_json,
+              "url": Json.String(w.url),
+              "events": w.events.to_json,
+              "enabled": Json.Boolean(w.enabled),
+              "created_at": w.created_at.to_json
+            })
+          end)
+        else
+          []
+        end
+        Ok((c_list, d_list, audit_items, hook_items))
+      end
+    )
+  end
+
+  if Auth.wants_json?(req)
+    return Ok(
+      json_ok(
+        200,
+        Json.Object({
+          "collections": cols.to_json,
+          "databases": dbs.to_json,
+          "audit_feed": feed.to_json,
+          "webhooks": Json.Array(hooks)
+        })
+      )
+    )
+  end
+
+  render_inertia_page(
+    req,
+    a,
+    rf,
+    env,
+    "Workspace/Admin",
+    {
+      "collections": cols.to_json,
+      "databases": dbs.to_json,
+      "audit_feed": feed.to_json,
+      "webhooks": Json.Array(hooks)
+    }
+  )
 end
 
 ## Periodic `mo serve` job handler draining indexing + signed webhook jobs and pruning expired MoDB sessions.

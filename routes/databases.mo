@@ -382,7 +382,7 @@ fn show_database(req: Api.Request, id: Text, auth: Option(AuthContext), rf: Read
   end
 
   read_act = db_read_action(a)
-  (def, views, enriched) = try Ledger.read_locked(
+  (cols, dbs, def, views, enriched) = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -394,11 +394,29 @@ fn show_database(req: Api.Request, id: Text, auth: Option(AuthContext), rf: Read
         None: return Error(Missing(entity: "database", id: id))
       end
       try Policy.require_collection_access(a, read_act, def.collection_id)
+      col_rows = try Table.scan(store, Db.collections_table(), None, None, 200).map_error(
+        Db.map_table_error
+      )
+      var cols = []
+      for (_cid, c) in col_rows
+        if c.archived_at == None and Policy.collection_permitted?(a, c.id)
+          cols = cols.append(c)
+        end
+      end
+      db_rows = try Table.scan(store, Db.databases_table(), None, None, 200).map_error(
+        Db.map_table_error
+      )
+      var dbs = []
+      for (_did, d) in db_rows
+        if Policy.collection_permitted?(a, d.collection_id)
+          dbs = dbs.append(d)
+        end
+      end
       v_pairs = try Table.lookup(store, Db.db_views_table(), Db.db_views_by_database(), def.id)
         .map_error(Db.map_table_error)
       active_rows = try load_active_db_rows(store, def.id)
       enr = try Db.enrich_rows_with_rollups(store, def, active_rows)
-      Ok((def, v_pairs.map(fn(x) x.1 end), DatabaseModel.sort_enriched_rows(enr, [])))
+      Ok((cols, dbs, def, v_pairs.map(fn(x) x.1 end), DatabaseModel.sort_enriched_rows(enr, [])))
     end
   )
 
@@ -421,7 +439,13 @@ fn show_database(req: Api.Request, id: Text, auth: Option(AuthContext), rf: Read
     req,
     icfg,
     "Workspace/Database",
-    {"database": def.to_json, "views": views.to_json, "rows": enriched.to_json},
+    {
+      "collections": cols.to_json,
+      "databases": dbs.to_json,
+      "database": def.to_json,
+      "views": views.to_json,
+      "rows": enriched.to_json
+    },
     shared
   )
   Ok(Flash.clear_if_present(res, had_flash?, Auth.secure_cookies?(env)))

@@ -49,6 +49,8 @@ api
   get "/c/:slug" Workspace.show_collection
   get "/p/:id" Workspace.show_page
   get "/d/:id" Databases.show_database
+  get "/proposals" Workspace.proposals_page
+  get "/admin" Workspace.admin_page
   post "/mcp" Mcp.handle_mcp
 
   scope "/api"
@@ -2836,4 +2838,209 @@ test "end-to-end Vellum Stage 4: Notion Markdown+CSV importer, Ask Workspace (JS
     Ok(rep): assert rep.invariants_checked == 5
     Error(_): stop "Ledger.verify_all stage 4 failed"
   end
+end
+
+test "end-to-end Vellum Stage 5: Inertia Workspace shells (/proposals, /admin, /d/:id collections sidebar)"
+  manifest_json = """
+    {
+      "src/main.tsx": {
+        "file": "assets/main-a1b2c3d4.js",
+        "css": ["assets/main-f9e8d7c6.css"],
+        "isEntry": true
+      }
+    }
+    """
+  files = Files.in_memory({
+    "public/manifest.json": manifest_json,
+    "public/assets/main-a1b2c3d4.js": "console.log('vellum');",
+    "public/assets/main-f9e8d7c6.css": "body{margin:0}"
+  })
+  rng = SecureRandom.seeded(20261130)
+  key_hex = "1111111111111111111111111111111122222222222222222222222222222222"
+  key_bytes = Bytes.from_hex(key_hex) or stop "key_hex"
+  t0 = Time.parse("2026-11-26T12:00:00Z") or stop "t0"
+  clock0 = Clock.fixed(t0)
+  env = Env.of({
+    "VELLUM_SECRET_KEY": key_hex,
+    "VELLUM_INSECURE_COOKIES": "1",
+    "VELLUM_OIDC_PROVIDER_ID": "okta-test",
+    "VELLUM_OIDC_CLIENT_ID": "vellum-web",
+    "VELLUM_OIDC_CLIENT_SECRET": "oidc-secret-xyz",
+    "VELLUM_OIDC_REDIRECT_URI": "http://localhost:8080/auth/oidc/callback",
+    "VELLUM_OIDC_ISSUER": "https://auth.example.com",
+    "VELLUM_OIDC_AUTH_URL": "https://auth.example.com/authorize",
+    "VELLUM_OIDC_TOKEN_URL": "https://auth.example.com/token",
+    "VELLUM_OIDC_USERINFO_URL": "https://auth.example.com/userinfo",
+    "VELLUM_OIDC_ALLOWED_DOMAINS": "acme.io"
+  })
+  empty_net = Network.fake(Http.replies([]))
+
+  guest = WebTest.new().with_header("Host", "localhost:8080")
+  g_prop = ApiTest.send(
+    Main,
+    WebTest.prepare(guest, Api.get("/proposals")),
+    files,
+    clock0,
+    env,
+    rng,
+    empty_net
+  )
+  assert g_prop.status == 303 and g_prop.header("Location") == Some("/login")
+  g_admin = ApiTest.send(
+    Main,
+    WebTest.prepare(guest, Api.get("/admin")),
+    files,
+    clock0,
+    env,
+    rng,
+    empty_net
+  )
+  assert g_admin.status == 303 and g_admin.header("Location") == Some("/login")
+
+  oidc_start = ApiTest.send(
+    Main,
+    WebTest.prepare(guest, Api.get("/auth/oidc/login?return_to=/")),
+    files,
+    clock0,
+    env,
+    rng,
+    empty_net
+  )
+  auth_loc = oidc_start.header("Location") or ""
+  q_params = Api.request("GET", auth_loc).query
+  oidc_state = q_params.find(fn(p) p.0 == "state" end).map(fn(p) p.1 end) or stop "state"
+  oidc_nonce = q_params.find(fn(p) p.0 == "nonce" end).map(fn(p) p.1 end) or stop "nonce"
+  verifier = unseal_oidc_code_verifier(oidc_start, "vellum_oidc_state", key_bytes)
+  oidc_cfg = case Auth.oidc_config(env)
+    Ok(c): c
+    Error(_): stop "oidc_config"
+  end
+  id_jwt = Oidc.build_unsigned_test_jwt(
+    Json.Object({
+      "iss": Json.String("https://auth.example.com"),
+      "aud": Json.String("vellum-web"),
+      "sub": Json.String("sub_ada_s5"),
+      "nonce": Json.String(oidc_nonce),
+      "exp": Json.int(1800000000),
+      "email": Json.String("ada@acme.io"),
+      "email_verified": Json.Boolean(true)
+    })
+  )
+  tok_body = Json.Object({
+    "access_token": Json.String("at_s5"),
+    "token_type": Json.String("Bearer"),
+    "id_token": Json.String(id_jwt)
+  }).to_text
+  ui_body = Json.Object({
+    "sub": Json.String("sub_ada_s5"),
+    "email": Json.String("ada@acme.io"),
+    "email_verified": Json.Boolean(true),
+    "name": Json.String("Ada Lovelace")
+  }).to_text
+  oidc_net = Network.fake(
+    Http.replies([
+      (Oidc.token_exchange_request(oidc_cfg, "code_s5", verifier), Http.reply(200, tok_body)),
+      (
+        Oidc.userinfo_request("https://auth.example.com/userinfo", "at_s5"),
+        Http.reply(200, ui_body)
+      )
+    ])
+  )
+  cb_res = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      WebTest.absorb(guest, oidc_start),
+      Api.get("/auth/oidc/callback?code=code_s5&state=#{oidc_state}")
+    ),
+    files,
+    clock0,
+    env,
+    rng,
+    oidc_net
+  )
+  assert cb_res.status == 303
+  owner = WebTest.absorb(guest, cb_res)
+
+  db_res = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/databases").with_json(
+        Databases.CreateDatabaseInput(
+          collection_id: Db.default_collection_id,
+          parent_page_id: None,
+          title: "Roadmap",
+          description: Some("UI database"),
+          properties: [
+            PropertyDef(id: "title", name: "Item", kind: Title, required: true, sort_order: "i")
+          ]
+        )
+      )
+    ),
+    files,
+    clock0,
+    env,
+    rng,
+    empty_net
+  )
+  assert db_res.status == 201
+  db_id = must_json(db_res.text).text_at("database.id") or stop "db_id"
+
+  home_res = ApiTest.send(
+    Main,
+    WebTest.prepare(owner, Api.get("/").with_header("X-Inertia", "true")),
+    files,
+    clock0,
+    env,
+    rng,
+    empty_net
+  )
+  assert home_res.status == 200
+  home_p = must_page(home_res)
+  assert home_p.component == "Workspace/Home"
+  assert (Json.Object(home_p.props).list_at("collections") or []).size >= 1
+  assert (Json.Object(home_p.props).list_at("databases") or []).size == 1
+
+  db_view_res = ApiTest.send(
+    Main,
+    WebTest.prepare(owner, Api.get("/d/#{db_id}").with_header("X-Inertia", "true")),
+    files,
+    clock0,
+    env,
+    rng,
+    empty_net
+  )
+  assert db_view_res.status == 200
+  db_p = must_page(db_view_res)
+  assert db_p.component == "Workspace/Database"
+  assert (Json.Object(db_p.props).list_at("collections") or []).size >= 1
+  assert (Json.Object(db_p.props).list_at("databases") or []).size == 1
+
+  prop_res = ApiTest.send(
+    Main,
+    WebTest.prepare(owner, Api.get("/proposals").with_header("X-Inertia", "true")),
+    files,
+    clock0,
+    env,
+    rng,
+    empty_net
+  )
+  assert prop_res.status == 200
+  prop_p = must_page(prop_res)
+  assert prop_p.component == "Workspace/Proposals"
+  assert (Json.Object(prop_p.props).list_at("collections") or []).size >= 1
+
+  adm_res = ApiTest.send(
+    Main,
+    WebTest.prepare(owner, Api.get("/admin").with_header("X-Inertia", "true")),
+    files,
+    clock0,
+    env,
+    rng,
+    empty_net
+  )
+  assert adm_res.status == 200
+  adm_p = must_page(adm_res)
+  assert adm_p.component == "Workspace/Admin"
+  assert (Json.Object(adm_p.props).list_at("audit_feed") or []).size >= 1
 end
