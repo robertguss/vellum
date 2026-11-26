@@ -1,6 +1,6 @@
 # Vellum v2 — AI-Native Knowledge Platform Vision & Roadmap
 
-> **Status:** Architectural Alignment Locked (Branches 1–5) · Active Exploration (Branch 6: RLM & Living Summaries)  
+> **Status:** Architectural Alignment Locked (Branches 1–6)  
 > **Companion Specs:** [vellum-spec.md](vellum-spec.md) · [upstream-roadmap.md](upstream-roadmap.md) · [benchmarks.md](benchmarks.md)  
 > **Substrate:** [Mo](https://github.com/robertguss/mo) (Pure Safe Rust VM) · [MoDB](https://github.com/robertguss/modb) (Pure CoW B+Tree / Ledger / FTS / Vec / World / Replay / Views / Feeds / Taint / Erasure) · [Arvo](https://github.com/robertguss/arvo)
 
@@ -30,6 +30,7 @@ Rather than welding one forced UI onto proprietary blobs, Vellum v2 treats **can
 | **Databases, Branches & AI Columns (Branch 3)** | Inline editing across all 11 cell types + saved-view tabs + visual schema builder + embedded DB blocks; **one Unified Multi-Resource `Modb.World` Branch** engine for multi-page proposals AND DB "What-If Scenarios"; **strictly typed AI-Compiled Columns**. | Eliminates parallel diff engines; AI columns validate via `DatabaseModel.validate_cell` against user-owned LLMs with `Modb.Feeds` triggers, per-column Auto vs. Proposal routing, and daily budgets. |
 | **Workspace-as-Memory & Local Sync (Branch 4)** | **3-Layer Progressive Disclosure** (`/llms.txt` index → **Context Studio / Compiled Context Packs** `vellum://packs/<slug>` with hard token budget → surgical `blk_` / `db_query` reads) + conflict-safe two-way `vellum sync`. | Prevents MCP schema/context bloat; sync conflicts never inject `<<<<<<<` markers or overwrite—mismatches open a `Modb.World` Proposal for visual Patchwork resolution. |
 | **Autonomous Gardeners & AI Safety (Branch 5)** | **Gardeners strictly Proposals-only**; external imports/webhooks auto-tainted (`TrustTier::Untrusted` in `Modb.Taint`); one-click **Crypto-Erase (`Modb.Erasure`)** for secrets/PII. | Zero silent AI overwrites; Lethal Trifecta blocked structurally at the storage layer; leaked secrets purge cleanly while preserving hash-chain audit integrity. |
+| **RLM Deep Research & Living Summaries (Branch 6)** | Hybrid zero-cost **structural summary on every save + debounced semantic summary** on every Page & DB; **3-Speed AI retrieval** (`Speed 1` fast search, `Speed 2` Context Packs, `Speed 3` opt-in Deep Research in 2 tiers: `ReadProgram` slice DSL → read-only `Mo` RLM REPL). | Gives agents an ~50-token metadata map across thousands of docs and runs programmatic slicing/recursive `llm.ask` inside MoDB's budgeted, taint-propagating capability VM—preventing context rot & runaway token spend. |
 
 ---
 
@@ -61,7 +62,7 @@ flowchart TB
 
   subgraph Server["Single Binary: mo serve (Pure Safe Rust VM)"]
     Auth["3 Modes: Solo (loopback) | Personal (passphrase/token) | Team (OIDC + S3/disk)"]
-    Packs["Context Studio: /llms.txt & Token-Budgeted Packs (vellum://packs/<slug>)"]
+    Packs["Context Studio: /llms.txt, Living Summaries, Token-Budgeted Packs & RLM Engine"]
     Views["Unified Blueprint + Multi-View Engine (Table / Board / Calendar / Gallery / Timeline)"]
     Branches["Unified Multi-Resource Modb.World Manager (Docs + DBs + What-If Scenarios)"]
   end
@@ -131,12 +132,16 @@ flowchart TB
 
 ---
 
-### Pillar 5 — Workspace-as-Memory: 3-Layer Progressive Disclosure & Context Studio
+### Pillar 5 — Workspace-as-Memory: Living Summaries, Progressive Packs & RLM Deep Research
 Built specifically to eliminate the MCP context bloat and "context rot" hitting Notion and Confluence:
-1. **Layer 1 — Grant-Filtered `/llms.txt` (`vellum://index`):** Compact ~300-token live workspace map of permitted Context Packs, pinned docs, schemas, and freshness status.
-2. **Layer 2 — Context Studio & Compiled Context Packs (`vellum://packs/<slug>`, `/api/packs/:slug.md`):** Reusable bundles combining collections, pinned pages, saved DB views, and optional semantic queries, filtered by freshness + `Modb.Taint` cleanliness, compiled under a **hard token budget** with a live token meter in the UI and 1-click Copy / MCP URI for Claude Code, Codex, and Cursor.
-3. **Layer 3 — Surgical Reads & Typed Queries:** Fetch only exact `<!-- blk:... -->` sections, `vellum.db_query`, or hybrid search hits needed for execution.
-4. **Conflict-Safe `vellum sync`:** When a local `.md` edit diverges from concurrent live edits (`expected_version` mismatch), Vellum **never clobbers files or inserts `<<<<<<<` markers**—instead it stages the local delta into a `Modb.World` Change Proposal resolved visually in Patchwork / Review Lens.
+1. **Per-Page & Per-DB Living Compact Summaries:** Every Page and Database maintains a compact metadata + ~50-token summary header (`Modb.Feeds`): a **zero-LLM deterministic structural summary** updates immediately on every save (headings, word counts, Blueprint fields, checklist progress, exact `Decimal` rollups), while a **debounced semantic 1-sentence summary** refreshes asynchronously after idle/material diffs.
+2. **Layer 1 — Grant-Filtered `/llms.txt` (`vellum://index`):** Compact ~300-token live workspace map of permitted Context Packs, living summaries, pinned docs, schemas, and freshness status.
+3. **Layer 2 — Context Studio & Compiled Context Packs (`vellum://packs/<slug>`, `/api/packs/:slug.md`):** Reusable bundles combining collections, pinned pages, saved DB views, and optional semantic queries, filtered by freshness + `Modb.Taint` cleanliness, compiled under a **hard token budget** with a live token meter in the UI and 1-click Copy / MCP URI for Claude Code, Codex, and Cursor.
+4. **Layer 3 — Surgical Reads & Typed Queries:** Fetch only exact `<!-- blk:... -->` sections, `vellum.db_query`, or hybrid search hits needed for execution.
+5. **Speed 3 — Budgeted, Taint-Tracked RLM Deep Research:** Explicit opt-in mode ("Deep Research (RLM)" in Ask AI & `vellum.rlm_query` in `/mcp`) for complex cross-corpus analysis across thousands of docs and databases without compacting or stuffing context windows:
+   - **Tier 1 (Declarative Query/Slice DSL):** Plans over living summaries, slices specific `Heading`/`Callout`/`TaskItem` or matching `blk_...` anchors, joins DB rows via budgeted `Modb.Views.execute_read_program_tainted` (`max_rows_scanned`, `max_ops`, `max_result_rows`), runs bounded parallel sub-LLM calls, and renders a reproducible query trace + clickable citations.
+   - **Tier 2 (Sandboxed Read-Only `Mo` RLM Micro-REPL):** Executes capability-confined read-only `Mo` scripts (`ws.summaries`, `ws.blocks`, `ws.db_rows`, `ws.search`, plus budget-capped `llm.ask`) with `max_depth`, `max_subcalls` (debited against `Modb.Grants.max_calls`), and monotonic `Modb.Taint.fork_session` enforcement—zero Python/Docker sandboxes required.
+6. **Conflict-Safe `vellum sync`:** When a local `.md` edit diverges from concurrent live edits (`expected_version` mismatch), Vellum **never clobbers files or inserts `<<<<<<<` markers**—instead it stages the local delta into a `Modb.World` Change Proposal resolved visually in Patchwork / Review Lens.
 
 ---
 
@@ -161,16 +166,18 @@ Built specifically to eliminate the MCP context bloat and "context rot" hitting 
 ### Phase 2 — AI-Native Workspace Superpowers
 | Workstream | Deliverables | Primary Touchpoints |
 | --- | --- | --- |
-| **2.1 Context Studio & Progressive Disclosure** | Grant-filtered `/llms.txt` (`vellum://index`), `ContextPack` MoDB schema, live token-budgeted compiler & UI, `vellum://packs/<slug>` MCP resource, `:::ai-brief` Living Brief cards (`Modb.Feeds`). | `domain/packs.mo`, `db.mo`, `routes/mcp.mo`, `routes/ai.mo`, `frontend/src/pages/Workspace/Packs.tsx` |
+| **2.1 Context Studio, Living Summaries & Progressive Disclosure** | Per-Page/DB structural + debounced semantic **Living Summaries**, grant-filtered `/llms.txt` (`vellum://index`), `ContextPack` MoDB schema, live token-budgeted compiler & UI, `vellum://packs/<slug>` MCP resource, `:::ai-brief` Living Brief cards (`Modb.Feeds`). | `domain/packs.mo`, `db.mo`, `routes/mcp.mo`, `routes/ai.mo`, `frontend/src/pages/Workspace/Packs.tsx` |
 | **2.2 Strictly Typed AI-Compiled Columns** | `AiDerived` DB column builder & executor validated via `DatabaseModel.validate_cell`, `Modb.Feeds` staleness tracking, per-column Auto vs. Proposal toggle, daily call/budget cap, citation provenance. | `domain/database-model.mo`, `routes/databases.mo`, `routes/ai.mo`, `frontend/src/pages/Workspace/Database.tsx` |
 | **2.3 Full Structured MCP DB Surface** | `vellum.db_schema`, `vellum.db_create_row`, `vellum.db_update_row`, `vellum.db_propose_changes` + `Steer-in-Place` comment threads inside Patchwork Review Lens. | `routes/mcp.mo`, `routes/collab.mo`, `frontend/src/pages/Workspace/Proposals.tsx` |
+| **2.4 RLM Deep Research Tier 1 (`ReadProgram` + Block-Slice DSL)** | Explicit "Deep Research (RLM)" Ask AI mode + `/mcp` tool over living summaries, `Modb.Views.execute_read_program_tainted`, block-anchor slicing, bounded parallel sub-LLM synthesis, and inspectable trace + clickable `[blk_...]` citations. | `routes/ai.mo`, `routes/mcp.mo`, `db.mo`, `frontend/src/components/WorkspaceLayout.tsx` |
 
-### Phase 3 — Living Docs, Local Sync & Time Travel
+### Phase 3 — Living Docs, Local Sync & RLM REPL Runtime
 | Workstream | Deliverables | Primary Touchpoints |
 | --- | --- | --- |
 | **3.1 Conflict-Safe `vellum sync`** | Two-way YAML frontmatter + `<!-- blk:... -->` Markdown local mirror routing version conflicts cleanly into `Modb.World` Change Proposals. | Sync command/module in `vellum` + `domain/blocks.mo` |
 | **3.2 Proposals-Only Gardeners & PR Bridge** | Contradiction/duplicate detector (`Modb.Vec`), cited-dependency drift detector, signed `POST /api/webhooks/github` PR-to-runbook proposal generator. | `routes/ai.mo`, `routes/collab.mo`, `frontend/src/pages/Workspace/Admin.tsx` |
 | **3.3 Visual `Modb.Replay` & DB Gallery/Timeline** | Point-in-time scrubber + selective actor undo simulation UI + Semantic Backlinks rail (`Modb.Vec`) + Gallery & Timeline DB views. | `routes/collab.mo`, `routes/workspace.mo`, `frontend/src/pages/Workspace/{Page,Admin,Database}.tsx` |
+| **3.4 RLM Deep Research Tier 2 (`Mo` Micro-REPL VM)** | Read-only capability-confined `Mo` workspace script runner (`vellum.rlm_query`) with `ws.*` + budget-capped `llm.ask`, `max_depth`/`max_subcalls`/`Modb.Grants` debiting, and monotonic `Modb.Taint.fork_session` enforcement. | `routes/ai.mo`, `routes/mcp.mo`, `main.mo` |
 
 ### Phase 4 — Enterprise AI Safety Moat
 | Workstream | Deliverables | Primary Touchpoints |
@@ -185,14 +192,5 @@ Built specifically to eliminate the MCP context bloat and "context rot" hitting 
 
 As with v1 ([upstream-roadmap.md](upstream-roadmap.md)), upstream primitives are extended cleanly rather than papered over:
 - **MoDB (`modb`):** Leverage existing `Modb.World`, `Modb.Replay`, `Modb.Grants`, `Modb.Claims`, `Modb.Fts`, `Modb.Vec`, `Modb.Feeds`, `Modb.Views` (`ReadProgram` + `describe_for_caller`), `Modb.Taint`, `Modb.Erasure`, and `Modb.Export`. Validate multi-bucket `Modb.World` landing invariants for unified page + database branches.
-- **Mo (`mo`):** Keep optimizing hot-path allocations, streaming HTTP/SSE ergonomics, and file-watching primitives if needed by `vellum sync`.
+- **Mo (`mo`):** Keep optimizing hot-path allocations, streaming HTTP/SSE ergonomics, sandboxed read-only `Mo` evaluation for Tier 2 RLM queries, and file-watching primitives for `vellum sync`.
 - **Arvo (`arvo`):** Support dynamic `Arvo.Mcp` resources (`vellum://packs/<slug>`, `vellum://index`), clean local-disk blob backend parity alongside `Arvo.S3`, and personal-mode local auth helpers.
-
----
-
-## 8. Under Active Exploration — Branch 6: RLM-Native Deep Research & Living Summaries
-
-We are actively evaluating combining **per-page and per-database Living Compact Summaries** (auto-refreshed via `Modb.Feeds`) with a **Recursive Language Model (RLM)** workspace runtime (inspired by MIT CSAIL's RLM architecture by Zhang, Kraska & Khattab):
-- **Core concept:** Instead of compacting or stuffing millions of tokens into a fixed context window ("context rot"), the workspace acts as a **programmable environment**: agents inspect ultra-compact living summaries/metadata first, then execute programmatic slicing/filtering/aggregation and targeted recursive sub-LLM inspection (`llm.ask(slice, question)`) over only the exact candidate blocks and rows.
-- **Why Vellum + `Mo` + `MoDB` fits uniquely:** `Modb.Views.ReadProgram` already enforces work-budgeted (`max_rows_scanned`, `max_ops`, `max_result_rows`), grant-scoped ad-hoc queries; `Modb.Taint.execute_read_program_tainted` + `fork_session` propagate taint into sub-queries; and `Mo`'s `#![forbid(unsafe_code)]` capability-confined VM eliminates unsafe Python/Docker REPL execution.
-- *(Status: Pending design alignment in chat before assigning to Roadmap Phases 2–3.)*
