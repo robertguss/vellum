@@ -1,6 +1,6 @@
 import { Link } from "@inertiajs/react";
 import { Calendar as CalIcon, Columns, ExternalLink, Filter, Plus, Table2 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import WorkspaceLayout from "../../components/WorkspaceLayout";
 import { ApiError, apiFetch } from "../../lib/api";
 import type {
@@ -278,6 +278,28 @@ export default function DatabaseView({
     return Array.from(byDate.entries()).sort((a, b) => a[0].localeCompare(b[0]));
   }, [rows, dateProp]);
 
+  const runQueryRef = useRef(runQuery);
+  runQueryRef.current = runQuery;
+
+  useEffect(() => {
+    setRows(initialRows);
+  }, [initialRows]);
+
+  useEffect(() => {
+    setViews(initialViews);
+  }, [initialViews]);
+
+  const handleRealtimeEvent = useCallback((eventName: string) => {
+    if (
+      eventName === "db.row_created" ||
+      eventName === "db.row_updated" ||
+      eventName === "db.row_deleted" ||
+      eventName === "resync_required"
+    ) {
+      void runQueryRef.current(null);
+    }
+  }, []);
+
   return (
     <WorkspaceLayout
       title={database.title}
@@ -285,6 +307,8 @@ export default function DatabaseView({
       databases={databases}
       activeDatabaseId={database.id}
       currentCollectionId={database.collection_id}
+      realtimeScope={{ databaseId: database.id }}
+      onRealtimeEvent={handleRealtimeEvent}
     >
       <div className="space-y-5">
         <div className="rounded-2xl border border-stone-200 bg-white p-6 flex flex-wrap items-center justify-between gap-4">

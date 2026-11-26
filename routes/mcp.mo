@@ -415,11 +415,22 @@ fn handle_tool_call(
         (t2, rep) = try Db.tx_apply_world_patch(t1, patch_args.to_json).map_error(fn(m)
           BadInput(reason: m)
         end)
-        Ok((t2, rep))
+        Ok((t2, (rep, old_pg.collection_id)))
       end
     )
     return case res
-      Ok(rep): Ok(Mcp.tool_ok(id, "Patched page #{pid}.", Some(rep)))
+      Ok((rep, col_id)):
+        blocks_ev = Json.Object({
+          "page_id": Json.String(pid),
+          "collection_id": Json.String(col_id),
+          "actor": Json.String(auth.principal.handle),
+          "reason": Json.String(reason)
+        })
+        Ok(
+          Mcp.tool_ok(id, "Patched page #{pid}.", Some(rep))
+            .with_sse_publish_json("page:#{pid}", "page.blocks_updated", blocks_ev)
+            .with_sse_publish_json("collection:#{col_id}", "page.blocks_updated", blocks_ev)
+        )
       Error(e): Ok(Mcp.tool_error(id, e.to_text))
     end
   end
@@ -470,7 +481,13 @@ fn handle_tool_call(
       end
     )
     return case res
-      Ok(cl): Ok(Mcp.tool_ok(id, "Acquired claim on #{resource}.", Some(cl.to_json)))
+      Ok(cl): Ok(
+        Mcp.tool_ok(id, "Acquired claim on #{resource}.", Some(cl.to_json)).with_sse_publish_json(
+          "claims",
+          "claim.acquired",
+          Json.Object({"claim": cl.to_json, "actor": Json.String(auth.principal.handle)})
+        )
+      )
       Error(e): Ok(Mcp.tool_error(id, e.to_text))
     end
   end
@@ -504,7 +521,16 @@ fn handle_tool_call(
       end
     )
     return case res
-      Ok(_): Ok(Mcp.tool_ok(id, "Released claim on #{resource}.", None))
+      Ok(_): Ok(
+        Mcp.tool_ok(id, "Released claim on #{resource}.", None).with_sse_publish_json(
+          "claims",
+          "claim.released",
+          Json.Object({
+            "resource": Json.String(resource),
+            "actor": Json.String(auth.principal.handle)
+          })
+        )
+      )
       Error(e): Ok(Mcp.tool_error(id, e.to_text))
     end
   end
@@ -592,7 +618,18 @@ fn handle_tool_call(
         Ok((t2, pm))
       end
     )
-    return Ok(Mcp.tool_ok(id, "Opened proposal #{saved.id}.", Some(saved.to_json)))
+    prop_ev = Json.Object({
+      "proposal_id": Json.String(saved.id),
+      "page_id": Json.String(saved.target_page_id),
+      "collection_id": Json.String(saved.collection_id),
+      "title": Json.String(saved.title),
+      "actor": Json.String(auth.principal.handle)
+    })
+    return Ok(
+      Mcp.tool_ok(id, "Opened proposal #{saved.id}.", Some(saved.to_json))
+        .with_sse_publish_json("collection:#{saved.collection_id}", "proposal.opened", prop_ev)
+        .with_sse_publish_json("page:#{saved.target_page_id}", "proposal.opened", prop_ev)
+    )
   end
 
   if name == "vellum.proposal_stage_ops"

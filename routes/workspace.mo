@@ -641,6 +641,12 @@ fn create_page(
     end
   )
 
+  page_ev = Json.Object({
+    "page_id": Json.String(saved_page.id),
+    "collection_id": Json.String(saved_page.collection_id),
+    "title": Json.String(saved_page.title),
+    "actor": Json.String(auth.principal.handle)
+  })
   Ok(
     json_ok(
       201,
@@ -649,7 +655,7 @@ fn create_page(
         "blocks": saved_blocks.to_json,
         "anchored_markdown": Json.String(Blocks.to_anchored_markdown(saved_blocks))
       })
-    )
+    ).with_sse_publish_json("collection:#{saved_page.collection_id}", "page.created", page_ev)
   )
 end
 
@@ -778,6 +784,13 @@ fn patch_blocks(
     end
   )
 
+  blocks_ev = Json.Object({
+    "page_id": Json.String(next_page.id),
+    "collection_id": Json.String(next_page.collection_id),
+    "version": Json.int(next_page.version),
+    "actor": Json.String(auth.principal.handle),
+    "reason": Json.String((input.reason or "update blocks").trim)
+  })
   Ok(
     json_ok(
       200,
@@ -786,13 +799,14 @@ fn patch_blocks(
         "blocks": next_blocks.to_json,
         "anchored_markdown": Json.String(Blocks.to_anchored_markdown(next_blocks))
       })
-    )
+    ).with_sse_publish_json("page:#{next_page.id}", "page.blocks_updated", blocks_ev)
+      .with_sse_publish_json("collection:#{next_page.collection_id}", "page.blocks_updated", blocks_ev)
   )
 end
 
 ## `POST /api/pages/:id/verify` — Marks a page freshly verified (`verified_at`, `verified_by`).
 fn verify_page(req: Api.Request, id: Text, auth: AuthContext, files: Files, clock: Clock) : Result(
-  Page,
+  Api.Response,
   AppError
 )
   try Auth.require_session_csrf(req, auth)
@@ -822,7 +836,7 @@ fn verify_page(req: Api.Request, id: Text, auth: AuthContext, files: Files, cloc
     "verified_by": Json.String(auth.principal.id)
   })
 
-  Ledger.transact_locked(
+  updated = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -841,7 +855,7 @@ fn verify_page(req: Api.Request, id: Text, auth: AuthContext, files: Files, cloc
         Some(v): Some(v)
         None: old_page.freshness_ttl_days
       end
-      updated = Page(
+      next_p = Page(
         id: old_page.id,
         collection_id: old_page.collection_id,
         parent_page_id: old_page.parent_page_id,
@@ -860,9 +874,20 @@ fn verify_page(req: Api.Request, id: Text, auth: AuthContext, files: Files, cloc
         archived_at: old_page.archived_at,
         version: old_page.version + 1
       )
-      t2 = try Table.put(t1, Db.pages_table(), updated.id, updated).map_error(Db.map_table_error)
-      Ok((t2, updated))
+      t2 = try Table.put(t1, Db.pages_table(), next_p.id, next_p).map_error(Db.map_table_error)
+      Ok((t2, next_p))
     end
+  )
+  verify_ev = Json.Object({
+    "page_id": Json.String(updated.id),
+    "collection_id": Json.String(updated.collection_id),
+    "version": Json.int(updated.version),
+    "actor": Json.String(auth.principal.handle)
+  })
+  Ok(
+    json_ok(200, updated.to_json)
+      .with_sse_publish_json("page:#{updated.id}", "page.verified", verify_ev)
+      .with_sse_publish_json("collection:#{updated.collection_id}", "page.verified", verify_ev)
   )
 end
 
@@ -930,7 +955,7 @@ fn create_comment(
   )
   audit_payload = Json.Object({"comment_id": Json.String(cmt.id), "page_id": Json.String(id)})
 
-  created = try Ledger.transact_locked(
+  (created, col_id) = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -946,10 +971,20 @@ fn create_comment(
       end
       try Policy.require_collection_access(auth, "comment", page.collection_id)
       t2 = try Table.put(t1, Db.comments_table(), cmt.id, cmt).map_error(Db.map_table_error)
-      Ok((t2, cmt))
+      Ok((t2, (cmt, page.collection_id)))
     end
   )
-  Ok(json_ok(201, created.to_json))
+  cmt_ev = Json.Object({
+    "comment_id": Json.String(created.id),
+    "page_id": Json.String(id),
+    "collection_id": Json.String(col_id),
+    "actor": Json.String(auth.principal.handle)
+  })
+  Ok(
+    json_ok(201, created.to_json)
+      .with_sse_publish_json("page:#{id}", "comment.created", cmt_ev)
+      .with_sse_publish_json("collection:#{col_id}", "comment.created", cmt_ev)
+  )
 end
 
 ## `POST /api/attachments/presign` — Issues an AWS SigV4 presigned `PUT` URL and records pending metadata in MoDB.

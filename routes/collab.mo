@@ -315,7 +315,13 @@ fn acquire_claim(
       Ok((t2, c))
     end
   )
-  Ok(json_ok(201, claim.to_json))
+  Ok(
+    json_ok(201, claim.to_json).with_sse_publish_json(
+      "claims",
+      "claim.acquired",
+      Json.Object({"claim": claim.to_json, "actor": Json.String(auth.principal.handle)})
+    )
+  )
 end
 
 ## `POST /api/claims/heartbeat` — Extends an active lease held by the caller.
@@ -359,7 +365,13 @@ fn heartbeat_claim(
       Ok((t2, c))
     end
   )
-  Ok(json_ok(200, claim.to_json))
+  Ok(
+    json_ok(200, claim.to_json).with_sse_publish_json(
+      "claims",
+      "claim.heartbeat",
+      Json.Object({"claim": claim.to_json, "actor": Json.String(auth.principal.handle)})
+    )
+  )
 end
 
 ## `POST /api/claims/release` — Releases caller's claim (or force-releases for Owners/Admins).
@@ -403,7 +415,13 @@ fn release_claim(
       Ok((t2, Unit))
     end
   )
-  Ok(json_ok(200, Json.Object({"released": Json.String(res_key)})))
+  Ok(
+    json_ok(200, Json.Object({"released": Json.String(res_key)})).with_sse_publish_json(
+      "claims",
+      "claim.released",
+      Json.Object({"resource": Json.String(res_key), "actor": Json.String(auth.principal.handle)})
+    )
+  )
 end
 
 ## `GET /api/proposals` — Lists Change Proposals visible to the caller's collection grants (`ReadFiles`-only).
@@ -539,7 +557,20 @@ fn open_proposal(
       Ok((cur, proposal))
     end
   )
-  Ok(json_ok(201, saved.to_json))
+  prop_payload = Json.Object({
+    "proposal_id": Json.String(saved.id),
+    "page_id": Json.String(saved.target_page_id),
+    "collection_id": Json.String(saved.collection_id),
+    "title": Json.String(saved.title),
+    "actor": Json.String(auth.principal.handle)
+  })
+  Ok(
+    json_ok(201, saved.to_json).with_sse_publish_json(
+      "collection:#{saved.collection_id}",
+      "proposal.opened",
+      prop_payload
+    ).with_sse_publish_json("page:#{saved.target_page_id}", "proposal.opened", prop_payload)
+  )
 end
 
 ## `POST /api/proposals/:id/ops` — Stages surgical `BlockOp`s inside a `Modb.World` branch without touching live pages.
@@ -770,7 +801,19 @@ fn accept_proposal(
       Ok((cur, accepted))
     end
   )
-  Ok(json_ok(200, Json.Object({"proposal": saved.to_json, "land_result": land_res.to_json})))
+  prop_payload = Json.Object({
+    "proposal_id": Json.String(saved.id),
+    "page_id": Json.String(saved.target_page_id),
+    "collection_id": Json.String(saved.collection_id),
+    "status": Json.String("accepted"),
+    "commit_txid": Json.int(land_res.commit_txid),
+    "actor": Json.String(auth.principal.handle)
+  })
+  Ok(
+    json_ok(200, Json.Object({"proposal": saved.to_json, "land_result": land_res.to_json}))
+      .with_sse_publish_json("collection:#{saved.collection_id}", "proposal.accepted", prop_payload)
+      .with_sse_publish_json("page:#{saved.target_page_id}", "proposal.accepted", prop_payload)
+  )
 end
 
 ## `POST /api/proposals/:id/reject` — Drops a pending `Modb.World` branch and marks the proposal rejected.
@@ -854,7 +897,20 @@ fn reject_proposal(req: Api.Request, id: Text, auth: AuthContext, files: Files, 
       Ok((t1, rejected))
     end
   )
-  Ok(json_ok(200, saved.to_json))
+  prop_payload = Json.Object({
+    "proposal_id": Json.String(saved.id),
+    "page_id": Json.String(saved.target_page_id),
+    "collection_id": Json.String(saved.collection_id),
+    "status": Json.String("rejected"),
+    "actor": Json.String(auth.principal.handle)
+  })
+  Ok(
+    json_ok(200, saved.to_json).with_sse_publish_json(
+      "collection:#{saved.collection_id}",
+      "proposal.rejected",
+      prop_payload
+    ).with_sse_publish_json("page:#{saved.target_page_id}", "proposal.rejected", prop_payload)
+  )
 end
 
 ## `POST /api/admin/replay/baseline` — Pins current CoW catalog root as `Modb.Replay` starting point.
@@ -1211,7 +1267,7 @@ fn create_webhook(
   )
 end
 
-## `GET /api/events` — Emits incremental `text/event-stream` SSE audit & active claims feed (`ReadFiles`-only).
+## `GET /api/events` — Emits live grant-scoped `text/event-stream` SSE stream with `Last-Event-ID` catchup (`ReadFiles`-only).
 fn events_stream(req: Api.Request, auth: AuthContext, rf: ReadFiles, clock: Clock) : Result(
   Api.Response,
   AppError
@@ -1219,33 +1275,110 @@ fn events_stream(req: Api.Request, auth: AuthContext, rf: ReadFiles, clock: Cloc
   if not Policy.action_permitted?(auth, "read")
     return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'read'"))
   end
+  last_id = Sse.last_event_id(req)
+  page_scope = req.query_param("page_id").map(fn(s) s.trim end)
+  db_scope = req.query_param("database_id").map(fn(s) s.trim end)
+  col_scope = req.query_param("collection_id").map(fn(s) s.trim end)
+
   if not rf.exists?(Db.ledger_db_path)
-    return Ok(Sse.response([]))
+    case page_scope
+      Some(pid) if not pid.empty?: return Error(Missing(entity: "page", id: pid))
+      Some(_) | None: Unit
+    end
+    case db_scope
+      Some(did) if not did.empty?: return Error(Missing(entity: "database", id: did))
+      Some(_) | None: Unit
+    end
+    case col_scope
+      Some(cid) if not cid.empty?: return Error(Missing(entity: "collection", id: cid))
+      Some(_) | None: Unit
+    end
+    empty_topics = ["claims"]
+    connected_ev = Sse.SseEvent(
+      id: None,
+      event: Some("connected"),
+      data: Json.Object({
+        "topics": empty_topics.to_json,
+        "actor": Json.String(auth.principal.handle)
+      }).to_text,
+      retry_ms: Some(3000)
+    )
+    snap_ev = Sse.json_event(None, "claims.snapshot", Json.Object({"claims": Json.Array([])}))
+    return Ok(Sse.response([connected_ev, snap_ev]).with_sse_subscribe(empty_topics, last_id))
   end
-  cursor = case Sse.last_event_id(req)
+
+  cursor = case last_id
     Some(s): s.trim.to_int or 0
     None: 0
   end
   now = clock.now
-  (entries, active_claims) = try Ledger.read_locked(
+  (topics, entries, active_claims) = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
+      var scoped_topics = ["claims"]
+      case page_scope
+        Some(pid) if not pid.empty?:
+          pg = case try Table.get(store, Db.pages_table(), pid).map_error(Db.map_table_error)
+            Some(p) if p.archived_at == None: p
+            Some(_) | None: return Error(Missing(entity: "page", id: pid))
+          end
+          try Policy.require_collection_access(auth, "read", pg.collection_id)
+          scoped_topics = scoped_topics.append("page:#{pg.id}")
+        Some(_) | None:
+          case db_scope
+            Some(did) if not did.empty?:
+              d = case try Table.get(store, Db.databases_table(), did).map_error(
+                Db.map_table_error
+              )
+                Some(def): def
+                None: return Error(Missing(entity: "database", id: did))
+              end
+              try Policy.require_collection_access(auth, "read", d.collection_id)
+              scoped_topics = scoped_topics.append("database:#{d.id}")
+            Some(_) | None:
+              case col_scope
+                Some(cid) if not cid.empty?:
+                  try Policy.require_collection_access(auth, "read", cid)
+                  scoped_topics = scoped_topics.append("collection:#{cid}")
+                Some(_) | None:
+                  cols = try Table.scan(store, Db.collections_table(), None, None, 200).map_error(
+                    Db.map_table_error
+                  )
+                  var added = 0
+                  for (_k, c) in cols
+                    if c.archived_at == None and Policy.collection_permitted?(auth, c.id) and added < 30
+                      scoped_topics = scoped_topics.append("collection:#{c.id}")
+                      added += 1
+                    end
+                  end
+              end
+          end
+      end
       audits = try Ledger.audit_tail_store(store, 50).map_error(Db.map_ledger_error)
       claims = try Claims.list_active(store, now).map_error(Db.map_claims_error)
-      Ok((audits, claims))
+      Ok((scoped_topics, audits, claims))
     end
   )
 
-  var sse_events = []
+  var sse_events = [
+    Sse.SseEvent(
+      id: None,
+      event: Some("connected"),
+      data: Json.Object({"topics": topics.to_json, "actor": Json.String(auth.principal.handle)})
+        .to_text,
+      retry_ms: Some(3000)
+    ),
+    Sse.json_event(None, "claims.snapshot", Json.Object({"claims": active_claims.to_json}))
+  ]
   for e in entries
     if e.seq > cursor
       sse_events = sse_events.append(
         Sse.json_event(
-          Some(e.seq.to_text),
+          None,
           "audit.#{e.action}",
           Json.Object({
             "seq": Json.int(e.seq),
@@ -1257,8 +1390,5 @@ fn events_stream(req: Api.Request, auth: AuthContext, rf: ReadFiles, clock: Cloc
       )
     end
   end
-  sse_events = sse_events.append(
-    Sse.json_event(None, "claims.snapshot", Json.Object({"claims": active_claims.to_json}))
-  )
-  Ok(Sse.response(sse_events))
+  Ok(Sse.response(sse_events).with_sse_subscribe(topics, last_id))
 end

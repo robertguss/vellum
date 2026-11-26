@@ -15,8 +15,10 @@ import {
 } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
 import { ApiError, apiFetch, streamAskWorkspace } from "../lib/api";
+import { useRealtimeEvents, type RealtimeScope } from "../lib/useRealtimeEvents";
 import type {
   AiCitation,
+  ClaimRecord,
   Collection,
   CollectionWritePolicy,
   DatabaseDef,
@@ -31,6 +33,9 @@ interface WorkspaceLayoutProps {
   activeCollectionSlug?: string;
   activeDatabaseId?: string;
   currentCollectionId?: string | null;
+  realtimeScope?: RealtimeScope;
+  onRealtimeEvent?: (eventName: string, data: Record<string, unknown>) => void;
+  onClaimsChange?: (claims: ClaimRecord[]) => void;
   children: ReactNode;
 }
 
@@ -41,9 +46,23 @@ export default function WorkspaceLayout({
   activeCollectionSlug,
   activeDatabaseId,
   currentCollectionId = null,
+  realtimeScope,
+  onRealtimeEvent,
+  onClaimsChange,
   children,
 }: WorkspaceLayoutProps) {
   const { auth, flash } = usePage<SharedPageProps>().props;
+  const effectiveScope: RealtimeScope | undefined =
+    realtimeScope ?? (currentCollectionId ? { collectionId: currentCollectionId } : undefined);
+  const { connectionState, claims } = useRealtimeEvents({
+    enabled: Boolean(auth),
+    scope: effectiveScope,
+    onEvent: onRealtimeEvent,
+  });
+
+  useEffect(() => {
+    onClaimsChange?.(claims);
+  }, [claims, onClaimsChange]);
 
   // Cmd+K BM25 search modal
   const [searchOpen, setSearchOpen] = useState(false);
@@ -321,6 +340,28 @@ export default function WorkspaceLayout({
               <span className="font-medium text-stone-900 truncate">{title}</span>
             </div>
             <div className="flex items-center gap-2">
+              {auth && (
+                <span
+                  data-testid="sse-status"
+                  title={
+                    connectionState === "live"
+                      ? "Streaming live updates via Mo SSE"
+                      : "Reconnecting to live SSE stream"
+                  }
+                  className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium ${
+                    connectionState === "live"
+                      ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                      : "border-amber-200 bg-amber-50 text-amber-700"
+                  }`}
+                >
+                  <span
+                    className={`h-1.5 w-1.5 rounded-full ${
+                      connectionState === "live" ? "bg-emerald-500" : "bg-amber-500 animate-pulse"
+                    }`}
+                  />
+                  {connectionState === "live" ? "Live" : "Syncing"}
+                </span>
+              )}
               <button
                 type="button"
                 onClick={() => setSearchOpen(true)}
