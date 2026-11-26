@@ -10,13 +10,13 @@ GardenBrokenLink(..),
 GardenReport(..),
 ai_config,
 build_llm_request,
+build_llm_request_with_stream,
 ask_workspace,
 draft_blocks,
 run_garden,
 garden_job
 use Api
 use Arvo.Id
-use Arvo.Sse
 use Db
 use Domain.Blocks
 use Domain.Collab{ProposalMeta, WorldPatchArgs}
@@ -118,31 +118,48 @@ fn ai_config(env: Env) : Result(AiConfig, AppError)
   Ok(AiConfig(provider: provider, api_key: api_key.trim, base_url: base_url, model: model))
 end
 
-## Builds the signed HTTP request for either OpenAI-compatible chat completions or Anthropic messages.
-fn build_llm_request(cfg: AiConfig, system_prompt: Text, user_prompt: Text) : Http.Request
+## Builds the signed HTTP request for either OpenAI-compatible chat completions or Anthropic
+## messages, optionally setting `"stream": true` for SSE delta streaming.
+fn build_llm_request_with_stream(
+  cfg: AiConfig,
+  system_prompt: Text,
+  user_prompt: Text,
+  stream?: Bool
+) : Http.Request
   if cfg.provider == "anthropic"
-    payload = Json.Object({
+    var fields = {
       "model": Json.String(cfg.model),
       "max_tokens": Json.int(1024),
       "system": Json.String(system_prompt),
       "messages": Json.Array([
         Json.Object({"role": Json.String("user"), "content": Json.String(user_prompt)})
       ])
-    })
-    Http.post(cfg.base_url).json(payload).header("x-api-key", cfg.api_key).header(
+    }
+    if stream?
+      fields = fields.set("stream", Json.Boolean(true))
+    end
+    Http.post(cfg.base_url).json(Json.Object(fields)).header("x-api-key", cfg.api_key).header(
       "anthropic-version",
       "2023-06-01"
     )
   else
-    payload = Json.Object({
+    var fields = {
       "model": Json.String(cfg.model),
       "messages": Json.Array([
         Json.Object({"role": Json.String("system"), "content": Json.String(system_prompt)}),
         Json.Object({"role": Json.String("user"), "content": Json.String(user_prompt)})
       ])
-    })
-    Http.post(cfg.base_url).json(payload).header("Authorization", "Bearer #{cfg.api_key}")
+    }
+    if stream?
+      fields = fields.set("stream", Json.Boolean(true))
+    end
+    Http.post(cfg.base_url).json(Json.Object(fields)).header("Authorization", "Bearer #{cfg.api_key}")
   end
+end
+
+## Builds the non-streaming signed HTTP request for OpenAI-compatible or Anthropic completions.
+fn build_llm_request(cfg: AiConfig, system_prompt: Text, user_prompt: Text) : Http.Request
+  build_llm_request_with_stream(cfg, system_prompt, user_prompt, false)
 end
 
 fn extract_llm_text(cfg: AiConfig, body: Bytes) : Result(Text, AppError)
@@ -248,6 +265,31 @@ fn ask_workspace(
   end
   usr_prompt = "Question: #{q}\n\nWorkspace Sources:\n#{ctx_body}"
 
+  accept = (req.header("Accept") or "").ascii_lowercase
+  wants_sse? = input.stream == Some(true) or accept.contains?("text/event-stream")
+  if wants_sse?
+    stream_req = build_llm_request_with_stream(cfg, sys_prompt, usr_prompt, true)
+    relay_mode = if cfg.provider == "anthropic": "anthropic_sse" else: "openai_sse"
+    body_text = stream_req.body.decode_utf8 or ""
+    var citation_events = []
+    for c in citations
+      citation_events = citation_events.append((Some("ai.citation"), c.to_text))
+    end
+    relay = Api.SseRelay(
+      method: stream_req.method,
+      url: stream_req.url,
+      headers: stream_req.headers,
+      body: body_text,
+      mode: relay_mode,
+      idle_timeout_ms: 60000,
+      token_event: Some("ai.token"),
+      done_event: Some("ai.done"),
+      done_data: Some(Json.Object({"model": Json.String(cfg.model)}).to_text),
+      error_event: Some("ai.error")
+    )
+    return Ok(Api.sse_relay_stream(citation_events, relay))
+  end
+
   http_req = build_llm_request(cfg, sys_prompt, usr_prompt)
   http_res = try Http.send(http_req, net).map_error(fn(e)
     ServerFailed(reason: "LLM HTTP request failed: #{e.to_text}")
@@ -256,29 +298,6 @@ fn ask_workspace(
     return Error(ServerFailed(reason: "LLM provider returned HTTP #{http_res.status}"))
   end
   answer = try extract_llm_text(cfg, http_res.body)
-
-  accept = (req.header("Accept") or "").ascii_lowercase
-  wants_sse? = input.stream == Some(true) or accept.contains?("text/event-stream")
-  if wants_sse?
-    var events = []
-    for (idx, c) in citations.enumerate
-      events = events.append(Sse.json_event(Some("c#{idx + 1}"), "ai.citation", c))
-    end
-    for (w_idx, chunk) in answer.words.enumerate
-      tok_text = if w_idx == 0: chunk else: " #{chunk}"
-      events = events.append(
-        Sse.json_event(
-          Some("t#{w_idx + 1}"),
-          "ai.token",
-          Json.Object({"delta": Json.String(tok_text)})
-        )
-      )
-    end
-    events = events.append(
-      Sse.json_event(None, "ai.done", Json.Object({"model": Json.String(cfg.model)}))
-    )
-    return Ok(Sse.response(events))
-  end
 
   Ok(
     json_ok(

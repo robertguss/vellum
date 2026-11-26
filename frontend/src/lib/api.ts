@@ -78,6 +78,48 @@ export interface AskWorkspaceStreamHandlers {
   onDone?: (model: string) => void;
 }
 
+function dispatchAskSseFrame(frame: string, handlers: AskWorkspaceStreamHandlers): void {
+  if (!frame.trim()) return;
+  let eventName = "message";
+  const dataLines: string[] = [];
+  for (const line of frame.split(/\r?\n/)) {
+    if (line.startsWith(":")) continue;
+    if (line.startsWith("event:")) {
+      eventName = line.slice("event:".length).trim();
+    } else if (line.startsWith("data:")) {
+      dataLines.push(line.slice("data:".length).trimStart());
+    }
+  }
+  if (dataLines.length === 0) return;
+  const rawData = dataLines.join("\n");
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(rawData) as Record<string, unknown>;
+  } catch {
+    return;
+  }
+  if (eventName === "ai.citation") {
+    handlers.onCitation?.(parsed as unknown as AiCitation);
+  } else if (eventName === "ai.token") {
+    const delta = typeof parsed.delta === "string" ? parsed.delta : "";
+    if (delta) {
+      handlers.onToken?.(delta);
+    }
+  } else if (eventName === "ai.done") {
+    const model = typeof parsed.model === "string" ? parsed.model : "";
+    handlers.onDone?.(model);
+  } else if (eventName === "ai.error") {
+    const status = typeof parsed.status === "number" ? parsed.status : 502;
+    const msg =
+      typeof parsed.detail === "string" && parsed.detail
+        ? parsed.detail
+        : typeof parsed.error === "string" && parsed.error
+          ? parsed.error
+          : "LLM streaming error";
+    throw new ApiError(status >= 400 ? status : 502, msg);
+  }
+}
+
 export async function streamAskWorkspace(
   payload: {
     question: string;
@@ -121,35 +163,37 @@ export async function streamAskWorkspace(
     throw new ApiError(res.status, msg);
   }
 
-  const bodyText = await res.text();
-  const frames = bodyText.split(/\r?\n\r?\n/);
-  for (const frame of frames) {
-    if (!frame.trim()) continue;
-    let eventName = "message";
-    const dataLines: string[] = [];
-    for (const line of frame.split(/\r?\n/)) {
-      if (line.startsWith(":")) continue;
-      if (line.startsWith("event:")) {
-        eventName = line.slice("event:".length).trim();
-      } else if (line.startsWith("data:")) {
-        dataLines.push(line.slice("data:".length).trimStart());
+  if (!res.body) {
+    const bodyText = await res.text();
+    for (const frame of bodyText.split(/\r?\n\r?\n/)) {
+      dispatchAskSseFrame(frame, handlers);
+    }
+    return;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (value) {
+        buffer += decoder.decode(value, { stream: !done });
+        const frames = buffer.split(/\r?\n\r?\n/);
+        buffer = frames.pop() ?? "";
+        for (const frame of frames) {
+          dispatchAskSseFrame(frame, handlers);
+        }
+      }
+      if (done) {
+        buffer += decoder.decode();
+        for (const frame of buffer.split(/\r?\n\r?\n/)) {
+          dispatchAskSseFrame(frame, handlers);
+        }
+        break;
       }
     }
-    if (dataLines.length === 0) continue;
-    const rawData = dataLines.join("\n");
-    try {
-      const parsed = JSON.parse(rawData) as Record<string, unknown>;
-      if (eventName === "ai.citation") {
-        handlers.onCitation?.(parsed as unknown as AiCitation);
-      } else if (eventName === "ai.token") {
-        const delta = typeof parsed.delta === "string" ? parsed.delta : "";
-        handlers.onToken?.(delta);
-      } else if (eventName === "ai.done") {
-        const model = typeof parsed.model === "string" ? parsed.model : "";
-        handlers.onDone?.(model);
-      }
-    } catch {
-      // ignore non-JSON frame
-    }
+  } finally {
+    reader.releaseLock();
   }
 }

@@ -6,9 +6,14 @@ cd "$ROOT_DIR"
 
 LIVE_DATA="$(mktemp -d /tmp/vellum-live.XXXXXX)"
 SERVE_PID=""
+MOCK_LLM_PID=""
 SERVE_LOG="$LIVE_DATA/mo-serve.log"
 
 cleanup() {
+  if [[ -n "${MOCK_LLM_PID:-}" ]]; then
+    kill "$MOCK_LLM_PID" 2>/dev/null || true
+    wait "$MOCK_LLM_PID" 2>/dev/null || true
+  fi
   if [[ -n "${SERVE_PID:-}" ]]; then
     kill "$SERVE_PID" 2>/dev/null || true
     wait "$SERVE_PID" 2>/dev/null || true
@@ -63,6 +68,90 @@ export VELLUM_S3_REGION="us-east-1"
 export VELLUM_S3_ACCESS_KEY_ID="vellum"
 export VELLUM_S3_SECRET_ACCESS_KEY="vellum-dev-secret-key"
 export VELLUM_S3_PATH_STYLE="1"
+
+echo "==> Starting local mock OpenAI SSE server for live streaming Ask Workspace test"
+node --input-type=module - "$LIVE_DATA/mock-llm.port" <<'MOCK_EOF' &
+import http from "node:http";
+import fs from "node:fs";
+
+const portFile = process.argv[2];
+let lastBody = null;
+
+const server = http.createServer((req, res) => {
+  if (req.method === "GET" && req.url === "/_last") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ lastBody }));
+    return;
+  }
+  if (req.method === "POST" && req.url === "/v1/chat/completions") {
+    if (req.headers.authorization !== "Bearer test-live-vellum-key") {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "unauthorized" }));
+      return;
+    }
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf8");
+      try {
+        lastBody = JSON.parse(raw);
+      } catch {
+        res.writeHead(400);
+        res.end("bad json");
+        return;
+      }
+      if (lastBody.stream !== true) {
+        res.writeHead(400);
+        res.end("expected stream:true");
+        return;
+      }
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache",
+      });
+      const tokens = ["Rotate ", "gateway ", "keys."];
+      let i = 0;
+      const timer = setInterval(() => {
+        if (i < tokens.length) {
+          const payload = JSON.stringify({ choices: [{ delta: { content: tokens[i] } }] });
+          res.write(`data: ${payload}\n\n`);
+          i += 1;
+        } else {
+          clearInterval(timer);
+          res.write("data: [DONE]\n\n");
+          res.end();
+        }
+      }, 120);
+      res.on("close", () => clearInterval(timer));
+    });
+    return;
+  }
+  res.writeHead(404);
+  res.end("not found");
+});
+
+server.listen(0, "127.0.0.1", () => {
+  const addr = server.address();
+  fs.writeFileSync(portFile, String(addr.port), "utf8");
+});
+MOCK_EOF
+MOCK_LLM_PID=$!
+
+for i in $(seq 1 30); do
+  if [[ -f "$LIVE_DATA/mock-llm.port" ]]; then
+    break
+  fi
+  sleep 0.1
+done
+if [[ ! -f "$LIVE_DATA/mock-llm.port" ]]; then
+  echo "Timed out waiting for mock OpenAI SSE server" >&2
+  exit 1
+fi
+MOCK_LLM_PORT="$(cat "$LIVE_DATA/mock-llm.port")"
+export VELLUM_AI_API_KEY="test-live-vellum-key"
+export VELLUM_AI_PROVIDER="openai"
+export VELLUM_AI_BASE_URL="http://127.0.0.1:${MOCK_LLM_PORT}/v1/chat/completions"
+export VELLUM_AI_MODEL="gpt-4o-mini"
 
 mo serve "$ROOT_DIR/main.mo" \
   --bind 127.0.0.1 \
@@ -609,6 +698,91 @@ const replayedEv = await replayedClient.waitFor((e) => e.event === "claim.releas
 assert.ok(Number(replayedEv.id) > Number(lastSeenId), "replayed claim.released has newer id");
 replayedClient.close();
 console.log("✓ Live streaming SSE fanout (claims, blocks, MCP proposals) & Last-Event-ID replay verified");
+
+// 9. Live HTTP-to-SSE AI token streaming via POST /api/ai/ask
+const askXsrf = jar.getCookie(BASE, "XSRF-TOKEN");
+const askHeaders = new Headers({
+  Accept: "text/event-stream",
+  "Content-Type": "application/json",
+});
+const askCookie = jar.headerFor(BASE);
+if (askCookie) askHeaders.set("Cookie", askCookie);
+if (askXsrf) askHeaders.set("X-XSRF-TOKEN", decodeURIComponent(askXsrf));
+
+const askStartMs = Date.now();
+const askRes = await fetch(`${BASE}/api/ai/ask`, {
+  method: "POST",
+  headers: askHeaders,
+  body: JSON.stringify({
+    question: "gateway",
+    collection_id: null,
+    max_sources: 3,
+    stream: true,
+  }),
+});
+assert.equal(askRes.status, 200, `Expected 200 on POST /api/ai/ask, got ${askRes.status}`);
+assert.ok(
+  (askRes.headers.get("content-type") || "").startsWith("text/event-stream"),
+  "Ask SSE Content-Type"
+);
+assert.equal(askRes.headers.get("x-mo-sse-relay"), null, "Internal relay header stripped");
+
+const askReader = askRes.body.getReader();
+const askDecoder = new TextDecoder("utf-8");
+let askBuf = "";
+let firstCitationMs = null;
+let doneMs = null;
+let doneModel = null;
+const aiCitations = [];
+const aiTokens = [];
+
+while (true) {
+  const { value, done } = await askReader.read();
+  if (value) {
+    askBuf += askDecoder.decode(value, { stream: !done });
+    const frames = askBuf.split(/\r?\n\r?\n/);
+    askBuf = frames.pop() ?? "";
+    for (const rawFrame of frames) {
+      if (!rawFrame.trim()) continue;
+      let evName = "message";
+      const dataLines = [];
+      for (const line of rawFrame.split(/\r?\n/)) {
+        if (line.startsWith(":")) continue;
+        if (line.startsWith("event:")) evName = line.slice(6).trim();
+        else if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+      }
+      if (dataLines.length === 0) continue;
+      const joined = dataLines.join("\n");
+      assert.ok(!joined.includes("test-live-vellum-key"), "LLM API key must never leak");
+      const parsed = JSON.parse(joined);
+      if (evName === "ai.citation") {
+        if (firstCitationMs === null) firstCitationMs = Date.now();
+        aiCitations.push(parsed);
+      } else if (evName === "ai.token") {
+        aiTokens.push(parsed.delta);
+      } else if (evName === "ai.done") {
+        doneMs = Date.now();
+        doneModel = parsed.model;
+      } else if (evName === "ai.error") {
+        throw new Error(`Unexpected ai.error frame: ${joined}`);
+      }
+    }
+  }
+  if (done) break;
+}
+
+assert.ok(firstCitationMs !== null, "Expected ai.citation frame before tokens");
+assert.ok(doneMs !== null && doneModel === "gpt-4o-mini", "Expected ai.done frame with model");
+assert.ok(
+  aiCitations.some((c) => c.page_id === pageId && String(c.title).includes("Live Deployment Runbook")),
+  "Expected permitted Live Deployment Runbook citation"
+);
+assert.equal(aiTokens.join(""), "Rotate gateway keys.");
+assert.ok(
+  doneMs - firstCitationMs >= 200,
+  `Expected incremental token streaming over >=200ms (got ${doneMs - firstCitationMs}ms since citation, total ${doneMs - askStartMs}ms)`
+);
+console.log("✓ Live Ask Workspace HTTP-to-SSE incremental token streaming verified");
 EOF
 
 echo "All Live Vellum E2E checks against mo serve + Dex + VersityGW S3 passed."
