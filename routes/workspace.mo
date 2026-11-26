@@ -30,8 +30,10 @@ use Arvo.Inertia
 use Arvo.Modb.Jobs
 use Arvo.Modb.Sessions
 use Arvo.S3
+use Arvo.Webhooks
 use Db
 use Domain.Blocks
+use Domain.Collab{WebhookJobPayload}
 use Domain.Policy
 use Domain.Types{
   AppError,
@@ -1282,8 +1284,8 @@ fn audit_index(req: Api.Request, auth: AuthContext, rf: ReadFiles) : Result(Api.
   Ok(json_ok(200, Json.Object({"audit_feed": feed.to_json})))
 end
 
-## Periodic `mo serve` job handler draining outbox jobs and pruning expired MoDB sessions.
-fn drain_jobs(_payload: Json, files: Files, clock: Clock) : Result(Unit, AppError)
+## Periodic `mo serve` job handler draining indexing + signed webhook jobs and pruning expired MoDB sessions.
+fn drain_jobs(_payload: Json, files: Files, clock: Clock, net: Network) : Result(Unit, AppError)
   if files.read_only.exists?(Db.sessions_db_path)
     _pruned = try Sessions.prune_expired(files, Db.sessions_db_path, clock).map_error(
       Db.map_table_error
@@ -1298,14 +1300,64 @@ fn drain_jobs(_payload: Json, files: Files, clock: Clock) : Result(Unit, AppErro
   var keep_going = true
   var processed = 0
   while keep_going and processed < 25
-    claimed = try Jobs.claim_next(files, Db.ledger_db_path, clock, ["vellum.page.indexed"])
-      .map_error(Db.map_table_error)
+    claimed = try Jobs.claim_next(
+      files,
+      Db.ledger_db_path,
+      clock,
+      ["vellum.page.indexed", "vellum.webhook.deliver"]
+    ).map_error(Db.map_table_error)
     case claimed
       None: keep_going = false
       Some(job):
-        try Jobs.complete(files, Db.ledger_db_path, clock, job.id, job.attempts).map_error(
-          Db.map_table_error
-        )
+        if job.job_name == "vellum.webhook.deliver"
+          case Json.decode_strict[WebhookJobPayload](job.payload_json.bytes)
+            Error(e): try Jobs.fail_or_retry(
+              files,
+              Db.ledger_db_path,
+              clock,
+              job.id,
+              job.attempts,
+              e.to_text
+            ).map_error(Db.map_table_error)
+            Ok(wp):
+              res = Webhooks.deliver(
+                wp.url,
+                wp.secret,
+                wp.delivery_id,
+                wp.event,
+                wp.body_json.to_text.bytes,
+                clock.now,
+                "X-Vellum-Signature-256",
+                net
+              )
+              case res
+                Ok(Webhooks.Delivered(status: _)) | Ok(
+                  Webhooks.PermanentFailure(status: _, reason: _)
+                ): try Jobs.complete(files, Db.ledger_db_path, clock, job.id, job.attempts)
+                  .map_error(Db.map_table_error)
+                Ok(Webhooks.RetryableFailure(status: _, reason: r)): try Jobs.fail_or_retry(
+                  files,
+                  Db.ledger_db_path,
+                  clock,
+                  job.id,
+                  job.attempts,
+                  r
+                ).map_error(Db.map_table_error)
+                Error(we): try Jobs.fail_or_retry(
+                  files,
+                  Db.ledger_db_path,
+                  clock,
+                  job.id,
+                  job.attempts,
+                  we.to_text
+                ).map_error(Db.map_table_error)
+              end
+          end
+        else
+          try Jobs.complete(files, Db.ledger_db_path, clock, job.id, job.attempts).map_error(
+            Db.map_table_error
+          )
+        end
         processed += 1
     end
   end

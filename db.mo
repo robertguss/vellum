@@ -50,8 +50,20 @@ encode_db_cell_key,
 lookup_row_ids_by_cell,
 tx_put_db_row,
 tx_delete_db_row,
-enrich_rows_with_rollups
+enrich_rows_with_rollups,
+proposals_by_status,
+proposals_by_page,
+proposals_table,
+webhooks_by_workspace,
+webhooks_table,
+map_claims_error,
+map_world_error,
+map_replay_error,
+tx_apply_world_patch,
+world_catalog,
+replay_catalog
 use Domain.Blocks
+use Domain.Collab{ProposalMeta, WebhookSub, WorldPatchArgs}
 use Domain.DatabaseModel{
   CellValue,
   DatabaseDef,
@@ -81,15 +93,19 @@ use Domain.Types{
   PrincipalKind,
   SearchResultItem,
   Workspace,
-  WorkspaceRole
+  WorkspaceRole,
+  to_text
 }
 use Json
 use Modb{Store, WriteTx}
+use Modb.Claims
 use Modb.Errors
 use Modb.Fts
 use Modb.Grants
 use Modb.Ledger
+use Modb.Replay
 use Modb.Table
+use Modb.World
 
 sessions_db_path = "sessions.modb"
 ledger_db_path = "vellum.modb"
@@ -204,6 +220,28 @@ fn db_rows_table() : Table.Table(Text, DbRow)
   Table.text_key[DbRow]("vlm_db_rows").with_index(db_rows_by_database())
 end
 
+fn proposals_by_status() : Table.Index(Text, ProposalMeta, Text)
+  Table.text_index[Text, ProposalMeta]("vlm_proposals_by_status", fn(p) p.status end)
+end
+
+fn proposals_by_page() : Table.Index(Text, ProposalMeta, Text)
+  Table.text_index[Text, ProposalMeta]("vlm_proposals_by_page", fn(p) p.target_page_id end)
+end
+
+fn proposals_table() : Table.Table(Text, ProposalMeta)
+  Table.text_key[ProposalMeta]("vlm_proposals").with_index(proposals_by_status()).with_index(
+    proposals_by_page()
+  )
+end
+
+fn webhooks_by_workspace() : Table.Index(Text, WebhookSub, Text)
+  Table.text_index[Text, WebhookSub]("vlm_webhooks_by_workspace", fn(w) w.workspace_id end)
+end
+
+fn webhooks_table() : Table.Table(Text, WebhookSub)
+  Table.text_key[WebhookSub]("vlm_webhooks").with_index(webhooks_by_workspace())
+end
+
 ## Converts `Modb.Table` errors to `AppError`.
 fn map_table_error(err: Table.TableError) : AppError
   case err
@@ -247,6 +285,55 @@ fn map_fts_error(err: Fts.FtsError) : AppError
   case err
     Fts.InvalidConfig(reason: _) | Fts.InvalidDocument(reason: _): BadInput(reason: err.to_text)
     Fts.Storage(_) | Fts.TableFailure(_): ServerFailed(reason: err.to_text)
+  end
+end
+
+## Converts `Modb.Claims` errors to `AppError`.
+fn map_claims_error(err: Claims.ClaimError) : AppError
+  case err
+    Claims.AlreadyClaimed(resource: _, holder: _, expires_at: _): Conflict(reason: err.to_text)
+    Claims.ClaimNotFound(resource: _): Missing(entity: "claim", id: err.to_text)
+    Claims.NotHolder(resource: _, expected: _, actual: _): Forbidden(reason: err.to_text)
+    Claims.InvalidClaim(reason: _): BadInput(reason: err.to_text)
+    Claims.LedgerFailure(le): map_ledger_error(le)
+  end
+end
+
+## Converts `Modb.World` errors to `AppError`.
+fn map_world_error(err: World.WorldError) : AppError
+  case err
+    World.WorldNotFound(id: wid): Missing(entity: "world", id: wid)
+    World.WorldNotOpen(id: _, status: _) | World.WorldExpired(id: _) | World.StaleRead(
+      query: _,
+      args: _,
+      expected: _,
+      actual: _
+    ): Conflict(reason: err.to_text)
+    World.GrantFailure(ge): map_grants_error(ge)
+    World.LedgerFailure(le): map_ledger_error(le)
+    World.ActionRejected(action: _, detail: _) | World.InvariantRejected(name: _, detail: _) | World
+      .UnknownQuery(name: _) | World.UnknownAction(name: _) | World.QueryFailed(query: _, detail: _) | World
+      .WorldAlreadyExists(id: _): BadInput(reason: err.to_text)
+  end
+end
+
+## Converts `Modb.Replay` errors to `AppError`.
+fn map_replay_error(err: Replay.ReplayError) : AppError
+  case err
+    Replay.ProposalNotFound(id: pid): Missing(entity: "replay_proposal", id: pid)
+    Replay.ProposalNotPending(id: _, status: _) | Replay.ProposalAlreadyExists(id: _) | Replay
+      .ProposalStale(
+        id: _,
+        expected_audit_seq: _,
+        actual_audit_seq: _,
+        expected_call_seq: _,
+        actual_call_seq: _
+      ): Conflict(reason: err.to_text)
+    Replay.GrantFailure(ge): map_grants_error(ge)
+    Replay.LedgerFailure(le): map_ledger_error(le)
+    Replay.ExportFailure(_) | Replay.UnknownReplayAction(action: _, schema_version: _) | Replay
+      .MissingReplayMigration(version: _) | Replay.ReplayActionRejected(action: _, detail: _) | Replay
+      .ReplayFailed(detail: _): BadInput(reason: err.to_text)
   end
 end
 
@@ -915,6 +1002,103 @@ fn enrich_rows_with_rollups(store: Store, def: DatabaseDef, rows: List(DbRow)) :
     enriched = enriched.append(EnrichedRow(row: r, rollups: roll_map))
   end
   Ok(enriched)
+end
+
+## Replayable `Modb.World` + `Modb.Replay` action handler applying surgical `BlockOp`s to a page inside `tx`.
+fn tx_apply_world_patch(tx: WriteTx, args_json: Json) : Result((WriteTx, Json), Text)
+  args = try Json.decode_strict[WorldPatchArgs](args_json.to_text.bytes).map_error(
+    fn(e) e.to_text end
+  )
+  old_page = case try Table.tx_get(tx, pages_table(), args.page_id).map_error(fn(e) e.to_text end)
+    Some(p) if p.archived_at == None: p
+    Some(_) | None: return Error("page '#{args.page_id}' not found or archived")
+  end
+
+  existing_rows = try Table.tx_lookup(tx, blocks_table(), blocks_by_page(), args.page_id).map_error(
+    fn(e) e.to_text end
+  )
+  existing_blocks = Blocks.sort_blocks(existing_rows.map(fn(x) x.1 end))
+
+  var ver_by_id = {}
+  for b in existing_blocks
+    ver_by_id = ver_by_id.set(b.id, b.version)
+  end
+  for (bid, exp_ver) in args.expected_versions.entries
+    case ver_by_id.get(bid)
+      None: return Error("block '#{bid}' not found")
+      Some(actual_ver):
+        if actual_ver != exp_ver
+          return Error("expected version #{exp_ver} on block '#{bid}', found #{actual_ver}")
+        end
+    end
+  end
+
+  updated_blocks = try Blocks.apply_block_ops(
+    existing_blocks,
+    args.ops,
+    args.page_id,
+    args.provenance,
+    args.new_ids
+  )
+  bumped_page = Page(
+    id: old_page.id,
+    collection_id: old_page.collection_id,
+    parent_page_id: old_page.parent_page_id,
+    title: old_page.title,
+    icon: old_page.icon,
+    cover_attachment_id: old_page.cover_attachment_id,
+    kind: old_page.kind,
+    sort_order: old_page.sort_order,
+    database_id: old_page.database_id,
+    freshness_ttl_days: old_page.freshness_ttl_days,
+    verified_at: old_page.verified_at,
+    verified_by: old_page.verified_by,
+    created_by: old_page.created_by,
+    created_at: old_page.created_at,
+    updated_at: args.updated_at,
+    archived_at: old_page.archived_at,
+    version: old_page.version + 1
+  )
+  next_tx = try tx_save_page_and_blocks(tx, bumped_page, updated_blocks).map_error(to_text)
+  Ok((
+    next_tx,
+    Json.Object({
+      "page_id": Json.String(bumped_page.id),
+      "page_version": Json.int(bumped_page.version),
+      "block_count": Json.int(updated_blocks.size)
+    })
+  ))
+end
+
+## Speculative `Modb.World` catalog registering `read_page` (O(diff) key-scoped) and `propose`.
+fn world_catalog() : World.Catalog
+  tcodec = Table.text_codec()
+  p_bucket = pages_table().bucket
+  World.with_action(
+    World.with_key_scoped_query(
+      World.catalog(),
+      "read_page",
+      p_bucket,
+      fn(args)
+        pid = try args.text_at("page_id").or_fail("read_page requires string 'page_id'")
+        Ok(tcodec.encode(pid))
+      end,
+      fn(tx, args)
+        pid = try args.text_at("page_id").or_fail("read_page requires string 'page_id'")
+        case try Table.tx_get(tx, pages_table(), pid).map_error(fn(e) e.to_text end)
+          Some(p): Ok(Json.Object({"id": Json.String(p.id), "version": Json.int(p.version)}))
+          None: Error("page '#{pid}' not found")
+        end
+      end
+    ),
+    "propose",
+    tx_apply_world_patch
+  )
+end
+
+## Offline `Modb.Replay` catalog pairing the exact `"propose"` handler for selective agent undo.
+fn replay_catalog() : Replay.ReplayCatalog
+  Replay.with_action(Replay.catalog(), "propose", tx_apply_world_patch)
 end
 
 test "Db schema, JIT OIDC human provisioning, page/block FTS indexing, and agent minting"
