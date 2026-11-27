@@ -141,7 +141,31 @@ scan_db_rows,
 get_db_row,
 tx_get_db_row,
 get_database,
-tx_get_database
+tx_get_database,
+get_collection,
+get_principal,
+get_page,
+get_proposal,
+get_attachment,
+tx_get_attachment,
+scan_databases,
+scan_pages,
+scan_proposals,
+tx_get_page,
+tx_get_proposal,
+tx_lookup_blocks_by_page,
+lookup_db_rows_by_database,
+get_page_meta,
+tx_get_page_meta,
+get_blueprint,
+tx_get_blueprint,
+lookup_comments_by_page,
+tx_lookup_comments_by_page,
+scan_webhooks,
+tx_put_blueprint,
+tx_put_attachment,
+tx_put_pack,
+tx_put_ai_col_usage
 use Domain.Blocks
 use Domain.Blueprints{BlueprintDef, PageBlueprintMeta}
 use Domain.Formulas{FormulaRelatedRow}
@@ -2259,14 +2283,202 @@ fn tx_apply_page_patch_inner(
   ))
 end
 
-## Decodes `WorldBranchArgs` once to avoid duplicate monomorphic JSON decoders.
-fn decode_world_branch_args(args_json: Json) : Result(WorldBranchArgs, Text)
-  Json.decode_strict[WorldBranchArgs](args_json.to_text.bytes).map_error(fn(e) e.to_text end)
+fn db_req_text(j: Json, field: Text) : Result(Text, Text)
+  case j.text_at(field)
+    Some(s): Ok(s)
+    None: Error("missing string field '#{field}'")
+  end
 end
 
-## Decodes `WorldPatchArgs` once to avoid duplicate monomorphic JSON decoders.
+fn db_req_opt_text(j: Json, field: Text) : Result(Option(Text), Text)
+  case j.get(field)
+    None | Some(Json.Null): Ok(None)
+    Some(Json.String(s)): Ok(Some(s))
+    Some(Json.Boolean(_)) | Some(Json.Number(_)) | Some(Json.Array(_)) | Some(Json.Object(_)):
+      Error("field '#{field}' must be string or null")
+  end
+end
+
+fn db_req_bool(j: Json, field: Text) : Result(Bool, Text)
+  case j.get(field)
+    Some(Json.Boolean(b)): Ok(b)
+    None | Some(Json.Null) | Some(Json.Number(_)) | Some(Json.String(_)) | Some(Json.Array(_)) |
+      Some(Json.Object(_)): Error("missing boolean field '#{field}'")
+  end
+end
+
+fn db_req_opt_int(j: Json, field: Text) : Result(Option(Int), Text)
+  case j.get(field)
+    None | Some(Json.Null): Ok(None)
+    Some(v):
+      case Json.Object({"v": v}).int_at("v")
+        Some(n): Ok(Some(n))
+        None: Error("field '#{field}' must be integer or null")
+      end
+  end
+end
+
+fn db_req_str_list(j: Json, field: Text) : Result(List(Text), Text)
+  items = case j.get(field)
+    None: []
+    Some(Json.Array(xs)): xs
+    Some(Json.Null) | Some(Json.Boolean(_)) | Some(Json.Number(_)) | Some(Json.String(_)) | Some(
+      Json.Object(_)
+    ): return Error("field '#{field}' must be a JSON array")
+  end
+  var out = []
+  for item in items
+    case item
+      Json.String(s): out = out.append(s)
+      Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json.Object(_): return Error(
+        "field '#{field}' must contain strings only"
+      )
+    end
+  end
+  Ok(out)
+end
+
+fn db_req_time(j: Json, field: Text) : Result(Time, Text)
+  raw = try db_req_text(j, field)
+  case Time.parse(raw.trim)
+    Some(t): Ok(t)
+    None: Error("invalid ISO timestamp '#{raw}' in '#{field}'")
+  end
+end
+
+fn db_req_obj(j: Json, msg: Text) : Result(Json, Text)
+  case j
+    Json.Object(_): Ok(j)
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): Error(msg)
+  end
+end
+
+fn decode_ai_cell_meta_json(j: Json) : Result(AiCellMeta, Text)
+  _obj = try db_req_obj(j, "AiCellMeta must be an object")
+  Ok(
+    AiCellMeta(
+      id: try db_req_text(j, "id"),
+      database_id: try db_req_text(j, "database_id"),
+      row_id: try db_req_text(j, "row_id"),
+      prop_id: try db_req_text(j, "prop_id"),
+      model: try db_req_text(j, "model"),
+      prompt_hash: try db_req_text(j, "prompt_hash"),
+      input_hash: try db_req_text(j, "input_hash"),
+      stale: try db_req_bool(j, "stale"),
+      rationale: try db_req_opt_text(j, "rationale"),
+      citations: try Blocks.decode_citations_json(j.get("citations") or Json.Array([])),
+      proposal_id: try db_req_opt_text(j, "proposal_id"),
+      computed_at: try db_req_time(j, "computed_at")
+    )
+  )
+end
+
+fn decode_world_mutation_json(j: Json) : Result(WorldMutation, Text)
+  m = case j
+    Json.Object(om): om
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+      "mutation must be a JSON object"
+    )
+  end
+  if m.entries.size != 1
+    return Error("mutation object must have 1 variant key")
+  end
+  (k, val) = m.entries.first or ("", Json.Null)
+  _obj = try db_req_obj(val, "mutation '#{k}' payload must be an object")
+  if k == "patch_page_blocks"
+    Ok(
+      PatchPageBlocks(
+        page_id: try db_req_text(val, "page_id"),
+        ops: try Blocks.decode_block_ops_from_json(val.get("ops") or Json.Null),
+        new_ids: try db_req_str_list(val, "new_ids"),
+        provenance: try Blocks.decode_provenance_json(val.get("provenance") or Json.Null),
+        expected_versions: try Blocks.decode_version_map_json(
+          (val.get("expected_versions") or Json.Object({})).to_text.bytes
+        )
+      )
+    )
+  else if k == "create_db_row"
+    cells_j = try db_req_obj(val.get("cells") or Json.Null, "create_db_row requires 'cells' object")
+    Ok(
+      CreateDbRow(
+        database_id: try db_req_text(val, "database_id"),
+        row_id: try db_req_text(val, "row_id"),
+        page_id: try db_req_text(val, "page_id"),
+        cells: try DatabaseModel.decode_cell_map_json(cells_j.to_text.bytes),
+        markdown: try db_req_opt_text(val, "markdown"),
+        block_prefix: try db_req_text(val, "block_prefix"),
+        provenance: try Blocks.decode_provenance_json(val.get("provenance") or Json.Null)
+      )
+    )
+  else if k == "update_db_row"
+    cells_j = try db_req_obj(val.get("cells") or Json.Null, "update_db_row requires 'cells' object")
+    Ok(
+      UpdateDbRow(
+        database_id: try db_req_text(val, "database_id"),
+        row_id: try db_req_text(val, "row_id"),
+        cells: try DatabaseModel.decode_cell_map_json(cells_j.to_text.bytes),
+        expected_version: try db_req_opt_int(val, "expected_version"),
+        provenance: try Blocks.decode_provenance_json(val.get("provenance") or Json.Null)
+      )
+    )
+  else if k == "delete_db_row"
+    Ok(
+      DeleteDbRow(
+        database_id: try db_req_text(val, "database_id"),
+        row_id: try db_req_text(val, "row_id")
+      )
+    )
+  else if k == "update_db_schema"
+    props_opt = case val.get("properties")
+      None | Some(Json.Null): None
+      Some(pv): Some(try DatabaseModel.decode_property_defs_json(pv.to_text.bytes))
+    end
+    Ok(
+      UpdateDbSchema(
+        database_id: try db_req_text(val, "database_id"),
+        title: try db_req_opt_text(val, "title"),
+        description: try db_req_opt_text(val, "description"),
+        properties: props_opt,
+        expected_version: try db_req_opt_int(val, "expected_version")
+      )
+    )
+  else if k == "put_ai_cell_meta"
+    Ok(
+      PutAiCellMeta(
+        meta: try decode_ai_cell_meta_json(val.get("meta") or Json.Null)
+      )
+    )
+  else
+    Error("unknown WorldMutation '#{k}'")
+  end
+end
+
+## Decodes `WorldBranchArgs` without generic `Json.decode_strict` lowering.
+fn decode_world_branch_args(args_json: Json) : Result(WorldBranchArgs, Text)
+  _obj = try db_req_obj(args_json, "WorldBranchArgs must be a JSON object")
+  Ok(
+    WorldBranchArgs(
+      mutation: try decode_world_mutation_json(args_json.get("mutation") or Json.Null),
+      updated_at: try db_req_time(args_json, "updated_at")
+    )
+  )
+end
+
+## Decodes `WorldPatchArgs` without generic `Json.decode_strict` lowering.
 fn decode_world_patch_args(args_json: Json) : Result(WorldPatchArgs, Text)
-  Json.decode_strict[WorldPatchArgs](args_json.to_text.bytes).map_error(fn(e) e.to_text end)
+  _obj = try db_req_obj(args_json, "WorldPatchArgs must be a JSON object")
+  Ok(
+    WorldPatchArgs(
+      page_id: try db_req_text(args_json, "page_id"),
+      ops: try Blocks.decode_block_ops_from_json(args_json.get("ops") or Json.Null),
+      new_ids: try db_req_str_list(args_json, "new_ids"),
+      provenance: try Blocks.decode_provenance_json(args_json.get("provenance") or Json.Null),
+      expected_versions: try Blocks.decode_version_map_json(
+        (args_json.get("expected_versions") or Json.Object({})).to_text.bytes
+      ),
+      updated_at: try db_req_time(args_json, "updated_at")
+    )
+  )
 end
 
 ## Replayable `Modb.World` + `Modb.Replay` action handler supporting both legacy `WorldPatchArgs`
@@ -2809,12 +3021,14 @@ fn ensure_ai_col_feed_locked(files: Files, db_id: Text, now: Time) : Result(Unit
       ledger_db_path,
       vellum_schema(),
       map_ledger_error,
-      fn(db) Feeds.get_feed(Ledger.store(db), fid).map_error(map_feeds_error) end
+      fn(db)
+        Ok(Json.Boolean((try Feeds.get_feed(Ledger.store(db), fid).map_error(map_feeds_error)) != None))
+      end
     )
   else
-    None
+    Json.Boolean(false)
   end
-  return Ok(Unit) if existing != None
+  return Ok(Unit) if existing == Json.Boolean(true)
 
   spec = Feeds.FeedSpec(
     id: fid,
@@ -2867,7 +3081,7 @@ fn sync_ai_col_feed_locked(files: Files, db_id: Text, now: Time) : Result(
     end
   end
 
-  stale_updates = try Ledger.read_locked(
+  stale_updates_j = try Ledger.read_locked(
     files.read_only,
     ledger_db_path,
     vellum_schema(),
@@ -2876,7 +3090,7 @@ fn sync_ai_col_feed_locked(files: Files, db_id: Text, now: Time) : Result(
       store = Ledger.store(db)
       def = case try Table.get(store, databases_table(), db_id).map_error(map_table_error)
         Some(d): d
-        None: return Ok([])
+        None: return Ok(Json.Array([]))
       end
       var prop_by_id = {}
       for p in def.properties
@@ -2931,14 +3145,23 @@ fn sync_ai_col_feed_locked(files: Files, db_id: Text, now: Time) : Result(
         row_touched? = touched_rows.get(row.id) != None
         if pr_hash != m.prompt_hash or in_hash != m.input_hash or row_touched?
           if pr_hash != m.prompt_hash or in_hash != m.input_hash
-            to_mark = to_mark.append(m)
+            to_mark = to_mark.append(
+              Json.Object({
+                "id": Json.String(m.id),
+                "input_hash": Json.String(m.input_hash)
+              })
+            )
           end
         end
       end
-      Ok(to_mark)
+      Ok(Json.Array(to_mark))
     end
   )
 
+  stale_updates = case stale_updates_j
+    Json.Array(xs): xs
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Object(_): []
+  end
   var marked = 0
   if not stale_updates.empty?
     wmeta = Ledger.WriteMeta(
@@ -2947,7 +3170,7 @@ fn sync_ai_col_feed_locked(files: Files, db_id: Text, now: Time) : Result(
       reason: "mark drifted AI-compiled cells stale via Modb.Feeds on #{db_id}",
       at: now
     )
-    marked = try Ledger.transact_locked(
+    marked_j = try Ledger.transact_locked(
       files,
       ledger_db_path,
       vellum_schema(),
@@ -2958,9 +3181,11 @@ fn sync_ai_col_feed_locked(files: Files, db_id: Text, now: Time) : Result(
       fn(tx)
         var t = tx
         var cnt = 0
-        for stale_m in stale_updates
-          case try Table.tx_get(t, ai_cell_meta_table(), stale_m.id).map_error(map_table_error)
-            Some(cur) if not cur.stale and cur.input_hash == stale_m.input_hash:
+        for smj in stale_updates
+          sm_id = smj.text_at("id") or ""
+          sm_hash = smj.text_at("input_hash") or ""
+          case try Table.tx_get(t, ai_cell_meta_table(), sm_id).map_error(map_table_error)
+            Some(cur) if not cur.stale and cur.input_hash == sm_hash:
               next_m = AiCellMeta(
                 id: cur.id,
                 database_id: cur.database_id,
@@ -2982,9 +3207,13 @@ fn sync_ai_col_feed_locked(files: Files, db_id: Text, now: Time) : Result(
             Some(_) | None: Unit
           end
         end
-        Ok((t, cnt))
+        Ok((t, Json.int(cnt)))
       end
     )
+    marked = case marked_j
+      Json.Number(_): Json.Object({"v": marked_j}).int_at("v") or 0
+      Json.Null | Json.Boolean(_) | Json.String(_) | Json.Array(_) | Json.Object(_): 0
+    end
   end
 
   Ok(
@@ -3825,4 +4054,100 @@ end
 
 fn tx_get_database(tx: WriteTx, id: Text) : Result(Option(DatabaseDef), AppError)
   Table.tx_get(tx, databases_table(), id).map_error(map_table_error)
+end
+
+fn get_collection(store: Store, id: Text) : Result(Option(Collection), AppError)
+  Table.get(store, collections_table(), id).map_error(map_table_error)
+end
+
+fn get_principal(store: Store, id: Text) : Result(Option(Principal), AppError)
+  Table.get(store, principals_table(), id).map_error(map_table_error)
+end
+
+fn get_page(store: Store, id: Text) : Result(Option(Page), AppError)
+  Table.get(store, pages_table(), id).map_error(map_table_error)
+end
+
+fn get_proposal(store: Store, id: Text) : Result(Option(ProposalMeta), AppError)
+  Table.get(store, proposals_table(), id).map_error(map_table_error)
+end
+
+fn get_attachment(store: Store, id: Text) : Result(Option(Attachment), AppError)
+  Table.get(store, attachments_table(), id).map_error(map_table_error)
+end
+
+fn tx_get_attachment(tx: WriteTx, id: Text) : Result(Option(Attachment), AppError)
+  Table.tx_get(tx, attachments_table(), id).map_error(map_table_error)
+end
+
+fn scan_databases(store: Store, limit: Int) : Result(List((Text, DatabaseDef)), AppError)
+  Table.scan(store, databases_table(), None, None, limit).map_error(map_table_error)
+end
+
+fn scan_pages(store: Store, limit: Int) : Result(List((Text, Page)), AppError)
+  Table.scan(store, pages_table(), None, None, limit).map_error(map_table_error)
+end
+
+fn scan_proposals(store: Store, limit: Int) : Result(List((Text, ProposalMeta)), AppError)
+  Table.scan(store, proposals_table(), None, None, limit).map_error(map_table_error)
+end
+
+fn tx_get_page(tx: WriteTx, id: Text) : Result(Option(Page), AppError)
+  Table.tx_get(tx, pages_table(), id).map_error(map_table_error)
+end
+
+fn tx_get_proposal(tx: WriteTx, id: Text) : Result(Option(ProposalMeta), AppError)
+  Table.tx_get(tx, proposals_table(), id).map_error(map_table_error)
+end
+
+fn tx_lookup_blocks_by_page(tx: WriteTx, page_id: Text) : Result(List((Text, Block)), AppError)
+  Table.tx_lookup(tx, blocks_table(), blocks_by_page(), page_id).map_error(map_table_error)
+end
+
+fn lookup_db_rows_by_database(store: Store, db_id: Text) : Result(List((Text, DbRow)), AppError)
+  Table.lookup(store, db_rows_table(), db_rows_by_database(), db_id).map_error(map_table_error)
+end
+
+fn get_page_meta(store: Store, page_id: Text) : Result(Option(PageBlueprintMeta), AppError)
+  Table.get(store, page_meta_table(), page_id).map_error(map_table_error)
+end
+
+fn tx_get_page_meta(tx: WriteTx, page_id: Text) : Result(Option(PageBlueprintMeta), AppError)
+  Table.tx_get(tx, page_meta_table(), page_id).map_error(map_table_error)
+end
+
+fn get_blueprint(store: Store, id: Text) : Result(Option(BlueprintDef), AppError)
+  Table.get(store, blueprints_table(), id).map_error(map_table_error)
+end
+
+fn tx_get_blueprint(tx: WriteTx, id: Text) : Result(Option(BlueprintDef), AppError)
+  Table.tx_get(tx, blueprints_table(), id).map_error(map_table_error)
+end
+
+fn lookup_comments_by_page(store: Store, page_id: Text) : Result(List((Text, Comment)), AppError)
+  Table.lookup(store, comments_table(), comments_by_page(), page_id).map_error(map_table_error)
+end
+
+fn tx_lookup_comments_by_page(tx: WriteTx, page_id: Text) : Result(List((Text, Comment)), AppError)
+  Table.tx_lookup(tx, comments_table(), comments_by_page(), page_id).map_error(map_table_error)
+end
+
+fn scan_webhooks(store: Store, limit: Int) : Result(List((Text, WebhookSub)), AppError)
+  Table.scan(store, webhooks_table(), None, None, limit).map_error(map_table_error)
+end
+
+fn tx_put_blueprint(tx: WriteTx, bp: BlueprintDef) : Result(WriteTx, AppError)
+  Table.put(tx, blueprints_table(), bp.id, bp).map_error(map_table_error)
+end
+
+fn tx_put_attachment(tx: WriteTx, att: Attachment) : Result(WriteTx, AppError)
+  Table.put(tx, attachments_table(), att.id, att).map_error(map_table_error)
+end
+
+fn tx_put_pack(tx: WriteTx, pk: ContextPack) : Result(WriteTx, AppError)
+  Table.put(tx, packs_table(), pk.id, pk).map_error(map_table_error)
+end
+
+fn tx_put_ai_col_usage(tx: WriteTx, u: AiColumnUsage) : Result(WriteTx, AppError)
+  Table.put(tx, ai_col_usage_table(), u.id, u).map_error(map_table_error)
 end

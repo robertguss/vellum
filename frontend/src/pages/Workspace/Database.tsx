@@ -9,6 +9,7 @@ import {
   GitBranch,
   Layers,
   LayoutGrid,
+  MessageSquare,
   Pencil,
   Play,
   Plus,
@@ -49,6 +50,7 @@ import type {
   DbViewKind,
   EnrichedRow,
   FilterOp,
+  OriginChatThreadLink,
   PrincipalSummary,
   PropertyDef,
   ProposalMeta,
@@ -69,6 +71,7 @@ interface DatabasePageProps {
   scenarios?: ProposalMeta[];
   ai_cell_meta?: Record<string, AiCellMeta>;
   ai_usage?: Record<string, AiColumnUsageSummary>;
+  row_chat_links?: Record<string, OriginChatThreadLink[]>;
 }
 
 function encodeInputToCell(prop: PropertyDef, raw: string): CellValue {
@@ -108,6 +111,7 @@ export default function DatabaseView({
   scenarios: initialScenarios = [],
   ai_cell_meta: initialAiCellMeta = {},
   ai_usage: initialAiUsage = {},
+  row_chat_links: initialRowChatLinks = {},
 }: DatabasePageProps) {
   const [liveDb, setLiveDb] = useState<DatabaseDef>(initialDatabase);
   const [views, setViews] = useState<DbViewDef[]>(initialViews);
@@ -1703,15 +1707,28 @@ export default function DatabaseView({
                           </td>
                         ))}
                         <td className="px-3 py-2.5 text-right whitespace-nowrap">
-                          <button
-                            type="button"
-                            disabled={busy}
-                            onClick={() => void handleDeleteRow(er)}
-                            className="rounded p-1 text-stone-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-40"
-                            title="Delete row"
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </button>
+                          <div className="inline-flex items-center gap-1.5">
+                            {(initialRowChatLinks[er.row.id] ?? []).slice(0, 2).map((ot) => (
+                              <Link
+                                key={`${ot.channel_id}-${ot.message_id}`}
+                                href={ot.url}
+                                title={`Origin thread in #${ot.channel_name}: ${ot.preview}`}
+                                className="inline-flex items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[10px] font-medium text-sky-800 hover:bg-sky-100"
+                              >
+                                <MessageSquare className="h-2.5 w-2.5" />
+                                #{ot.channel_name}
+                              </Link>
+                            ))}
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => void handleDeleteRow(er)}
+                              className="rounded p-1 text-stone-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-40"
+                              title="Delete row"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     );
@@ -1884,6 +1901,20 @@ export default function DatabaseView({
                                     </span>
                                   );
                                 })}
+                              </div>
+                            )}
+                            {(initialRowChatLinks[er.row.id] ?? []).length > 0 && (
+                              <div className="flex flex-wrap gap-1 pt-0.5">
+                                {(initialRowChatLinks[er.row.id] ?? []).slice(0, 2).map((ot) => (
+                                  <Link
+                                    key={`${ot.channel_id}-${ot.message_id}`}
+                                    href={ot.url}
+                                    className="inline-flex items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[10px] font-medium text-sky-800 hover:bg-sky-100"
+                                  >
+                                    <MessageSquare className="h-2.5 w-2.5" />
+                                    #{ot.channel_name}
+                                  </Link>
+                                ))}
                               </div>
                             )}
 

@@ -53,6 +53,7 @@ mo check routes/auth.mo
 mo check routes/workspace.mo
 mo check routes/vault.mo
 mo check routes/chat.mo
+mo check routes/chat-moat.mo
 mo check routes/databases.mo
 mo check routes/collab.mo
 mo check routes/mcp.mo
@@ -98,6 +99,7 @@ mo check tests/v3m2a.mo
 mo check tests/v3m2b.mo
 mo check tests/v3m3a.mo
 mo check tests/v3m3a-vault.mo
+mo check tests/v3m3b.mo
 
 mo test domain/blocks.mo
 mo test domain/policy.mo
@@ -136,5 +138,6 @@ mo test tests/v3m2a.mo
 mo test tests/v3m2b.mo
 mo test tests/v3m3a.mo
 mo test tests/v3m3a-vault.mo
+mo test tests/v3m3b.mo
 
 echo "All Vellum Stage 1-5 checks, frontend build checks, and tests passed."

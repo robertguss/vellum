@@ -42,6 +42,7 @@ import type {
   EditorLens,
   ExplicitBacklink,
   GardenCitationDrift,
+  OriginChatThreadLink,
   Page,
   PageBlueprintMeta,
   PageTaintProvenance,
@@ -79,6 +80,7 @@ interface PageProps {
   taint_provenance?: PageTaintProvenance | null;
   secret_hints?: SecretHint[];
   collection_security?: CollectionSecuritySummary | null;
+  origin_chat_threads?: OriginChatThreadLink[];
 }
 
 async function sha256Hex(file: File): Promise<string> {
@@ -132,6 +134,7 @@ export default function PageView({
   taint_provenance = null,
   secret_hints = [],
   collection_security = null,
+  origin_chat_threads = [],
 }: PageProps) {
   const [page, setPage] = useState<Page>(initialPage);
   const [stagingDriftId, setStagingDriftId] = useState<string | null>(null);
@@ -1074,6 +1077,39 @@ export default function PageView({
             )}
           </section>
         </div>
+
+        {/* Originating Chat Discussions (ACL-filtered bidirectional links) */}
+        {origin_chat_threads.length > 0 && (
+          <section className="rounded-2xl border border-stone-200 bg-white p-5 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 text-sm font-semibold text-stone-900">
+                <MessageSquare className="h-4 w-4 text-sky-700" />
+                Originating Chat Threads ({origin_chat_threads.length})
+              </div>
+              <span className="text-[11px] font-mono text-stone-400">ACL-filtered</span>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+              {origin_chat_threads.map((ot) => (
+                <Link
+                  key={`${ot.channel_id}-${ot.message_id}`}
+                  href={ot.url}
+                  className="block rounded-xl border border-stone-200 bg-stone-50/70 p-3 hover:border-sky-300 hover:bg-sky-50/40 transition"
+                >
+                  <div className="flex items-center justify-between gap-2 text-xs">
+                    <span className="font-semibold text-stone-900 truncate">
+                      {ot.channel_kind === "dm" ? ot.channel_name : `#${ot.channel_name}`}
+                    </span>
+                    <span className="rounded-full bg-sky-50 border border-sky-200 px-2 py-0.5 font-mono text-[10px] text-sky-800 capitalize">
+                      {ot.link_kind}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs text-stone-600 line-clamp-2">{ot.preview}</p>
+                  <div className="mt-1.5 text-[11px] text-stone-400">@{ot.author_handle}</div>
+                </Link>
+              ))}
+            </div>
+          </section>
+        )}
       </div>
 
       {/* Right Slide-Over Inspector Drawer */}

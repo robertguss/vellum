@@ -217,13 +217,12 @@ end
 
 ## Scans all active workspace pages, blocks, comments, and database rows for exposed credentials/PII.
 fn scan_workspace_secrets(store: Store) : Result(List(Json), AppError)
-  rows = try Table.scan(store, Db.pages_table(), None, None, 500).map_error(Db.map_table_error)
+  rows = try Db.scan_pages(store, 500)
   var out = []
   for (_pid, pg) in rows
     if pg.archived_at == None
       blks = try Db.load_page_blocks(store, pg.id)
-      cmt_rows = try Table.lookup(store, Db.comments_table(), Db.comments_by_page(), pg.id)
-        .map_error(Db.map_table_error)
+      cmt_rows = try Db.lookup_comments_by_page(store, pg.id)
       cmts = cmt_rows.map(fn(x) x.1 end)
       for h in scan_page_secret_hints(store, pg, blks, cmts)
         out = out.append(h)
@@ -350,13 +349,12 @@ fn execute_secret_purge_locked(
       end
       case target_page_id_opt
         Some(pid):
-          pg = case try Table.get(store, Db.pages_table(), pid).map_error(Db.map_table_error)
+          pg = case try Db.get_page(store, pid)
             Some(p) if p.archived_at == None: p
             Some(_) | None: return Error(Missing(entity: "page", id: pid))
           end
           blks = try Db.load_page_blocks(store, pg.id)
-          cmt_rows = try Table.lookup(store, Db.comments_table(), Db.comments_by_page(), pg.id)
-            .map_error(Db.map_table_error)
+          cmt_rows = try Db.lookup_comments_by_page(store, pg.id)
           cmts = cmt_rows.map(fn(x) x.1 end)
           case (target_block_id_opt, target_comment_id_opt)
             (Some(bid), _):
@@ -404,18 +402,11 @@ fn execute_secret_purge_locked(
               end
           end
         None:
-          all_pgs = try Table.scan(store, Db.pages_table(), None, None, 500).map_error(
-            Db.map_table_error
-          )
+          all_pgs = try Db.scan_pages(store, 500)
           for (_pid, pg) in all_pgs
             if pg.archived_at == None
               blks = try Db.load_page_blocks(store, pg.id)
-              cmt_rows = try Table.lookup(
-                store,
-                Db.comments_table(),
-                Db.comments_by_page(),
-                pg.id
-              ).map_error(Db.map_table_error)
+              cmt_rows = try Db.lookup_comments_by_page(store, pg.id)
               cmts = cmt_rows.map(fn(x) x.1 end)
               for f in Secrets.scan_text(pg.title)
                 toks = append_unique_text(toks, f.raw_token)
@@ -462,18 +453,11 @@ fn execute_secret_purge_locked(
         None: Unit
       end
       if not toks.empty? and target_block_id_opt == None and target_comment_id_opt == None
-        all_pgs2 = try Table.scan(store, Db.pages_table(), None, None, 500).map_error(
-          Db.map_table_error
-        )
+        all_pgs2 = try Db.scan_pages(store, 500)
         for (_pid2, pg2) in all_pgs2
           if pg2.archived_at == None and not aff.contains?(pg2.id)
             blks2 = try Db.load_page_blocks(store, pg2.id)
-            cmt_rows2 = try Table.lookup(
-              store,
-              Db.comments_table(),
-              Db.comments_by_page(),
-              pg2.id
-            ).map_error(Db.map_table_error)
+            cmt_rows2 = try Db.lookup_comments_by_page(store, pg2.id)
             cmts2 = cmt_rows2.map(fn(x) x.1 end)
             row_hit? = case pg2.kind
               DatabaseRow(database_id: _, row_id: rid2):
@@ -602,8 +586,7 @@ fn execute_secret_purge_locked(
       for pid in affected_page_ids
         is_deleted_target = clean_mode == "delete_page" and target_page_id_opt == Some(pid)
         if is_deleted_target
-          cmt_rows = try Table.tx_lookup(cur, Db.comments_table(), Db.comments_by_page(), pid)
-            .map_error(Db.map_table_error)
+          cmt_rows = try Db.tx_lookup_comments_by_page(cur, pid)
           for (cid, _c) in cmt_rows
             cur = try Table.delete(cur, Db.comments_table(), cid).map_error(Db.map_table_error)
             c_cnt += 1
@@ -617,13 +600,12 @@ fn execute_secret_purge_locked(
           for (aid, _a) in att_rows
             cur = try Table.delete(cur, Db.attachments_table(), aid).map_error(Db.map_table_error)
           end
-          blk_rows = try Table.tx_lookup(cur, Db.blocks_table(), Db.blocks_by_page(), pid)
-            .map_error(Db.map_table_error)
+          blk_rows = try Db.tx_lookup_blocks_by_page(cur, pid)
           for (bid, _b) in blk_rows
             cur = try Db.tx_delete_block_row(cur, bid)
             b_cnt += 1
           end
-          case try Table.tx_get(cur, Db.page_meta_table(), pid).map_error(Db.map_table_error)
+          case try Db.tx_get_page_meta(cur, pid)
             Some(_pm): cur = try Db.tx_delete_page_meta(cur, pid)
             None: Unit
           end
@@ -638,7 +620,7 @@ fn execute_secret_purge_locked(
             Some(_sm): cur = try Db.tx_delete_summary(cur, skey)
             None: Unit
           end
-          case try Table.tx_get(cur, Db.pages_table(), pid).map_error(Db.map_table_error)
+          case try Db.tx_get_page(cur, pid)
             Some(pg_del):
               case pg_del.kind
                 DatabaseRow(database_id: db_id_del, row_id: rid_del):
@@ -651,10 +633,9 @@ fn execute_secret_purge_locked(
             None: Unit
           end
         else
-          case try Table.tx_get(cur, Db.pages_table(), pid).map_error(Db.map_table_error)
+          case try Db.tx_get_page(cur, pid)
             Some(pg):
-              blk_rows = try Table.tx_lookup(cur, Db.blocks_table(), Db.blocks_by_page(), pid)
-                .map_error(Db.map_table_error)
+              blk_rows = try Db.tx_lookup_blocks_by_page(cur, pid)
               var next_blks = []
               for (_bid, blk) in blk_rows
                 allow_blk = target_block_id_opt == None or target_block_id_opt == Some(blk.id)
@@ -693,8 +674,7 @@ fn execute_secret_purge_locked(
               end
               sorted_next_blks = Blocks.sort_blocks(next_blks)
 
-              cmt_rows = try Table.tx_lookup(cur, Db.comments_table(), Db.comments_by_page(), pid)
-                .map_error(Db.map_table_error)
+              cmt_rows = try Db.tx_lookup_comments_by_page(cur, pid)
               for (_cid, cmt) in cmt_rows
                 allow_cmt = target_comment_id_opt == None or target_comment_id_opt == Some(cmt.id)
                 if allow_cmt and not tokens.empty?
@@ -874,10 +854,9 @@ fn execute_secret_purge_locked(
       fn(tx)
         var cur = tx
         for pid in surviving_pids
-          case try Table.tx_get(cur, Db.pages_table(), pid).map_error(Db.map_table_error)
+          case try Db.tx_get_page(cur, pid)
             Some(pg):
-              b_rows = try Table.tx_lookup(cur, Db.blocks_table(), Db.blocks_by_page(), pid)
-                .map_error(Db.map_table_error)
+              b_rows = try Db.tx_lookup_blocks_by_page(cur, pid)
               extra_opt = case pg.kind
                 DatabaseRow(database_id: db_id, row_id: rid):
                   case (try Db.tx_get_database(cur, db_id), try Db.tx_get_db_row(cur, rid))

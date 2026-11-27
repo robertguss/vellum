@@ -412,6 +412,38 @@ fn normalize_search_mode(raw: Option(Text)) : Result(Text, AppError)
   end
 end
 
+fn decode_search_result_items_json(arr_j: Json) : List(SearchResultItem)
+  var items = []
+  case arr_j
+    Json.Array(raw_items):
+      for item in raw_items
+        score = case item.get("score")
+          Some(Json.Number(num)): num.to_float or 0.0
+          Some(_) | None: 0.0
+        end
+        vec_score = case item.get("vec_score")
+          Some(Json.Number(num)): num.to_float
+          Some(_) | None: None
+        end
+        items = items.append(
+          SearchResultItem(
+            page_id: item.text_at("page_id") or "",
+            collection_id: item.text_at("collection_id") or "",
+            title: item.text_at("title") or "",
+            score: score,
+            matched_terms: VaultOps.json_text_list_opt(item, "matched_terms") or [],
+            matched_fields: VaultOps.json_text_list_opt(item, "matched_fields") or [],
+            fts_rank: item.int_at("fts_rank"),
+            vec_rank: item.int_at("vec_rank"),
+            vec_score: vec_score
+          )
+        )
+      end
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Object(_): Unit
+  end
+  items
+end
+
 ## Executes fail-closed grant-filtered hybrid (`Modb.Fts` + `Modb.Vec` RRF), `bm25`, or `semantic` search
 ## strictly using `ReadFiles`, selecting the neural vector index when populated and gracefully falling
 ## back to the local 256-dim `Modb.Vec` sketch index otherwise (never calling external HTTP inside a lock).
@@ -437,13 +469,18 @@ fn execute_workspace_search(
   end
 
   if mode == "bm25"
-    hits = try Ledger.read_locked(
+    hits_j = try Ledger.read_locked(
       rf,
       Db.ledger_db_path,
       Db.vellum_schema(),
       Db.map_ledger_error,
-      fn(db) Db.search_pages(Ledger.store(db), auth, q, limit, prefix_last?, collection_filter) end
+      fn(db)
+        Db.search_pages(Ledger.store(db), auth, q, limit, prefix_last?, collection_filter).map(
+          fn(xs) Json.Array(xs.map(fn(x) x.to_json end)) end
+        )
+      end
     )
+    hits = decode_search_result_items_json(hits_j)
     return Ok(WorkspaceSearchOutcome(results: hits, mode: "bm25", vector_backend: "none"))
   end
 
@@ -455,14 +492,16 @@ fn execute_workspace_search(
       Some(Db.sketch_min_vec_score)
     )
     Some(ecfg):
-      has_neural = try Ledger.read_locked(
+      has_neural_j = try Ledger.read_locked(
         rf,
         Db.ledger_db_path,
         Db.vellum_schema(),
         Db.map_ledger_error,
-        fn(db) Db.neural_vec_populated(Ledger.store(db), ecfg.dimensions) end
+        fn(db)
+          Ok(Json.Boolean(try Db.neural_vec_populated(Ledger.store(db), ecfg.dimensions)))
+        end
       )
-      if has_neural
+      if has_neural_j == Json.Boolean(true)
         case fetch_embedding(ecfg, q, net)
           Ok(qv): (Some(qv), Db.neural_vec_index(ecfg.dimensions), "neural", Some(ecfg.min_score))
           Error(_): (
@@ -482,7 +521,7 @@ fn execute_workspace_search(
       end
   end
 
-  hits = try Ledger.read_locked(
+  hits_j = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -499,9 +538,10 @@ fn execute_workspace_search(
         prefix_last?,
         collection_filter,
         min_vec_score
-      )
+      ).map(fn(xs) Json.Array(xs.map(fn(x) x.to_json end)) end)
     end
   )
+  hits = decode_search_result_items_json(hits_j)
   Ok(WorkspaceSearchOutcome(results: hits, mode: mode, vector_backend: backend_label))
 end
 
@@ -704,7 +744,7 @@ fn draft_blocks(
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
-      pg = case try Table.get(store, Db.pages_table(), input.page_id).map_error(Db.map_table_error)
+      pg = case try Db.get_page(store, input.page_id)
         Some(p) if p.archived_at == None: p
         Some(_) | None: return Error(Missing(entity: "page", id: input.page_id))
       end
@@ -843,7 +883,7 @@ fn draft_blocks(
     reason: "open AI draft proposal on #{page_id}",
     at: now
   )
-  saved = try Ledger.transact_locked(
+  try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -861,7 +901,7 @@ fn draft_blocks(
         tx
       end
       t2 = try Db.tx_put_proposal(t1, pm)
-      Ok((t2, pm))
+      Ok((t2, Unit))
     end
   )
 
@@ -870,7 +910,7 @@ fn draft_blocks(
       201,
       Json.Object({
         "draft_markdown": Json.String(draft_md),
-        "proposal": saved.to_json,
+        "proposal": pm.to_json,
         "model": Json.String(cfg.model)
       })
     )
@@ -889,9 +929,7 @@ fn scan_garden_report(store: Store, auth_opt: Option(AuthContext), now: Time) : 
     Some(_) | None: None
   end
 
-  col_rows = try Table.scan(store, Db.collections_table(), None, None, 200).map_error(
-    Db.map_table_error
-  )
+  col_rows = try Db.scan_collections(store, 200)
   var col_ttl = {}
   for (cid, col) in col_rows
     case col.freshness_ttl_days
@@ -900,7 +938,7 @@ fn scan_garden_report(store: Store, auth_opt: Option(AuthContext), now: Time) : 
     end
   end
 
-  page_rows = try Table.scan(store, Db.pages_table(), None, None, 500).map_error(Db.map_table_error)
+  page_rows = try Db.scan_pages(store, 500)
   var active_pages = {}
   for (pid, p) in page_rows
     if p.archived_at == None
@@ -1168,9 +1206,7 @@ fn propose_garden_fix(
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
-      tpg = case try Table.get(store, Db.pages_table(), input.target_page_id).map_error(
-        Db.map_table_error
-      )
+      tpg = case try Db.get_page(store, input.target_page_id)
         Some(p) if p.archived_at == None: p
         Some(_) | None: return Error(Missing(entity: "page", id: input.target_page_id))
       end
@@ -1189,7 +1225,7 @@ fn propose_garden_fix(
 
       rpg_opt = case input.related_page_id
         Some(rpid) if not rpid.trim.empty?:
-          rp = case try Table.get(store, Db.pages_table(), rpid.trim).map_error(Db.map_table_error)
+          rp = case try Db.get_page(store, rpid.trim)
             Some(p) if p.archived_at == None: p
             Some(_) | None: return Error(Missing(entity: "page", id: rpid.trim))
           end
@@ -1201,9 +1237,7 @@ fn propose_garden_fix(
         Some(rbid) if not rbid.trim.empty?:
           case try Table.get(store, Db.blocks_table(), rbid.trim).map_error(Db.map_table_error)
             Some(rb):
-              rpg2 = case try Table.get(store, Db.pages_table(), rb.page_id).map_error(
-                Db.map_table_error
-              )
+              rpg2 = case try Db.get_page(store, rb.page_id)
                 Some(p) if p.archived_at == None: p
                 Some(_) | None: return Error(Missing(entity: "page", id: rb.page_id))
               end
@@ -1390,7 +1424,7 @@ fn propose_garden_fix(
     reason: reason_str,
     at: now
   )
-  saved = try Ledger.transact_locked(
+  try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -1412,22 +1446,22 @@ fn propose_garden_fix(
         tx
       end
       t2 = try Db.tx_put_proposal(t1, pm)
-      Ok((t2, pm))
+      Ok((t2, Unit))
     end
   )
 
   prop_ev = Json.Object({
-    "proposal_id": Json.String(saved.id),
+    "proposal_id": Json.String(pm.id),
     "page_id": Json.String(target_pg_id),
     "collection_id": Json.String(target_col_id),
-    "title": Json.String(saved.title),
+    "title": Json.String(pm.title),
     "actor": Json.String(auth.principal.handle)
   })
   Ok(
     json_ok(
       201,
       Json.Object({
-        "proposal": saved.to_json,
+        "proposal": pm.to_json,
         "kind": Json.String(kind),
         "target_page_id": Json.String(target_pg_id),
         "citations": cits.to_json,
@@ -1505,9 +1539,7 @@ fn refresh_ai_brief(
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
-      pg = case try Table.get(store, Db.pages_table(), input.page_id.trim).map_error(
-        Db.map_table_error
-      )
+      pg = case try Db.get_page(store, input.page_id.trim)
         Some(p) if p.archived_at == None: p
         Some(_) | None: return Error(Missing(entity: "page", id: input.page_id))
       end
@@ -1716,7 +1748,7 @@ fn refresh_ai_brief(
     reason: "stage refreshed ai-brief proposal on #{pg_id}",
     at: now
   )
-  saved = try Ledger.transact_locked(
+  try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -1734,7 +1766,7 @@ fn refresh_ai_brief(
         tx
       end
       t2 = try Db.tx_put_proposal(t1, pm)
-      Ok((t2, pm))
+      Ok((t2, Unit))
     end
   )
 
@@ -1742,7 +1774,7 @@ fn refresh_ai_brief(
     json_ok(
       201,
       Json.Object({
-        "proposal": saved.to_json,
+        "proposal": pm.to_json,
         "draft_markdown": Json.String(brief_md),
         "block_id": Json.String(target_blk_id),
         "model": Json.String(model_name)
@@ -1950,7 +1982,7 @@ fn ai_columns_status(
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
-      def = case try Table.get(store, Db.databases_table(), id).map_error(Db.map_table_error)
+      def = case try Db.get_database(store, id)
         Some(d): d
         None: return Error(Missing(entity: "database", id: id))
       end
@@ -1997,8 +2029,7 @@ fn ai_columns_status(
         end
       end
 
-      r_pairs = try Table.lookup(store, Db.db_rows_table(), Db.db_rows_by_database(), def.id)
-        .map_error(Db.map_table_error)
+      r_pairs = try Db.lookup_db_rows_by_database(store, def.id)
       var row_by_id = {}
       for (_rid, r) in r_pairs
         if r.archived_at == None
@@ -2107,20 +2138,18 @@ fn sync_ai_column_feed(
   if not files.read_only.exists?(Db.ledger_db_path)
     return Error(Missing(entity: "database", id: id))
   end
-  _def = try Ledger.read_locked(
+  _u = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
     fn(db)
-      d = case try Table.get(Ledger.store(db), Db.databases_table(), id).map_error(
-        Db.map_table_error
-      )
+      d = case try Db.get_database(Ledger.store(db), id)
         Some(x): x
         None: return Error(Missing(entity: "database", id: id))
       end
       try Policy.require_collection_access(auth, "read", d.collection_id)
-      Ok(d)
+      Ok(Unit)
     end
   )
   res = try Db.sync_ai_col_feed_locked(files, id, clock.now)
@@ -2159,20 +2188,35 @@ fn run_ai_column(
   now = clock.now
   day_iso = now.to_text.bytes.slice(0, 10).decode_utf8 or "1970-01-01"
 
-  def_check = try Ledger.read_locked(
+  def_check_j = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
-      d = case try Table.get(store, Db.databases_table(), id).map_error(Db.map_table_error)
+      d = case try Db.get_database(store, id)
         Some(x): x
         None: return Error(Missing(entity: "database", id: id))
       end
       try Policy.require_collection_access(auth, "read", d.collection_id)
-      Ok(d)
+      Ok(d.to_json)
     end
+  )
+  def_props_j = try def_check_j.get("properties").or_fail(
+    ServerFailed(reason: "missing database properties")
+  )
+  def_props = try DatabaseModel.decode_property_defs_json(def_props_j.to_text.bytes).map_error(fn(e)
+    ServerFailed(reason: e)
+  end)
+  def_check = DatabaseDef(
+    id: def_check_j.text_at("id") or id,
+    collection_id: def_check_j.text_at("collection_id") or "",
+    page_id: def_check_j.text_at("page_id") or "",
+    title: def_check_j.text_at("title") or "",
+    description: def_check_j.text_at("description") or "",
+    properties: def_props,
+    version: def_check_j.int_at("version") or 1
   )
   prop = try def_check.properties.find(fn(p) p.id == prop_id end).or_fail(
     Missing(entity: "property", id: prop_id)
@@ -2234,9 +2278,7 @@ fn run_ai_column(
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
-      col_check = case try Table.get(store, Db.collections_table(), def_check.collection_id).map_error(
-        Db.map_table_error
-      )
+      col_check = case try Db.get_collection(store, def_check.collection_id)
         Some(x): x
         None: return Error(Missing(entity: "collection", id: def_check.collection_id))
       end
@@ -2268,8 +2310,7 @@ fn run_ai_column(
         Some(u): u.calls_used
         None: 0
       end
-      r_pairs = try Table.lookup(store, Db.db_rows_table(), Db.db_rows_by_database(), def_check.id)
-        .map_error(Db.map_table_error)
+      r_pairs = try Db.lookup_db_rows_by_database(store, def_check.id)
       active_rows = r_pairs.filter(fn(p) p.1.archived_at == None end).map(fn(p) p.1 end).sort_by(
         fn(r) r.id end
       )
@@ -2488,32 +2529,23 @@ fn run_ai_column(
           calls_used: cur_u + attempted_calls,
           updated_at: now
         )
-        t = try Table.put(t, Db.ai_col_usage_table(), new_u.id, new_u).map_error(
-          Db.map_table_error
-        )
+        t = try Db.tx_put_ai_col_usage(t, new_u)
 
         var applied = 0
         for (orig_row_id, _orig_ver, cell_val, rat_opt, cits, in_h, mname) in valid_updates
-          cur_def = case try Table.tx_get(t, Db.databases_table(), def_check.id).map_error(
-            Db.map_table_error
-          )
+          cur_def = case try Db.tx_get_database(t, def_check.id)
             Some(d): d
             None: def_check
           end
-          cur_row = case try Table.tx_get(t, Db.db_rows_table(), orig_row_id).map_error(
-            Db.map_table_error
-          )
+          cur_row = case try Db.tx_get_db_row(t, orig_row_id)
             Some(r) if r.archived_at == None: r
             Some(_) | None: continue
           end
-          old_pg = case try Table.tx_get(t, Db.pages_table(), cur_row.page_id).map_error(
-            Db.map_table_error
-          )
+          old_pg = case try Db.tx_get_page(t, cur_row.page_id)
             Some(p): p
             None: continue
           end
-          blks = try Table.tx_lookup(t, Db.blocks_table(), Db.blocks_by_page(), old_pg.id)
-            .map_error(Db.map_table_error)
+          blks = try Db.tx_lookup_blocks_by_page(t, old_pg.id)
             .map(fn(xs) Blocks.sort_blocks(xs.map(fn(x) x.1 end)) end)
           merged_cells = cur_row.cells.set(prop.id, cell_val)
           bumped_row = DbRow(
@@ -2646,9 +2678,7 @@ fn run_ai_column(
         calls_used: cur_u + attempted_calls,
         updated_at: now
       )
-      t1 = try Table.put(t, Db.ai_col_usage_table(), new_u.id, new_u).map_error(
-        Db.map_table_error
-      )
+      t1 = try Db.tx_put_ai_col_usage(t, new_u)
       Ok((t1, Json.Object({"calls_used": Json.int(new_u.calls_used)})))
     end
   )
@@ -2778,7 +2808,7 @@ fn run_ai_column(
     reason: "open AI column proposal #{prop_id_new} on #{def_check.id}",
     at: now
   )
-  saved_pm = try Ledger.transact_locked(
+  try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -2788,7 +2818,7 @@ fn run_ai_column(
     Db.map_ledger_error,
     fn(tx)
       t1 = try Db.tx_put_proposal(tx, pm)
-      Ok((t1, pm))
+      Ok((t1, Unit))
     end
   )
 
@@ -2805,7 +2835,7 @@ fn run_ai_column(
         "skipped_budget_count": Json.int(skipped_budget),
         "usage": usage_json,
         "results": Json.Array(result_items),
-        "proposal": saved_pm.to_json
+        "proposal": pm.to_json
       })
     )
   )
@@ -2871,7 +2901,7 @@ fn steer_proposal(
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
-      found = case try Table.get(store, Db.proposals_table(), id).map_error(Db.map_table_error)
+      found = case try Db.get_proposal(store, id)
         Some(p): p
         None: return Error(Missing(entity: "proposal", id: id))
       end
@@ -2900,8 +2930,8 @@ fn steer_proposal(
         Some(p) if not p.trim.empty?: p.trim
         Some(_) | None: found.target_page_id
       end
-      pg_spec = try Table.tx_get(spec_tx, Db.pages_table(), pid).map_error(Db.map_table_error)
-      pg_base = try Table.tx_get(base_tx, Db.pages_table(), pid).map_error(Db.map_table_error)
+      pg_spec = try Db.tx_get_page(spec_tx, pid)
+      pg_base = try Db.tx_get_page(base_tx, pid)
       ptitle = case pg_spec
         Some(p): p.title
         None:
@@ -2911,12 +2941,8 @@ fn steer_proposal(
           end
       end
 
-      brows = try Table.tx_lookup(base_tx, Db.blocks_table(), Db.blocks_by_page(), pid).map_error(
-        Db.map_table_error
-      )
-      srows = try Table.tx_lookup(spec_tx, Db.blocks_table(), Db.blocks_by_page(), pid).map_error(
-        Db.map_table_error
-      )
+      brows = try Db.tx_lookup_blocks_by_page(base_tx, pid)
+      srows = try Db.tx_lookup_blocks_by_page(spec_tx, pid)
       base_blocks = Blocks.sort_blocks(brows.map(fn(x) x.1 end))
       spec_blocks = Blocks.sort_blocks(srows.map(fn(x) x.1 end))
       var base_by_id = {}
@@ -3219,9 +3245,7 @@ fn rlm_target_collections(
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
-      pairs = try Table.scan(store, Db.collections_table(), None, None, 200).map_error(
-        Db.map_table_error
-      )
+      pairs = try Db.scan_collections(store, 200)
       active = pairs.filter(fn(p) p.1.archived_at == None end).map(fn(p) p.1 end).sort_by(
         fn(c) c.id end
       )
@@ -4070,14 +4094,16 @@ fn rlm_vm_search_vec_setup(
       )
     )
     Some(ecfg):
-      has_neural = try Ledger.read_locked(
+      has_neural_j = try Ledger.read_locked(
         rf,
         Db.ledger_db_path,
         Db.vellum_schema(),
         Db.map_ledger_error,
-        fn(db) Db.neural_vec_populated(Ledger.store(db), ecfg.dimensions) end
+        fn(db)
+          Ok(Json.Boolean(try Db.neural_vec_populated(Ledger.store(db), ecfg.dimensions)))
+        end
       )
-      if has_neural
+      if has_neural_j == Json.Boolean(true)
         case fetch_embedding(ecfg, q, net)
           Ok(qv): Ok((Some(qv), Db.neural_vec_index(ecfg.dimensions), Some(ecfg.min_score)))
           Error(_): Ok(
@@ -4180,7 +4206,7 @@ fn rlm_vm_run_search(
   end
 
   sorted_hits = raw_hits.sort_by(fn(h) -h.score end).take(12)
-  out_vals = try Ledger.read_locked(
+  out_vals_j = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -4193,19 +4219,35 @@ fn rlm_vm_run_search(
         case try Table.get(store, ptbl, hh.doc_id).map_error(Db.map_table_error)
           Some(p) if p.archived_at == None and Policy.collection_permitted?(auth, p.collection_id):
             list_out = list_out.append(
-              RlmVm.VRecord({
-                "page_id": RlmVm.VText(p.id),
-                "collection_id": RlmVm.VText(p.collection_id),
-                "title": RlmVm.VText(p.title),
-                "rank": RlmVm.VInt(i + 1)
+              Json.Object({
+                "page_id": Json.String(p.id),
+                "collection_id": Json.String(p.collection_id),
+                "title": Json.String(p.title),
+                "rank": Json.int(i + 1)
               })
             )
           Some(_) | None: Unit
         end
       end
-      Ok(list_out)
+      Ok(Json.Array(list_out))
     end
   ).map_error(fn(e) RlmVm.HostAppError(err: e) end)
+
+  var out_vals = []
+  case out_vals_j
+    Json.Array(items):
+      for item in items
+        out_vals = out_vals.append(
+          RlmVm.VRecord({
+            "page_id": RlmVm.VText(item.text_at("page_id") or ""),
+            "collection_id": RlmVm.VText(item.text_at("collection_id") or ""),
+            "title": RlmVm.VText(item.text_at("title") or ""),
+            "rank": RlmVm.VInt(item.int_at("rank") or 1)
+          })
+        )
+      end
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Object(_): Unit
+  end
 
   tr_step = RlmTraceStep(
     step: 1,
@@ -4636,19 +4678,19 @@ fn rlm_vm_sync_parent_taint(
   if not child_tainted?
     return Ok(Unit)
   end
-  already_tainted? = try Ledger.read_locked(
+  already_tainted_j = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
     fn(db)
       case try TaintBridge.get_taint_session(Ledger.store(db), parent_sess_id)
-        Some(ps): Ok(ps.untrusted_tainted)
-        None: Ok(false)
+        Some(ps): Ok(Json.Boolean(ps.untrusted_tainted))
+        None: Ok(Json.Boolean(false))
       end
     end
   ).map_error(fn(e) RlmVm.HostAppError(err: e) end)
-  if not already_tainted?
+  if already_tainted_j != Json.Boolean(true)
     _upd = try TaintBridge.record_untrusted_read_locked(
       files,
       Db.ledger_db_path,
@@ -4662,7 +4704,7 @@ fn rlm_vm_sync_parent_taint(
 end
 
 fn next_child_session_id(files: Files, base: Text) : Result(Text, RlmVm.RlmVmError)
-  Ledger.read_locked(
+  case try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -4673,13 +4715,16 @@ fn next_child_session_id(files: Files, base: Text) : Result(Text, RlmVm.RlmVmErr
       while seq < 64
         cand = "#{base}:#{seq}"
         if (try TaintBridge.get_taint_session(store, cand)) is None
-          return Ok(cand)
+          return Ok(Json.String(cand))
         end
         seq += 1
       end
-      Ok("#{base}:64")
+      Ok(Json.String("#{base}:64"))
     end
   ).map_error(fn(err) RlmVm.HostAppError(err: err) end)
+    Json.String(s): Ok(s)
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json.Object(_): Ok("#{base}:64")
+  end
 end
 
 fn run_rlm_tier2_frame(
@@ -5081,20 +5126,32 @@ fn execute_rlm_tier2(
     now
   )
 
-  persisted_sess_opt = try Ledger.read_locked(
+  persisted_j = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
-    fn(db) TaintBridge.get_taint_session(Ledger.store(db), sess.id) end
+    fn(db)
+      case try TaintBridge.get_taint_session(Ledger.store(db), sess.id)
+        Some(ps): Ok(
+          Json.Object({
+            "untrusted_tainted": Json.Boolean(ps.untrusted_tainted),
+            "max_sensitivity": Json.String(TaintBridge.sensitivity_label(ps.max_sensitivity_read)),
+            "untrusted_sources": ps.untrusted_sources.to_json
+          })
+        )
+        None: Ok(Json.Null)
+      end
+    end
   )
-  (db_tainted, db_sens, db_srcs) = case persisted_sess_opt
-    Some(ps): (
-      ps.untrusted_tainted,
-      TaintBridge.sensitivity_label(ps.max_sensitivity_read),
-      ps.untrusted_sources
+  (db_tainted, db_sens, db_srcs) = if persisted_j == Json.Null
+    (sess.untrusted_tainted, TaintBridge.sensitivity_label(sess.max_sensitivity_read), [])
+  else
+    (
+      persisted_j.bool_at("untrusted_tainted") or false,
+      persisted_j.text_at("max_sensitivity") or "public",
+      VaultOps.json_text_list_raw(persisted_j, "untrusted_sources")
     )
-    None: (sess.untrusted_tainted, TaintBridge.sensitivity_label(sess.max_sensitivity_read), [])
   end
   final_tainted = db_tainted or vm_out.untrusted_tainted
   final_sens = RlmVm.max_sensitivity_label(db_sens, vm_out.max_sensitivity_read)
@@ -5209,13 +5266,13 @@ end
 fn deep_research(
   req: Api.Request,
   auth: AuthContext,
-  body: Json,
   files: Files,
   clock: Clock,
   env: Env,
   net: Network
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  body = try VaultOps.parse_req_json_obj(req.text)
   input = DeepResearchInput(
     question: try VaultOps.req_text(body, "question"),
     collection_id: body.text_at("collection_id"),

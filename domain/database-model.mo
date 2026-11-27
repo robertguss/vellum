@@ -1689,14 +1689,433 @@ fn row_plain_text(def: DatabaseDef, row: DbRow) : Text
   parts.join("\n")
 end
 
-## Decodes a JSON object into `Map(Text, CellValue)` once to avoid duplicate monomorphic decoders.
-fn decode_cell_map_json(raw: Bytes) : Result(Map(Text, CellValue), Text)
-  Json.decode_strict[Map(Text, CellValue)](raw).map_error(fn(e) e.to_text end)
+fn decode_strict_string_list(j: Json) : Result(List(Text), Text)
+  items = case j
+    Json.Array(xs): xs
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Object(_): return Error(
+      "expected JSON array of strings"
+    )
+  end
+  var out = []
+  for item in items
+    case item
+      Json.String(s): out = out.append(s)
+      Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json.Object(_): return Error(
+        "expected string array element"
+      )
+    end
+  end
+  Ok(out)
 end
 
-## Decodes a JSON array into `List(PropertyDef)` once to avoid duplicate monomorphic decoders.
+fn decode_cell_value_json(v: Json) : Result(CellValue, Text)
+  case v
+    Json.String(s):
+      if s == "empty"
+        Ok(Empty)
+      else
+        Error("unknown CellValue string '#{s}'")
+      end
+    Json.Object(m):
+      entries = m.entries
+      if entries.size != 1
+        return Error("expected single-key CellValue object")
+      end
+      (k, val) = entries.first or ("", Json.Null)
+      if k == "text_val"
+        case val
+          Json.String(s): Ok(TextVal(s))
+          Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json.Object(_): Error(
+            "text_val must be a string"
+          )
+        end
+      else if k == "url_val"
+        case val
+          Json.String(s): Ok(UrlVal(s))
+          Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json.Object(_): Error(
+            "url_val must be a string"
+          )
+        end
+      else if k == "bool_val"
+        case val
+          Json.Boolean(b): Ok(BoolVal(b))
+          Json.Null | Json.Number(_) | Json.String(_) | Json.Array(_) | Json.Object(_): Error(
+            "bool_val must be a boolean"
+          )
+        end
+      else if k == "number_val"
+        case json_to_decimal(val)
+          Some(d): Ok(NumberVal(d))
+          None: Error("number_val must be a decimal number")
+        end
+      else if k == "date_val"
+        case val
+          Json.Object(_): Unit
+          Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+            "date_val must be a JSON object"
+          )
+        end
+        st = case json_to_date(val.get("start") or Json.Null)
+          Some(d): d
+          None: return Error("date_val missing valid ISO 'start' date")
+        end
+        ed_opt = case val.get("end_date")
+          Some(Json.Null) | None: None
+          Some(edv):
+            case json_to_date(edv)
+              Some(ed): Some(ed)
+              None: return Error("date_val has invalid 'end_date'")
+            end
+        end
+        Ok(DateVal(start: st, end_date: ed_opt))
+      else if k == "select_val"
+        case val
+          Json.Object(_): Unit
+          Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+            "select_val must be a JSON object"
+          )
+        end
+        case val.text_at("option_id")
+          Some(oid): Ok(SelectVal(option_id: oid))
+          None: Error("select_val missing 'option_id'")
+        end
+      else if k == "multi_select_val"
+        case val
+          Json.Object(_): Unit
+          Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+            "multi_select_val must be a JSON object"
+          )
+        end
+        oids = try decode_strict_string_list(val.get("option_ids") or Json.Null)
+        Ok(MultiSelectVal(option_ids: oids))
+      else if k == "principal_val"
+        pids = try decode_strict_string_list(val)
+        Ok(PrincipalVal(pids))
+      else if k == "files_val"
+        case val
+          Json.Object(_): Unit
+          Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+            "files_val must be a JSON object"
+          )
+        end
+        aids = try decode_strict_string_list(val.get("attachment_ids") or Json.Null)
+        Ok(FilesVal(attachment_ids: aids))
+      else if k == "relation_val"
+        case val
+          Json.Object(_): Unit
+          Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+            "relation_val must be a JSON object"
+          )
+        end
+        rids = try decode_strict_string_list(val.get("row_ids") or Json.Null)
+        Ok(RelationVal(row_ids: rids))
+      else
+        Error("unknown CellValue variant '#{k}'")
+      end
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_): Error(
+      "expected CellValue string or variant object"
+    )
+  end
+end
+
+## Decodes a JSON object into `Map(Text, CellValue)` without generic `Json.decode_strict` lowering.
+fn decode_cell_map_json(raw: Bytes) : Result(Map(Text, CellValue), Text)
+  txt = case raw.decode_utf8
+    Some(s): s
+    None: return Error("expected valid UTF-8 JSON")
+  end
+  parsed = case Json.parse(txt)
+    Ok(j): j
+    Error(e): return Error(e.to_text)
+  end
+  obj = case parsed
+    Json.Object(m): m
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+      "expected cell map JSON object"
+    )
+  end
+  var out = {}
+  for (k, v) in obj.entries
+    cv = try decode_cell_value_json(v)
+    out = out.set(k, cv)
+  end
+  Ok(out)
+end
+
+fn req_obj_text(j: Json, field: Text) : Result(Text, Text)
+  case j.text_at(field)
+    Some(s): Ok(s)
+    None: Error("missing string field '#{field}'")
+  end
+end
+
+fn req_obj_opt_text(j: Json, field: Text) : Result(Option(Text), Text)
+  case j.get(field)
+    None | Some(Json.Null): Ok(None)
+    Some(Json.String(s)): Ok(Some(s))
+    Some(Json.Boolean(_)) | Some(Json.Number(_)) | Some(Json.Array(_)) | Some(Json.Object(_)):
+      Error("field '#{field}' must be string or null")
+  end
+end
+
+fn req_obj_bool(j: Json, field: Text) : Result(Bool, Text)
+  case j.get(field)
+    Some(Json.Boolean(b)): Ok(b)
+    None | Some(Json.Null) | Some(Json.Number(_)) | Some(Json.String(_)) | Some(Json.Array(_)) |
+      Some(Json.Object(_)): Error("missing boolean field '#{field}'")
+  end
+end
+
+fn req_obj_int(j: Json, field: Text) : Result(Int, Text)
+  case j.int_at(field)
+    Some(n): Ok(n)
+    None: Error("missing integer field '#{field}'")
+  end
+end
+
+fn decode_select_color_json(raw: Text) : Result(SelectOptionColor, Text)
+  if raw == "gray"
+    Ok(Gray)
+  else if raw == "blue"
+    Ok(Blue)
+  else if raw == "green"
+    Ok(Green)
+  else if raw == "amber"
+    Ok(Amber)
+  else if raw == "red"
+    Ok(Red)
+  else if raw == "purple"
+    Ok(Purple)
+  else
+    Error("unknown option color '#{raw}'")
+  end
+end
+
+fn decode_select_options_json(j: Json) : Result(List(SelectOption), Text)
+  arr = case j
+    Json.Array(xs): xs
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Object(_): return Error(
+      "expected options JSON array"
+    )
+  end
+  var out = []
+  for item in arr
+    case item
+      Json.Object(_): Unit
+      Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+        "option item must be a JSON object"
+      )
+    end
+    oid = try req_obj_text(item, "id")
+    lbl = try req_obj_text(item, "label")
+    col_str = try req_obj_text(item, "color")
+    col = try decode_select_color_json(col_str)
+    out = out.append(SelectOption(id: oid, label: lbl, color: col))
+  end
+  Ok(out)
+end
+
+fn decode_rollup_agg_json(j: Json) : Result(RollupAgg, Text)
+  s = case j
+    Json.String(raw): raw
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json.Object(_): return Error(
+      "rollup agg must be a string"
+    )
+  end
+  if s == "count_all"
+    Ok(CountAll)
+  else if s == "count_values"
+    Ok(CountValues)
+  else if s == "sum_values"
+    Ok(SumValues)
+  else if s == "min_value"
+    Ok(MinValue)
+  else if s == "max_value"
+    Ok(MaxValue)
+  else if s == "percent_per_group"
+    Ok(PercentPerGroup)
+  else
+    Error("unknown rollup agg '#{s}'")
+  end
+end
+
+fn decode_ai_output_kind_json(j: Json) : Result(AiOutputKind, Text)
+  case j
+    Json.String(s):
+      if s == "ai_text"
+        Ok(AiText)
+      else if s == "ai_date"
+        Ok(AiDate)
+      else if s == "ai_bool"
+        Ok(AiBool)
+      else
+        Error("unknown AiOutputKind '#{s}'")
+      end
+    Json.Object(m):
+      if m.entries.size != 1
+        return Error("expected single-key AiOutputKind object")
+      end
+      (k, val) = m.entries.first or ("", Json.Null)
+      case val
+        Json.Object(_): Unit
+        Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+          "AiOutputKind payload must be an object"
+        )
+      end
+      if k == "ai_number"
+        Ok(AiNumber(format: try req_obj_text(val, "format")))
+      else if k == "ai_select"
+        opts = try decode_select_options_json(val.get("options") or Json.Null)
+        Ok(AiSelect(options: opts))
+      else
+        Error("unknown AiOutputKind object '#{k}'")
+      end
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_): Error(
+      "invalid AiOutputKind JSON"
+    )
+  end
+end
+
+fn decode_ai_col_mode_json(j: Json) : Result(AiColumnMode, Text)
+  s = case j
+    Json.String(raw): raw
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json.Object(_): return Error(
+      "AiColumnMode must be a string"
+    )
+  end
+  if s == "auto_apply"
+    Ok(AutoApply)
+  else if s == "stage_proposal"
+    Ok(StageProposal)
+  else
+    Error("unknown AiColumnMode '#{s}'")
+  end
+end
+
+fn decode_property_kind_json(j: Json) : Result(PropertyKind, Text)
+  case j
+    Json.String(s):
+      if s == "title"
+        Ok(Title)
+      else if s == "rich_text"
+        Ok(RichText)
+      else if s == "checkbox"
+        Ok(Checkbox)
+      else if s == "person"
+        Ok(Person)
+      else if s == "email"
+        Ok(Email)
+      else if s == "file_list"
+        Ok(FileList)
+      else if s == "url"
+        Ok(Url)
+      else if s == "created_time"
+        Ok(CreatedTime)
+      else if s == "created_by"
+        Ok(CreatedBy)
+      else if s == "last_edited_time"
+        Ok(LastEditedTime)
+      else if s == "last_edited_by"
+        Ok(LastEditedBy)
+      else
+        Error("unknown PropertyKind string '#{s}'")
+      end
+    Json.Object(m):
+      if m.entries.size != 1
+        return Error("expected single-key PropertyKind object")
+      end
+      (k, val) = m.entries.first or ("", Json.Null)
+      case val
+        Json.Object(_): Unit
+        Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+          "PropertyKind payload must be an object"
+        )
+      end
+      if k == "number"
+        Ok(Number(format: try req_obj_text(val, "format")))
+      else if k == "date_prop"
+        Ok(DateProp(include_time: try req_obj_bool(val, "include_time")))
+      else if k == "select"
+        Ok(Select(options: try decode_select_options_json(val.get("options") or Json.Null)))
+      else if k == "multi_select"
+        Ok(MultiSelect(options: try decode_select_options_json(val.get("options") or Json.Null)))
+      else if k == "status"
+        opts = try decode_select_options_json(val.get("options") or Json.Null)
+        done_ids = try decode_strict_string_list(val.get("done_option_ids") or Json.Null)
+        Ok(Status(options: opts, done_option_ids: done_ids))
+      else if k == "unique_id"
+        Ok(UniqueId(prefix: try req_obj_text(val, "prefix")))
+      else if k == "formula"
+        expr = try req_obj_text(val, "expression")
+        fmt = try req_obj_text(val, "format")
+        Ok(Formula(expression: expr, format: fmt))
+      else if k == "relation"
+        tid = try req_obj_text(val, "target_db_id")
+        inv = try req_obj_opt_text(val, "inverse_prop_id")
+        Ok(Relation(target_db_id: tid, inverse_prop_id: inv))
+      else if k == "rollup"
+        rpid = try req_obj_text(val, "relation_prop_id")
+        tpid = try req_obj_text(val, "target_prop_id")
+        agg = try decode_rollup_agg_json(val.get("agg") or Json.Null)
+        Ok(Rollup(relation_prop_id: rpid, target_prop_id: tpid, agg: agg))
+      else if k == "ai_derived"
+        prompt = try req_obj_text(val, "prompt")
+        srcs = try decode_strict_string_list(val.get("source_prop_ids") or Json.Null)
+        inc_body = try req_obj_bool(val, "include_row_body")
+        okind = try decode_ai_output_kind_json(val.get("output_kind") or Json.Null)
+        mode = try decode_ai_col_mode_json(val.get("mode") or Json.Null)
+        cap = try req_obj_int(val, "daily_call_cap")
+        Ok(
+          AiDerived(
+            prompt: prompt,
+            source_prop_ids: srcs,
+            include_row_body: inc_body,
+            output_kind: okind,
+            mode: mode,
+            daily_call_cap: cap
+          )
+        )
+      else
+        Error("unknown PropertyKind object '#{k}'")
+      end
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_): Error("invalid PropertyKind JSON")
+  end
+end
+
+## Decodes a JSON array into `List(PropertyDef)` without generic `Json.decode_strict` lowering.
 fn decode_property_defs_json(raw: Bytes) : Result(List(PropertyDef), Text)
-  Json.decode_strict[List(PropertyDef)](raw).map_error(fn(e) e.to_text end)
+  txt = case raw.decode_utf8
+    Some(s): s
+    None: return Error("expected valid UTF-8 JSON")
+  end
+  parsed = case Json.parse(txt)
+    Ok(j): j
+    Error(e): return Error(e.to_text)
+  end
+  items = case parsed
+    Json.Array(xs): xs
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Object(_): return Error(
+      "expected property definitions JSON array"
+    )
+  end
+  var out = []
+  for item in items
+    case item
+      Json.Object(_): Unit
+      Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+        "property definition must be a JSON object"
+      )
+    end
+    pid = try req_obj_text(item, "id")
+    pname = try req_obj_text(item, "name")
+    pkind = try decode_property_kind_json(item.get("kind") or Json.Null)
+    preq = try req_obj_bool(item, "required")
+    psort = try req_obj_text(item, "sort_order")
+    out = out.append(
+      PropertyDef(id: pid, name: pname, kind: pkind, required: preq, sort_order: psort)
+    )
+  end
+  Ok(out)
 end
 
 ## Decodes a JSON array into `List(DbFilterRule)` without generic `Json.decode_strict` lowering.

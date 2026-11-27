@@ -103,6 +103,7 @@ use Modb.Table
 use Modb.World
 use Routes.Ai
 use Routes.Auth
+use Routes.ChatMoat
 use VaultOps
 
 ## JSON payload for `POST /api/collections`.
@@ -258,7 +259,7 @@ fn validate_blueprint_relations_tx(tx: WriteTx, auth: AuthContext, bp: Blueprint
   for f in bp.fields
     case prop_is_relation_target(f.kind)
       Some(tdb_id):
-        tdb = case try Table.tx_get(tx, Db.databases_table(), tdb_id).map_error(Db.map_table_error)
+        tdb = case try Db.tx_get_database(tx, tdb_id)
           Some(d): d
           None: return Error(
             BadInput(reason: "relation field '#{f.id}' references missing database '#{tdb_id}'")
@@ -282,9 +283,7 @@ fn validate_meta_relations_tx(
       Some(tdb_id):
         case values.get(f.id)
           Some(RelationVal(row_ids: rids)) if not rids.empty?:
-            tdb = case try Table.tx_get(tx, Db.databases_table(), tdb_id).map_error(
-              Db.map_table_error
-            )
+            tdb = case try Db.tx_get_database(tx, tdb_id)
               Some(d): d
               None: return Error(
                 BadInput(reason: "relation field '#{f.id}' references missing database '#{tdb_id}'")
@@ -292,7 +291,7 @@ fn validate_meta_relations_tx(
             end
             try Policy.require_collection_access(auth, "read", tdb.collection_id)
             for rid in rids
-              case try Table.tx_get(tx, Db.db_rows_table(), rid).map_error(Db.map_table_error)
+              case try Db.tx_get_db_row(tx, rid)
                 Some(tr) if tr.database_id == tdb_id and tr.archived_at == None: Unit
                 Some(_) | None: return Error(
                   BadInput(
@@ -553,14 +552,13 @@ fn load_live_db_cached(
     Some(hit): return Ok((cache, hit))
     None: Unit
   end
-  res = case try Table.get(store, Db.databases_table(), db_id).map_error(Db.map_table_error)
+  res = case try Db.get_database(store, db_id)
     None: None
     Some(def):
       if not Policy.collection_permitted?(auth, def.collection_id)
         None
       else
-        pairs = try Table.lookup(store, Db.db_rows_table(), Db.db_rows_by_database(), def.id)
-          .map_error(Db.map_table_error)
+        pairs = try Db.lookup_db_rows_by_database(store, def.id)
         var active = []
         for (_rid, r) in pairs
           if r.archived_at == None
@@ -584,7 +582,7 @@ fn load_scen_db_cached(
     Some(hit): return Ok((cache, hit))
     None: Unit
   end
-  res = case try Table.tx_get(spec_tx, Db.databases_table(), db_id).map_error(Db.map_table_error)
+  res = case try Db.tx_get_database(spec_tx, db_id)
     None: None
     Some(def):
       if not Policy.collection_permitted?(auth, def.collection_id)
@@ -736,7 +734,7 @@ fn resolve_metrics_in_store(
   spec_tx_opt = case scenario_id
     Some(sid_raw) if not sid_raw.trim.empty?:
       sid = sid_raw.trim
-      pm = case try Table.get(store, Db.proposals_table(), sid).map_error(Db.map_table_error)
+      pm = case try Db.get_proposal(store, sid)
         Some(p): p
         None: return Error(Missing(entity: "proposal", id: sid))
       end
@@ -889,9 +887,7 @@ fn resolve_metrics_in_store(
 end
 
 fn load_active_principals_json(store: Store) : Result(Json, AppError)
-  pr_rows = try Table.scan(store, Db.principals_table(), None, None, 200).map_error(
-    Db.map_table_error
-  )
+  pr_rows = try Db.scan_principals(store, 200)
   var list_out = []
   for (_pid, pr) in pr_rows
     if not pr.suspended
@@ -929,12 +925,7 @@ fn load_blueprint_relation_targets(
             seen_targets = seen_targets.set(tdb_id, true)
             case db_by_id.get(tdb_id)
               Some(tdb) if Policy.collection_permitted?(auth, tdb.collection_id):
-                r_pairs = try Table.lookup(
-                  store,
-                  Db.db_rows_table(),
-                  Db.db_rows_by_database(),
-                  tdb.id
-                ).map_error(Db.map_table_error)
+                r_pairs = try Db.lookup_db_rows_by_database(store, tdb.id)
                 var opts = []
                 for (_rid, tr) in r_pairs
                   if tr.archived_at == None
@@ -1088,9 +1079,7 @@ fn parse_limit(raw: Option(Text), default_val: Int, max_val: Int) : Int
 end
 
 fn permitted_collections(store: Store, auth: AuthContext) : Result(List(Collection), AppError)
-  rows = try Table.scan(store, Db.collections_table(), None, None, 200).map_error(
-    Db.map_table_error
-  )
+  rows = try Db.scan_collections(store, 200)
   var out = []
   for (_id, col) in rows
     if col.archived_at == None and Policy.collection_permitted?(auth, col.id)
@@ -1101,7 +1090,7 @@ fn permitted_collections(store: Store, auth: AuthContext) : Result(List(Collecti
 end
 
 fn permitted_databases(store: Store, auth: AuthContext) : Result(List(DatabaseDef), AppError)
-  rows = try Table.scan(store, Db.databases_table(), None, None, 200).map_error(Db.map_table_error)
+  rows = try Db.scan_databases(store, 200)
   var out = []
   for (_id, d) in rows
     if Policy.collection_permitted?(auth, d.collection_id)
@@ -1158,9 +1147,7 @@ fn home(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: Env) : 
         store = Ledger.store(db)
         c_list = try permitted_collections(store, a)
         d_list = try permitted_databases(store, a)
-        p_rows = try Table.scan(store, Db.pages_table(), None, None, 100).map_error(
-          Db.map_table_error
-        )
+        p_rows = try Db.scan_pages(store, 100)
         var visible_pages = []
         for (_pid, p) in p_rows
           if p.archived_at == None and Policy.collection_permitted?(a, p.collection_id)
@@ -1402,20 +1389,17 @@ fn show_page(
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
-      page = case try Table.get(store, Db.pages_table(), id).map_error(Db.map_table_error)
+      page = case try Db.get_page(store, id)
         Some(p) if p.archived_at == None: p
         Some(_) | None: return Error(Missing(entity: "page", id: id))
       end
       try Policy.require_collection_access(a, "read", page.collection_id)
-      col = case try Table.get(store, Db.collections_table(), page.collection_id).map_error(
-        Db.map_table_error
-      )
+      col = case try Db.get_collection(store, page.collection_id)
         Some(c): c
         None: return Error(Missing(entity: "collection", id: page.collection_id))
       end
       blks = try Db.load_page_blocks(store, page.id)
-      cmt_rows = try Table.lookup(store, Db.comments_table(), Db.comments_by_page(), page.id)
-        .map_error(Db.map_table_error)
+      cmt_rows = try Db.lookup_comments_by_page(store, page.id)
       att_rows = try Table.lookup(store, Db.attachments_table(), Db.attachments_by_page(), page.id)
         .map_error(Db.map_table_error)
       c_list = try permitted_collections(store, a)
@@ -1425,13 +1409,9 @@ fn show_page(
         Db.map_table_error
       )
       bps = bp_rows.map(fn(x) x.1 end)
-      page_meta_opt = try Table.get(store, Db.page_meta_table(), page.id).map_error(
-        Db.map_table_error
-      )
+      page_meta_opt = try Db.get_page_meta(store, page.id)
       page_bp_opt = case page_meta_opt
-        Some(pm): try Table.get(store, Db.blueprints_table(), pm.blueprint_id).map_error(
-          Db.map_table_error
-        )
+        Some(pm): try Db.get_blueprint(store, pm.blueprint_id)
         None: None
       end
 
@@ -1444,9 +1424,7 @@ fn show_page(
         end
       end
 
-      all_prop_rows = try Table.scan(store, Db.proposals_table(), None, None, 200).map_error(
-        Db.map_table_error
-      )
+      all_prop_rows = try Db.scan_proposals(store, 200)
       var scenarios = []
       for (_spid, spr) in all_prop_rows
         if spr.status == "open" and spr.branch_kind == "scenario" and Policy.collection_permitted?(
@@ -1590,7 +1568,8 @@ fn show_page(
           "explicit_backlinks": page_bundle.get("explicit_backlinks") or Json.Null,
           "semantic_backlinks": page_bundle.get("semantic_backlinks") or Json.Null,
           "taint_provenance": page_bundle.get("taint_provenance") or Json.Null,
-          "secret_hints": page_bundle.get("secret_hints") or Json.Null
+          "secret_hints": page_bundle.get("secret_hints") or Json.Null,
+          "origin_chat_threads": try ChatMoat.page_origin_threads_json(files.read_only, a, id)
         })
       )
     )
@@ -1626,7 +1605,8 @@ fn show_page(
       "explicit_backlinks": page_bundle.get("explicit_backlinks") or Json.Null,
       "semantic_backlinks": page_bundle.get("semantic_backlinks") or Json.Null,
       "taint_provenance": page_bundle.get("taint_provenance") or Json.Null,
-      "secret_hints": page_bundle.get("secret_hints") or Json.Null
+      "secret_hints": page_bundle.get("secret_hints") or Json.Null,
+      "origin_chat_threads": try ChatMoat.page_origin_threads_json(files.read_only, a, id)
     }
   )
 end
@@ -1654,7 +1634,7 @@ fn page_backlinks(req: Api.Request, id: Text, auth: AuthContext, rf: ReadFiles) 
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
-      page = case try Table.get(store, Db.pages_table(), id).map_error(Db.map_table_error)
+      page = case try Db.get_page(store, id)
         Some(p) if p.archived_at == None: p
         Some(_) | None: return Error(Missing(entity: "page", id: id))
       end
@@ -1751,9 +1731,7 @@ fn create_page(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "write_direct", now)
-      col = case try Table.tx_get(t1, Db.collections_table(), input.collection_id).map_error(
-        Db.map_table_error
-      )
+      col = case try Db.tx_get_collection(t1, input.collection_id)
         Some(c) if c.archived_at == None: c
         Some(_) | None: return Error(Missing(entity: "collection", id: input.collection_id))
       end
@@ -1766,7 +1744,7 @@ fn create_page(
       end
       case input.parent_page_id
         Some(pid):
-          case try Table.tx_get(t1, Db.pages_table(), pid).map_error(Db.map_table_error)
+          case try Db.tx_get_page(t1, pid)
             Some(par) if par.archived_at == None and par.collection_id == col.id: Unit
             Some(_): return Error(BadInput(reason: "parent_page_id must belong to same collection"))
             None: return Error(Missing(entity: "parent_page", id: pid))
@@ -1818,7 +1796,7 @@ fn validate_page_parent_tx(tx: WriteTx, page_id: Text, col_id: Text, parent_id: 
     if cid == page_id
       return Error(BadInput(reason: "parent_page_id '#{clean_pid}' would create a cycle"))
     end
-    par = case try Table.tx_get(tx, Db.pages_table(), cid).map_error(Db.map_table_error)
+    par = case try Db.tx_get_page(tx, cid)
       Some(p) if p.archived_at == None: p
       Some(_) | None:
         if hops == 0
@@ -1881,14 +1859,12 @@ fn update_page(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "write_direct", now)
-      old_page = case try Table.tx_get(t1, Db.pages_table(), id).map_error(Db.map_table_error)
+      old_page = case try Db.tx_get_page(t1, id)
         Some(p) if p.archived_at == None: p
         Some(_) | None: return Error(Missing(entity: "page", id: id))
       end
       try Policy.require_collection_access(auth, "write_direct", old_page.collection_id)
-      col = case try Table.tx_get(t1, Db.collections_table(), old_page.collection_id).map_error(
-        Db.map_table_error
-      )
+      col = case try Db.tx_get_collection(t1, old_page.collection_id)
         Some(c): c
         None: return Error(Missing(entity: "collection", id: old_page.collection_id))
       end
@@ -1920,15 +1896,11 @@ fn update_page(
             if aid.empty?
               None
             else
-              att = case try Table.tx_get(t1, Db.attachments_table(), aid).map_error(
-                Db.map_table_error
-              )
+              att = case try Db.tx_get_attachment(t1, aid)
                 Some(a): a
                 None: return Error(Missing(entity: "attachment", id: aid))
               end
-              att_pg = case try Table.tx_get(t1, Db.pages_table(), att.page_id).map_error(
-                Db.map_table_error
-              )
+              att_pg = case try Db.tx_get_page(t1, att.page_id)
                 Some(p) if p.archived_at == None: p
                 Some(_) | None: return Error(Missing(entity: "page", id: att.page_id))
               end
@@ -1976,8 +1948,7 @@ fn update_page(
         archived_at: old_page.archived_at,
         version: old_page.version + 1
       )
-      existing_rows = try Table.tx_lookup(t1, Db.blocks_table(), Db.blocks_by_page(), old_page.id)
-        .map_error(Db.map_table_error)
+      existing_rows = try Db.tx_lookup_blocks_by_page(t1, old_page.id)
       existing_blocks = Blocks.sort_blocks(existing_rows.map(fn(x) x.1 end))
       t2 = try Db.tx_save_page_and_blocks(t1, updated_page, existing_blocks)
       (t3, _jid) = try Jobs.tx_put(t2, idx_job).map_error(Db.map_table_error)
@@ -2089,24 +2060,24 @@ fn patch_blocks(
   case patch_sid
     Some(sid):
       if files.read_only.exists?(Db.ledger_db_path)
-        sess_opt = try Ledger.read_locked(
+        sess_exists_j = try Ledger.read_locked(
           files.read_only,
           Db.ledger_db_path,
           Db.vellum_schema(),
           Db.map_ledger_error,
-          fn(db) TaintBridge.get_taint_session(Ledger.store(db), sid) end
+          fn(db)
+            Ok(Json.Boolean((try TaintBridge.get_taint_session(Ledger.store(db), sid)) != None))
+          end
         )
-        case sess_opt
-          Some(_):
-            _auth_sess = try TaintBridge.authorize_action_locked(
-              files,
-              Db.ledger_db_path,
-              Db.vellum_schema(),
-              sid,
-              "page.write_direct",
-              now
-            )
-          None: Unit
+        if sess_exists_j == Json.Boolean(true)
+          _auth_sess = try TaintBridge.authorize_action_locked(
+            files,
+            Db.ledger_db_path,
+            Db.vellum_schema(),
+            sid,
+            "page.write_direct",
+            now
+          )
         end
       end
     None: Unit
@@ -2136,14 +2107,12 @@ fn patch_blocks(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "write_direct", now)
-      old_page = case try Table.tx_get(t1, Db.pages_table(), id).map_error(Db.map_table_error)
+      old_page = case try Db.tx_get_page(t1, id)
         Some(p) if p.archived_at == None: p
         Some(_) | None: return Error(Missing(entity: "page", id: id))
       end
       try Policy.require_collection_access(auth, "write_direct", old_page.collection_id)
-      col = case try Table.tx_get(t1, Db.collections_table(), old_page.collection_id).map_error(
-        Db.map_table_error
-      )
+      col = case try Db.tx_get_collection(t1, old_page.collection_id)
         Some(c): c
         None: return Error(Missing(entity: "collection", id: old_page.collection_id))
       end
@@ -2155,9 +2124,7 @@ fn patch_blocks(
         )
       end
 
-      existing_rows = try Table.tx_lookup(t1, Db.blocks_table(), Db.blocks_by_page(), id).map_error(
-        Db.map_table_error
-      )
+      existing_rows = try Db.tx_lookup_blocks_by_page(t1, id)
       existing_blocks = Blocks.sort_blocks(existing_rows.map(fn(x) x.1 end))
       try verify_expected_block_versions(existing_blocks, input.expected_versions)
       updated_blocks = try Blocks.apply_block_ops(existing_blocks, input.ops, id, prov, new_ids)
@@ -2259,7 +2226,7 @@ fn verify_page(req: Api.Request, id: Text, auth: AuthContext, files: Files, cloc
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, action_needed, now)
-      old_page = case try Table.tx_get(t1, Db.pages_table(), id).map_error(Db.map_table_error)
+      old_page = case try Db.tx_get_page(t1, id)
         Some(p) if p.archived_at == None: p
         Some(_) | None: return Error(Missing(entity: "page", id: id))
       end
@@ -2428,7 +2395,7 @@ fn create_comment(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "comment", now)
-      page = case try Table.tx_get(t1, Db.pages_table(), id).map_error(Db.map_table_error)
+      page = case try Db.tx_get_page(t1, id)
         Some(p) if p.archived_at == None: p
         Some(_) | None: return Error(Missing(entity: "page", id: id))
       end
@@ -2571,15 +2538,13 @@ fn presign_attachment(
         end
         try ChatOps.require_channel_access(auth, ch, upload_action)
       else
-        page = case try Table.tx_get(t1, Db.pages_table(), input.page_id).map_error(
-          Db.map_table_error
-        )
+        page = case try Db.tx_get_page(t1, input.page_id)
           Some(p) if p.archived_at == None: p
           Some(_) | None: return Error(Missing(entity: "page", id: input.page_id))
         end
         try Policy.require_collection_access(auth, upload_action, page.collection_id)
       end
-      t2 = try Table.put(t1, Db.attachments_table(), att.id, att).map_error(Db.map_table_error)
+      t2 = try Db.tx_put_attachment(t1, att)
       Ok((t2, Unit))
     end
   )
@@ -2635,9 +2600,7 @@ fn upload_local_attachment(
     Db.vellum_schema(),
     Db.map_ledger_error,
     fn(db)
-      a = case try Table.get(Ledger.store(db), Db.attachments_table(), id).map_error(
-        Db.map_table_error
-      )
+      a = case try Db.get_attachment(Ledger.store(db), id)
         Some(x): x
         None: return Error(Missing(entity: "attachment", id: id))
       end
@@ -2783,7 +2746,7 @@ fn commit_attachment(req: Api.Request, id: Text, auth: AuthContext, files: Files
     Db.vellum_schema(),
     Db.map_ledger_error,
     fn(db)
-      case try Table.get(Ledger.store(db), Db.attachments_table(), id).map_error(Db.map_table_error)
+      case try Db.get_attachment(Ledger.store(db), id)
         Some(a): Ok(a.to_json)
         None: Error(Missing(entity: "attachment", id: id))
       end
@@ -2834,7 +2797,7 @@ fn commit_attachment(req: Api.Request, id: Text, auth: AuthContext, files: Files
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, upload_action, now)
-      old_att = case try Table.tx_get(t1, Db.attachments_table(), id).map_error(Db.map_table_error)
+      old_att = case try Db.tx_get_attachment(t1, id)
         Some(a): a
         None: return Error(Missing(entity: "attachment", id: id))
       end
@@ -2845,9 +2808,7 @@ fn commit_attachment(req: Api.Request, id: Text, auth: AuthContext, files: Files
         end
         try ChatOps.require_channel_access(auth, ch, upload_action)
       else
-        page = case try Table.tx_get(t1, Db.pages_table(), old_att.page_id).map_error(
-          Db.map_table_error
-        )
+        page = case try Db.tx_get_page(t1, old_att.page_id)
           Some(p) if p.archived_at == None: p
           Some(_) | None: return Error(Missing(entity: "page", id: old_att.page_id))
         end
@@ -2867,7 +2828,7 @@ fn commit_attachment(req: Api.Request, id: Text, auth: AuthContext, files: Files
         status: "ready",
         created_at: old_att.created_at
       )
-      t2 = try Table.put(t1, Db.attachments_table(), ready.id, ready).map_error(Db.map_table_error)
+      t2 = try Db.tx_put_attachment(t1, ready)
       Ok((t2, ready.to_json))
     end
   )
@@ -2894,7 +2855,7 @@ fn download_attachment(
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
-      a = case try Table.get(store, Db.attachments_table(), id).map_error(Db.map_table_error)
+      a = case try Db.get_attachment(store, id)
         Some(x): x
         None: return Error(Missing(entity: "attachment", id: id))
       end
@@ -2909,7 +2870,7 @@ fn download_attachment(
           None: Json.Null
         end
       else
-        page = case try Table.get(store, Db.pages_table(), a.page_id).map_error(Db.map_table_error)
+        page = case try Db.get_page(store, a.page_id)
           Some(p) if p.archived_at == None: p
           Some(_) | None: return Error(Missing(entity: "page", id: a.page_id))
         end
@@ -3290,9 +3251,7 @@ fn grants_tree(auth: AuthContext, rf: ReadFiles, clock: Clock) : Result(Api.Resp
     fn(db)
       store = Ledger.store(db)
       all_grants = try Grants.list_all(store).map_error(Db.map_grants_error)
-      p_rows = try Table.scan(store, Db.principals_table(), None, None, 500).map_error(
-        Db.map_table_error
-      )
+      p_rows = try Db.scan_principals(store, 500)
       t_rows = try Table.scan(store, Db.agent_tokens_table(), None, None, 500).map_error(
         Db.map_table_error
       )
@@ -3614,9 +3573,7 @@ fn proposals_page(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, en
         store = Ledger.store(db)
         c_list = try permitted_collections(store, a)
         d_list = try permitted_databases(store, a)
-        p_rows = try Table.scan(store, Db.proposals_table(), None, None, 200).map_error(
-          Db.map_table_error
-        )
+        p_rows = try Db.scan_proposals(store, 200)
         var out = []
         for (_id, p) in p_rows
           if Policy.collection_permitted?(a, p.collection_id)
@@ -3695,9 +3652,7 @@ fn admin_page(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: E
         can_webhooks = (a.principal.role == Owner or a.principal.role == Admin) and
           Policy.action_permitted?(a, "manage_grants")
         hook_items = if can_webhooks
-          w_rows = try Table.scan(store, Db.webhooks_table(), None, None, 100).map_error(
-            Db.map_table_error
-          )
+          w_rows = try Db.scan_webhooks(store, 100)
           w_rows.map(fn(pair)
             w = pair.1
             Json.Object({
@@ -3803,7 +3758,7 @@ fn refresh_semantic_summary_if_stale(
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
-      pg = case try Table.get(store, Db.pages_table(), pid).map_error(Db.map_table_error)
+      pg = case try Db.get_page(store, pid)
         Some(p) if p.archived_at == None and p.kind == Document: p
         Some(_) | None: return Ok(Json.Object({"ready": Json.Boolean(false)}))
       end
@@ -3932,27 +3887,30 @@ fn drain_jobs(_payload: Json, files: Files, clock: Clock, env: Env, net: Network
             Ok(wp):
               taint_check = case wp.taint_session_id
                 Some(sid):
-                  sess_opt = try Ledger.read_locked(
+                  sess_exists_j = try Ledger.read_locked(
                     files.read_only,
                     Db.ledger_db_path,
                     Db.vellum_schema(),
                     Db.map_ledger_error,
-                    fn(db) TaintBridge.get_taint_session(Ledger.store(db), sid) end
+                    fn(db)
+                      sopt = try TaintBridge.get_taint_session(Ledger.store(db), sid)
+                      Ok(Json.Boolean(sopt != None))
+                    end
                   )
-                  case sess_opt
-                    Some(_):
-                      case TaintBridge.authorize_action_locked(
-                        files,
-                        Db.ledger_db_path,
-                        Db.vellum_schema(),
-                        sid,
-                        "webhook.deliver",
-                        clock.now
-                      )
-                        Ok(_): Ok(Unit)
-                        Error(te): Error(te)
-                      end
-                    None: Ok(Unit)
+                  if sess_exists_j == Json.Boolean(true)
+                    case TaintBridge.authorize_action_locked(
+                      files,
+                      Db.ledger_db_path,
+                      Db.vellum_schema(),
+                      sid,
+                      "webhook.deliver",
+                      clock.now
+                    )
+                      Ok(_): Ok(Unit)
+                      Error(te): Error(te)
+                    end
+                  else
+                    Ok(Unit)
                   end
                 None: Ok(Unit)
               end
@@ -4022,9 +3980,7 @@ fn drain_jobs(_payload: Json, files: Files, clock: Clock, env: Env, net: Network
                     Db.map_ledger_error,
                     fn(db)
                       store = Ledger.store(db)
-                      case try Table.get(store, Db.pages_table(), pid).map_error(
-                        Db.map_table_error
-                      )
+                      case try Db.get_page(store, pid)
                         Some(pg) if pg.archived_at == None:
                           if not try VaultOps.ai_allowed_for_collection(
                             store,
@@ -4037,28 +3993,18 @@ fn drain_jobs(_payload: Json, files: Files, clock: Clock, env: Env, net: Network
                           blks = try Db.load_page_blocks(store, pg.id)
                           extra = case pg.kind
                             Document:
-                              case try Table.get(store, Db.page_meta_table(), pg.id).map_error(
-                                Db.map_table_error
-                              )
+                              case try Db.get_page_meta(store, pg.id)
                                 Some(pm):
-                                  case try Table.get(
-                                    store,
-                                    Db.blueprints_table(),
-                                    pm.blueprint_id
-                                  ).map_error(Db.map_table_error)
+                                  case try Db.get_blueprint(store, pm.blueprint_id)
                                     Some(bp): Some(Blueprints.page_meta_plain_text(bp, pm))
                                     None: None
                                   end
                                 None: None
                               end
                             DatabaseRow(database_id: db_id, row_id: row_id):
-                              case try Table.get(store, Db.databases_table(), db_id).map_error(
-                                Db.map_table_error
-                              )
+                              case try Db.get_database(store, db_id)
                                 Some(def):
-                                  case try Table.get(store, Db.db_rows_table(), row_id).map_error(
-                                    Db.map_table_error
-                                  )
+                                  case try Db.get_db_row(store, row_id)
                                     Some(row): Some(DatabaseModel.row_plain_text(def, row))
                                     None: None
                                   end
@@ -4136,9 +4082,7 @@ fn drain_jobs(_payload: Json, files: Files, clock: Clock, env: Env, net: Network
                             }),
                             Db.map_ledger_error,
                             fn(tx)
-                              case try Table.tx_get(tx, Db.pages_table(), pid).map_error(
-                                Db.map_table_error
-                              )
+                              case try Db.tx_get_page(tx, pid)
                                 Some(live_pg) if live_pg.archived_at == None:
                                   t1 = try Db.tx_put_page_neural_vector(
                                     tx,
@@ -4259,7 +4203,7 @@ fn create_blueprint(
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "manage_schema", now)
       try validate_blueprint_relations_tx(t1, auth, bp)
-      t2 = try Table.put(t1, Db.blueprints_table(), bp.id, bp).map_error(Db.map_table_error)
+      t2 = try Db.tx_put_blueprint(t1, bp)
       Ok((t2, bp.to_json))
     end
   )
@@ -4316,7 +4260,7 @@ fn update_blueprint(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "manage_schema", now)
-      old_bp = case try Table.tx_get(t1, Db.blueprints_table(), id).map_error(Db.map_table_error)
+      old_bp = case try Db.tx_get_blueprint(t1, id)
         Some(b): b
         None: return Error(Missing(entity: "blueprint", id: id))
       end
@@ -4362,9 +4306,7 @@ fn update_blueprint(
         end
       end
 
-      t2 = try Table.put(t1, Db.blueprints_table(), next_bp.id, next_bp).map_error(
-        Db.map_table_error
-      )
+      t2 = try Db.tx_put_blueprint(t1, next_bp)
       Ok((t2, next_bp.to_json))
     end
   )
@@ -4425,7 +4367,7 @@ fn set_page_blueprint_meta(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "write_direct", now)
-      old_page = case try Table.tx_get(t1, Db.pages_table(), id).map_error(Db.map_table_error)
+      old_page = case try Db.tx_get_page(t1, id)
         Some(p) if p.archived_at == None: p
         Some(_) | None: return Error(Missing(entity: "page", id: id))
       end
@@ -4433,9 +4375,7 @@ fn set_page_blueprint_meta(
         return Error(BadInput(reason: "blueprints are only supported on Document pages"))
       end
       try Policy.require_collection_access(auth, "write_direct", old_page.collection_id)
-      col = case try Table.tx_get(t1, Db.collections_table(), old_page.collection_id).map_error(
-        Db.map_table_error
-      )
+      col = case try Db.tx_get_collection(t1, old_page.collection_id)
         Some(c): c
         None: return Error(Missing(entity: "collection", id: old_page.collection_id))
       end
@@ -4447,23 +4387,19 @@ fn set_page_blueprint_meta(
         )
       end
 
-      existing_rows = try Table.tx_lookup(t1, Db.blocks_table(), Db.blocks_by_page(), id).map_error(
-        Db.map_table_error
-      )
+      existing_rows = try Db.tx_lookup_blocks_by_page(t1, id)
       existing_blocks = Blocks.sort_blocks(existing_rows.map(fn(x) x.1 end))
 
       (t2, out_blocks, bp_opt, pm_opt) = case input.blueprint_id
         None:
-          cleaned = case try Table.tx_get(t1, Db.page_meta_table(), id).map_error(
-            Db.map_table_error
-          )
+          cleaned = case try Db.tx_get_page_meta(t1, id)
             Some(_): try Db.tx_delete_page_meta(t1, id)
             None: t1
           end
           (cleaned, existing_blocks, None, None)
         Some(raw_bid):
           bid = raw_bid.trim
-          bp = case try Table.tx_get(t1, Db.blueprints_table(), bid).map_error(Db.map_table_error)
+          bp = case try Db.tx_get_blueprint(t1, bid)
             Some(b): b
             None: return Error(Missing(entity: "blueprint", id: bid))
           end
@@ -4587,14 +4523,12 @@ fn sync_page_markdown(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "write_direct", now)
-      old_page = case try Table.tx_get(t1, Db.pages_table(), id).map_error(Db.map_table_error)
+      old_page = case try Db.tx_get_page(t1, id)
         Some(p) if p.archived_at == None: p
         Some(_) | None: return Error(Missing(entity: "page", id: id))
       end
       try Policy.require_collection_access(auth, "write_direct", old_page.collection_id)
-      col = case try Table.tx_get(t1, Db.collections_table(), old_page.collection_id).map_error(
-        Db.map_table_error
-      )
+      col = case try Db.tx_get_collection(t1, old_page.collection_id)
         Some(c): c
         None: return Error(Missing(entity: "collection", id: old_page.collection_id))
       end
@@ -4613,9 +4547,7 @@ fn sync_page_markdown(
         )
       end
 
-      existing_rows = try Table.tx_lookup(t1, Db.blocks_table(), Db.blocks_by_page(), id).map_error(
-        Db.map_table_error
-      )
+      existing_rows = try Db.tx_lookup_blocks_by_page(t1, id)
       existing_blocks = Blocks.sort_blocks(existing_rows.map(fn(x) x.1 end))
       reconciled = reconcile_markdown_blocks(id, existing_blocks, input.markdown, prov, id_prefix)
 
@@ -4640,11 +4572,9 @@ fn sync_page_markdown(
       )
       t2 = try Db.tx_save_page_and_blocks(t1, bumped_page, reconciled)
       (t3, _jid) = try Jobs.tx_put(t2, idx_job).map_error(Db.map_table_error)
-      pm_opt = try Table.tx_get(t3, Db.page_meta_table(), id).map_error(Db.map_table_error)
+      pm_opt = try Db.tx_get_page_meta(t3, id)
       bp_opt = case pm_opt
-        Some(pm): try Table.tx_get(t3, Db.blueprints_table(), pm.blueprint_id).map_error(
-          Db.map_table_error
-        )
+        Some(pm): try Db.tx_get_blueprint(t3, pm.blueprint_id)
         None: None
       end
       anchored_md = Blocks.to_anchored_markdown(reconciled)
@@ -4746,14 +4676,12 @@ fn show_block_context(_req: Api.Request, block_id: Text, auth: AuthContext, rf: 
         Some(b): b
         None: return Error(Missing(entity: "block", id: block_id))
       end
-      page = case try Table.get(store, Db.pages_table(), blk.page_id).map_error(Db.map_table_error)
+      page = case try Db.get_page(store, blk.page_id)
         Some(p) if p.archived_at == None: p
         Some(_) | None: return Error(Missing(entity: "block", id: block_id))
       end
       try Policy.require_collection_access(auth, "read", page.collection_id)
-      col = case try Table.get(store, Db.collections_table(), page.collection_id).map_error(
-        Db.map_table_error
-      )
+      col = case try Db.get_collection(store, page.collection_id)
         Some(c): c
         None: return Error(Missing(entity: "collection", id: page.collection_id))
       end
@@ -4777,15 +4705,12 @@ fn show_block_context(_req: Api.Request, block_id: Text, auth: AuthContext, rf: 
         next_blk = blks.get(found_idx + 1)
       end
 
-      pm_opt = try Table.get(store, Db.page_meta_table(), page.id).map_error(Db.map_table_error)
+      pm_opt = try Db.get_page_meta(store, page.id)
       bp_opt = case pm_opt
-        Some(pm): try Table.get(store, Db.blueprints_table(), pm.blueprint_id).map_error(
-          Db.map_table_error
-        )
+        Some(pm): try Db.get_blueprint(store, pm.blueprint_id)
         None: None
       end
-      cmt_rows = try Table.lookup(store, Db.comments_table(), Db.comments_by_page(), page.id)
-        .map_error(Db.map_table_error)
+      cmt_rows = try Db.lookup_comments_by_page(store, page.id)
       var blk_cmts = []
       for (_cid, c) in cmt_rows
         if c.block_id == Some(blk.id)

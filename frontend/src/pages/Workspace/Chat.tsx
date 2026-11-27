@@ -1,12 +1,16 @@
-import { usePage } from "@inertiajs/react";
+import { Link, usePage } from "@inertiajs/react";
 import {
   AtSign,
   Award,
   Check,
   CheckCheck,
+  CheckSquare,
   Edit3,
+  FileText,
+  GitPullRequest,
   Hash,
   Inbox,
+  Link2,
   Lock,
   MessageSquare,
   Paperclip,
@@ -25,6 +29,7 @@ import type {
   ChatAttachmentSummary,
   ChatChannel,
   ChatInboxItem,
+  ChatLinkableEntity,
   ChatMessage,
   ChatPrincipalSummary,
   ChatSearchHit,
@@ -118,6 +123,23 @@ export default function Chat({
   const [newTopic, setNewTopic] = useState("");
   const [newMemberIds, setNewMemberIds] = useState<string[]>([]);
   const [creatingCh, setCreatingCh] = useState(false);
+
+  // Chat Moat: Create Task modal, Draft Doc Proposal modal & Entity Ref picker
+  const [taskModalMsg, setTaskModalMsg] = useState<ChatMessage | null>(null);
+  const [taskDbId, setTaskDbId] = useState<string>(databases[0]?.id ?? "");
+  const [taskTitle, setTaskTitle] = useState("");
+  const [taskSubmitting, setTaskSubmitting] = useState(false);
+
+  const [propModalMsg, setPropModalMsg] = useState<ChatMessage | null>(null);
+  const [propTargetPageId, setPropTargetPageId] = useState("");
+  const [propTitle, setPropTitle] = useState("");
+  const [propReason, setPropReason] = useState("");
+  const [propPages, setPropPages] = useState<ChatLinkableEntity[]>([]);
+  const [propSubmitting, setPropSubmitting] = useState(false);
+
+  const [entityPickerOpen, setEntityPickerOpen] = useState(false);
+  const [entityQuery, setEntityQuery] = useState("");
+  const [entityResults, setEntityResults] = useState<ChatLinkableEntity[]>([]);
 
   const [error, setError] = useState<string | null>(null);
   const [highlightMsgId] = useState<string | null>(initial_message_id ?? null);
@@ -239,8 +261,14 @@ export default function Chat({
               if (prev.some((r) => r.id === msg.id)) return prev;
               return [...prev, msg];
             });
+            if (msg.needs_enrichment && threadRoot && threadRoot.id === msg.parent_message_id) {
+              void loadThread(activeChannelId, threadRoot);
+            }
           } else {
             setMessages((prev) => (prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]));
+            if (msg.needs_enrichment) {
+              void loadMessages(activeChannelId);
+            }
           }
         } else if (!msg.parent_message_id && msg.author_id !== auth?.id) {
           setChannels((prev) =>
@@ -255,6 +283,12 @@ export default function Chat({
         setMessages((prev) => prev.map((m) => (m.id === msg.id ? { ...m, ...msg } : m)));
         setThreadReplies((prev) => prev.map((r) => (r.id === msg.id ? { ...r, ...msg } : r)));
         setThreadRoot((prev) => (prev && prev.id === msg.id ? { ...prev, ...msg } : prev));
+        if (msg.needs_enrichment && activeChannelId && msg.channel_id === activeChannelId) {
+          void loadMessages(activeChannelId);
+          if (threadRoot && (msg.parent_message_id === threadRoot.id || msg.id === threadRoot.id)) {
+            void loadThread(activeChannelId, threadRoot);
+          }
+        }
       } else if (eventName === "chat.message_deleted") {
         const msgId = typeof data.message_id === "string" ? data.message_id : "";
         if (!msgId) return;
@@ -281,8 +315,119 @@ export default function Chat({
         }
       }
     },
-    [activeChannelId, auth?.id, inboxOpen, loadInbox, threadRoot]
+    [activeChannelId, auth?.id, inboxOpen, loadInbox, loadMessages, loadThread, threadRoot]
   );
+
+  function statusBadgeClasses(color?: string | null): string {
+    switch (color) {
+      case "green":
+        return "border-emerald-200 bg-emerald-50 text-emerald-800";
+      case "blue":
+        return "border-sky-200 bg-sky-50 text-sky-800";
+      case "amber":
+        return "border-amber-200 bg-amber-50 text-amber-800";
+      case "red":
+        return "border-rose-200 bg-rose-50 text-rose-800";
+      case "purple":
+        return "border-purple-200 bg-purple-50 text-purple-800";
+      default:
+        return "border-stone-200 bg-stone-100 text-stone-700";
+    }
+  }
+
+  const loadLinkableEntities = useCallback(async (q: string, kind?: string) => {
+    try {
+      const params = new URLSearchParams({ limit: "25" });
+      if (q.trim()) params.set("q", q.trim());
+      if (kind) params.set("kind", kind);
+      const res = await apiFetch<{ entities: ChatLinkableEntity[] }>(
+        `/api/v1/chat/entities?${params.toString()}`
+      );
+      if (kind === "page") setPropPages(res.entities ?? []);
+      else setEntityResults(res.entities ?? []);
+    } catch {
+      // ignore picker load failure
+    }
+  }, []);
+
+  function openCreateTaskModal(msg: ChatMessage) {
+    setTaskModalMsg(msg);
+    setTaskDbId(databases[0]?.id ?? "");
+    const firstLine = (msg.body_markdown || "").split("\n")[0]?.trim() || "";
+    setTaskTitle(firstLine.slice(0, 80) || "Follow-up task");
+  }
+
+  async function handleCreateTaskFromMsg(e: React.FormEvent) {
+    e.preventDefault();
+    if (!activeChannelId || !taskModalMsg || !taskDbId || taskSubmitting) return;
+    setTaskSubmitting(true);
+    setError(null);
+    try {
+      const res = await apiFetch<{ message: ChatMessage }>(
+        `/api/v1/chat/channels/${encodeURIComponent(
+          activeChannelId
+        )}/messages/${encodeURIComponent(taskModalMsg.id)}/create-task`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            database_id: taskDbId,
+            title: taskTitle.trim() || undefined,
+          }),
+        }
+      );
+      const mergeUpdated = (m: ChatMessage): ChatMessage =>
+        m.id === res.message.id ? { ...m, ...res.message } : m;
+      setMessages((prev) => prev.map(mergeUpdated));
+      setThreadReplies((prev) => prev.map(mergeUpdated));
+      setThreadRoot((prev) => (prev && prev.id === res.message.id ? mergeUpdated(prev) : prev));
+      setTaskModalMsg(null);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to create task from message");
+    } finally {
+      setTaskSubmitting(false);
+    }
+  }
+
+  function openDraftPropModal(msg: ChatMessage) {
+    setPropModalMsg(msg);
+    setPropTargetPageId("");
+    const firstLine = (msg.body_markdown || "").split("\n")[0]?.trim() || "";
+    setPropTitle(`Decision: ${firstLine.slice(0, 72) || "Doc update"}`);
+    setPropReason("Promoted chat decision into living documentation");
+    void loadLinkableEntities("", "page");
+  }
+
+  async function handleDraftProposalFromMsg(e: React.FormEvent) {
+    e.preventDefault();
+    if (!activeChannelId || !propModalMsg || !propTargetPageId || propSubmitting) return;
+    setPropSubmitting(true);
+    setError(null);
+    try {
+      const res = await apiFetch<{ message: ChatMessage }>(
+        `/api/v1/chat/channels/${encodeURIComponent(
+          activeChannelId
+        )}/messages/${encodeURIComponent(propModalMsg.id)}/draft-proposal`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            target_page_id: propTargetPageId,
+            title: propTitle.trim() || undefined,
+            reason: propReason.trim() || undefined,
+          }),
+        }
+      );
+      const mergeUpdated = (m: ChatMessage): ChatMessage =>
+        m.id === res.message.id ? { ...m, ...res.message } : m;
+      setMessages((prev) => prev.map(mergeUpdated));
+      setThreadReplies((prev) => prev.map(mergeUpdated));
+      setThreadRoot((prev) => (prev && prev.id === res.message.id ? mergeUpdated(prev) : prev));
+      setPropModalMsg(null);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to draft doc proposal");
+    } finally {
+      setPropSubmitting(false);
+    }
+  }
 
   async function handleSendMessage(e: React.FormEvent) {
     e.preventDefault();
@@ -651,6 +796,22 @@ export default function Chat({
                   <MessageSquare className="h-3.5 w-3.5" />
                 </button>
               )}
+              <button
+                type="button"
+                onClick={() => openCreateTaskModal(msg)}
+                title="Create Database Task"
+                className="rounded p-1 text-stone-400 hover:bg-emerald-50 hover:text-emerald-700"
+              >
+                <CheckSquare className="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => openDraftPropModal(msg)}
+                title="Draft Doc Update Proposal"
+                className="rounded p-1 text-stone-400 hover:bg-indigo-50 hover:text-indigo-700"
+              >
+                <GitPullRequest className="h-3.5 w-3.5" />
+              </button>
               {mine && !inThread && (
                 <button
                   type="button"
@@ -739,6 +900,81 @@ export default function Chat({
             ))}
           </div>
         )}
+
+        {!deleted && msg.inline_refs && msg.inline_refs.length > 0 && (
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {msg.inline_refs.map((ref) =>
+              ref.accessible && ref.url ? (
+                <Link
+                  key={`${ref.kind}-${ref.id}`}
+                  href={ref.url}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-stone-200 bg-stone-50 px-2.5 py-1 text-xs text-stone-800 hover:border-sky-300 hover:bg-sky-50/60"
+                >
+                  <FileText className="h-3 w-3 text-stone-500" />
+                  <span className="font-medium truncate max-w-[180px]">{ref.title}</span>
+                  <span className="text-[10px] text-stone-400">{ref.subtitle}</span>
+                  {ref.status_label && (
+                    <span
+                      className={`rounded-full border px-1.5 py-0 text-[10px] font-medium ${statusBadgeClasses(
+                        ref.status_color
+                      )}`}
+                    >
+                      {ref.status_label}
+                    </span>
+                  )}
+                </Link>
+              ) : (
+                <span
+                  key={`${ref.kind}-${ref.id}`}
+                  className="inline-flex items-center gap-1 rounded-lg border border-amber-200 bg-amber-50/70 px-2 py-1 text-[11px] font-medium text-amber-900"
+                >
+                  <Lock className="h-3 w-3 text-amber-700" />
+                  {ref.title}
+                </span>
+              )
+            )}
+          </div>
+        )}
+
+        {!deleted &&
+          ((msg.linked_rows && msg.linked_rows.length > 0) ||
+            (msg.linked_proposals && msg.linked_proposals.length > 0)) && (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {(msg.linked_rows ?? []).map((lr) => (
+                <Link
+                  key={lr.row_id}
+                  href={`/p/${lr.page_id}`}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50/60 px-2.5 py-1 text-xs text-stone-900 hover:bg-emerald-50"
+                >
+                  <CheckSquare className="h-3 w-3 text-emerald-700" />
+                  <span className="font-medium truncate max-w-[180px]">{lr.title}</span>
+                  <span className="text-[10px] text-stone-500">{lr.database_title}</span>
+                  {lr.status_label && (
+                    <span
+                      className={`rounded-full border px-1.5 py-0 text-[10px] font-semibold ${statusBadgeClasses(
+                        lr.status_color
+                      )}`}
+                    >
+                      {lr.status_label}
+                    </span>
+                  )}
+                </Link>
+              ))}
+              {(msg.linked_proposals ?? []).map((lp) => (
+                <Link
+                  key={lp.proposal_id}
+                  href={`/p/${lp.target_page_id}`}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-200 bg-indigo-50/60 px-2.5 py-1 text-xs text-stone-900 hover:bg-indigo-50"
+                >
+                  <GitPullRequest className="h-3 w-3 text-indigo-700" />
+                  <span className="font-medium truncate max-w-[180px]">{lp.title}</span>
+                  <span className="rounded-full bg-white border border-indigo-200 px-1.5 py-0 text-[10px] font-mono uppercase text-indigo-800">
+                    {lp.status}
+                  </span>
+                </Link>
+              ))}
+            </div>
+          )}
 
         {!deleted && (reactionEntries.length > 0 || (!inThread && (msg.reply_count ?? 0) > 0)) && (
           <div className="mt-2.5 flex flex-wrap items-center gap-2">
@@ -1007,6 +1243,12 @@ export default function Chat({
                         FERPA Vault Audited
                       </span>
                     )}
+                    {activeChannel.read_only && (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-stone-100 border border-stone-200 px-2 py-0.5 text-[10px] font-semibold text-stone-700">
+                        <Lock className="h-3 w-3" />
+                        Read-only archive
+                      </span>
+                    )}
                   </div>
                   {activeChannel.topic && (
                     <p className="text-xs text-stone-500 truncate mt-0.5">{activeChannel.topic}</p>
@@ -1107,84 +1349,155 @@ export default function Chat({
                 )}
               </div>
 
-              <form onSubmit={handleSendMessage} className="border-t border-stone-200 p-3.5 bg-white">
-                {pendingAtts.length > 0 && (
-                  <div className="mb-2 flex flex-wrap gap-2">
-                    {pendingAtts.map((a) => (
-                      <span
-                        key={a.id}
-                        className="inline-flex items-center gap-1.5 rounded-lg border border-stone-200 bg-stone-50 px-2.5 py-1 text-xs text-stone-700"
-                      >
-                        <Paperclip className="h-3 w-3" />
-                        {a.filename}
+              {activeChannel.read_only ? (
+                <div className="border-t border-stone-200 px-4 py-3 bg-stone-50 text-xs text-stone-600 flex items-center gap-2">
+                  <Lock className="h-3.5 w-3.5 text-stone-500 shrink-0" />
+                  Read-only archive imported from Slack — posting, edits, and deletions are disabled.
+                </div>
+              ) : (
+                <form onSubmit={handleSendMessage} className="relative border-t border-stone-200 p-3.5 bg-white">
+                  {entityPickerOpen && (
+                    <div className="mb-2.5 rounded-xl border border-stone-200 bg-stone-50 p-2.5 space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <input
+                          type="text"
+                          value={entityQuery}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setEntityQuery(val);
+                            void loadLinkableEntities(val);
+                          }}
+                          placeholder="Search pages, tasks, proposals to cite (@/#)..."
+                          className="flex-1 rounded-lg border border-stone-200 bg-white px-2.5 py-1 text-xs outline-none focus:border-stone-900"
+                        />
                         <button
                           type="button"
-                          onClick={() =>
-                            setPendingAtts((prev) => prev.filter((x) => x.id !== a.id))
-                          }
+                          onClick={() => setEntityPickerOpen(false)}
+                          className="rounded p-1 text-stone-400 hover:text-stone-700"
                         >
-                          <X className="h-3 w-3 text-stone-400 hover:text-stone-800" />
+                          <X className="h-3.5 w-3.5" />
                         </button>
-                      </span>
-                    ))}
+                      </div>
+                      <div className="max-h-36 overflow-y-auto space-y-1">
+                        {entityResults.length === 0 ? (
+                          <div className="text-[11px] text-stone-400 px-1 py-1">No matching entities.</div>
+                        ) : (
+                          entityResults.map((ent) => (
+                            <button
+                              key={`${ent.kind}-${ent.id}`}
+                              type="button"
+                              onClick={() => {
+                                setComposer((prev) =>
+                                  prev ? `${prev.trimEnd()} ${ent.insert_token} ` : `${ent.insert_token} `
+                                );
+                                setEntityPickerOpen(false);
+                              }}
+                              className="w-full flex items-center justify-between gap-2 rounded-lg bg-white border border-stone-200 px-2.5 py-1 text-left text-xs hover:border-sky-300 hover:bg-sky-50/40"
+                            >
+                              <span className="font-medium text-stone-900 truncate">{ent.title}</span>
+                              <span className="shrink-0 font-mono text-[10px] text-stone-500">
+                                {ent.subtitle}
+                              </span>
+                            </button>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  )}
+                  {pendingAtts.length > 0 && (
+                    <div className="mb-2 flex flex-wrap gap-2">
+                      {pendingAtts.map((a) => (
+                        <span
+                          key={a.id}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-stone-200 bg-stone-50 px-2.5 py-1 text-xs text-stone-700"
+                        >
+                          <Paperclip className="h-3 w-3" />
+                          {a.filename}
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setPendingAtts((prev) => prev.filter((x) => x.id !== a.id))
+                            }
+                          >
+                            <X className="h-3 w-3 text-stone-400 hover:text-stone-800" />
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  <div className="flex items-end gap-2">
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      className="hidden"
+                      onChange={(e) => {
+                        const f = e.target.files?.[0];
+                        if (f) void handleUploadFile(f);
+                      }}
+                    />
+                    <button
+                      type="button"
+                      disabled={uploading}
+                      onClick={() => fileInputRef.current?.click()}
+                      title="Attach file"
+                      className="rounded-lg border border-stone-200 p-2 text-stone-500 hover:bg-stone-100 hover:text-stone-800 disabled:opacity-50"
+                    >
+                      <Paperclip className="h-4 w-4" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const next = !entityPickerOpen;
+                        setEntityPickerOpen(next);
+                        if (next) void loadLinkableEntities(entityQuery);
+                      }}
+                      title="Insert @page / @task / @proposal citation"
+                      className={`rounded-lg border p-2 transition ${
+                        entityPickerOpen
+                          ? "border-sky-400 bg-sky-50 text-sky-800"
+                          : "border-stone-200 text-stone-500 hover:bg-stone-100"
+                      }`}
+                    >
+                      <Link2 className="h-4 w-4" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setMarkDecision((p) => !p)}
+                      title="Flag message as Decision"
+                      className={`rounded-lg border p-2 transition ${
+                        markDecision
+                          ? "border-amber-400 bg-amber-50 text-amber-800"
+                          : "border-stone-200 text-stone-500 hover:bg-stone-100"
+                      }`}
+                    >
+                      <Award className="h-4 w-4" />
+                    </button>
+                    <textarea
+                      rows={2}
+                      value={composer}
+                      onChange={(e) => setComposer(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && !e.shiftKey) {
+                          e.preventDefault();
+                          void handleSendMessage(e);
+                        }
+                      }}
+                      placeholder={`Message ${
+                        activeChannel.kind === "dm" ? activeChannel.name : `#${activeChannel.name}`
+                      } (@mention teammates or @page:/[[row:...]] refs)...`}
+                      className="flex-1 resize-none rounded-xl border border-stone-200 px-3 py-2 text-sm outline-none focus:border-stone-900"
+                    />
+                    <button
+                      type="submit"
+                      disabled={sending || (!composer.trim() && pendingAtts.length === 0)}
+                      className="inline-flex items-center gap-1.5 rounded-xl bg-stone-900 px-4 py-2 text-xs font-medium text-white hover:bg-stone-800 disabled:opacity-50"
+                    >
+                      <Send className="h-3.5 w-3.5" />
+                      Send
+                    </button>
                   </div>
-                )}
-                <div className="flex items-end gap-2">
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    className="hidden"
-                    onChange={(e) => {
-                      const f = e.target.files?.[0];
-                      if (f) void handleUploadFile(f);
-                    }}
-                  />
-                  <button
-                    type="button"
-                    disabled={uploading}
-                    onClick={() => fileInputRef.current?.click()}
-                    title="Attach file"
-                    className="rounded-lg border border-stone-200 p-2 text-stone-500 hover:bg-stone-100 hover:text-stone-800 disabled:opacity-50"
-                  >
-                    <Paperclip className="h-4 w-4" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setMarkDecision((p) => !p)}
-                    title="Flag message as Decision"
-                    className={`rounded-lg border p-2 transition ${
-                      markDecision
-                        ? "border-amber-400 bg-amber-50 text-amber-800"
-                        : "border-stone-200 text-stone-500 hover:bg-stone-100"
-                    }`}
-                  >
-                    <Award className="h-4 w-4" />
-                  </button>
-                  <textarea
-                    rows={2}
-                    value={composer}
-                    onChange={(e) => setComposer(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && !e.shiftKey) {
-                        e.preventDefault();
-                        void handleSendMessage(e);
-                      }
-                    }}
-                    placeholder={`Message ${
-                      activeChannel.kind === "dm" ? activeChannel.name : `#${activeChannel.name}`
-                    } (@mention teammates)...`}
-                    className="flex-1 resize-none rounded-xl border border-stone-200 px-3 py-2 text-sm outline-none focus:border-stone-900"
-                  />
-                  <button
-                    type="submit"
-                    disabled={sending || (!composer.trim() && pendingAtts.length === 0)}
-                    className="inline-flex items-center gap-1.5 rounded-xl bg-stone-900 px-4 py-2 text-xs font-medium text-white hover:bg-stone-800 disabled:opacity-50"
-                  >
-                    <Send className="h-3.5 w-3.5" />
-                    Send
-                  </button>
-                </div>
-              </form>
+                </form>
+              )}
             </>
           ) : (
             <div className="flex-1 flex flex-col items-center justify-center p-8 text-center">
@@ -1379,6 +1692,145 @@ export default function Chat({
                 className="rounded-lg bg-stone-900 px-4 py-1.5 text-xs font-medium text-white disabled:opacity-50"
               >
                 {creatingCh ? "Creating..." : "Create"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Create Database Task Modal */}
+      {taskModalMsg && (
+        <div className="fixed inset-0 z-50 bg-stone-950/40 backdrop-blur-xs flex items-center justify-center p-4">
+          <form
+            onSubmit={handleCreateTaskFromMsg}
+            className="w-full max-w-md rounded-2xl border border-stone-200 bg-white p-6 shadow-xl space-y-4"
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-stone-900">Create Database Task from Chat</h3>
+              <button
+                type="button"
+                onClick={() => setTaskModalMsg(null)}
+                className="text-stone-400 hover:text-stone-700"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-stone-700 mb-1">
+                Target Database
+              </label>
+              <select
+                value={taskDbId}
+                onChange={(e) => setTaskDbId(e.target.value)}
+                required
+                className="w-full rounded-lg border border-stone-200 px-3 py-1.5 text-sm bg-white"
+              >
+                {databases.map((db) => (
+                  <option key={db.id} value={db.id}>
+                    {db.title}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-stone-700 mb-1">Task Title</label>
+              <input
+                type="text"
+                value={taskTitle}
+                onChange={(e) => setTaskTitle(e.target.value)}
+                required
+                placeholder="Action item title"
+                className="w-full rounded-lg border border-stone-200 px-3 py-1.5 text-sm"
+              />
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setTaskModalMsg(null)}
+                className="rounded-lg border border-stone-200 px-3.5 py-1.5 text-xs font-medium text-stone-600"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={taskSubmitting || !taskDbId}
+                className="rounded-lg bg-stone-900 px-4 py-1.5 text-xs font-medium text-white disabled:opacity-50"
+              >
+                {taskSubmitting ? "Creating..." : "Create Task"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Draft Living Doc Change Proposal Modal */}
+      {propModalMsg && (
+        <div className="fixed inset-0 z-50 bg-stone-950/40 backdrop-blur-xs flex items-center justify-center p-4">
+          <form
+            onSubmit={handleDraftProposalFromMsg}
+            className="w-full max-w-md rounded-2xl border border-stone-200 bg-white p-6 shadow-xl space-y-4"
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-stone-900">Draft Living Doc Update</h3>
+              <button
+                type="button"
+                onClick={() => setPropModalMsg(null)}
+                className="text-stone-400 hover:text-stone-700"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-stone-700 mb-1">Target Page</label>
+              <select
+                value={propTargetPageId}
+                onChange={(e) => setPropTargetPageId(e.target.value)}
+                required
+                className="w-full rounded-lg border border-stone-200 px-3 py-1.5 text-sm bg-white"
+              >
+                <option value="">Select a visible page...</option>
+                {propPages.map((pg) => (
+                  <option key={pg.id} value={pg.id}>
+                    {pg.title}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-stone-700 mb-1">
+                Proposal Title
+              </label>
+              <input
+                type="text"
+                value={propTitle}
+                onChange={(e) => setPropTitle(e.target.value)}
+                required
+                className="w-full rounded-lg border border-stone-200 px-3 py-1.5 text-sm"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-stone-700 mb-1">Reason</label>
+              <input
+                type="text"
+                value={propReason}
+                onChange={(e) => setPropReason(e.target.value)}
+                className="w-full rounded-lg border border-stone-200 px-3 py-1.5 text-sm"
+              />
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setPropModalMsg(null)}
+                className="rounded-lg border border-stone-200 px-3.5 py-1.5 text-xs font-medium text-stone-600"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={propSubmitting || !propTargetPageId}
+                className="rounded-lg bg-stone-900 px-4 py-1.5 text-xs font-medium text-white disabled:opacity-50"
+              >
+                {propSubmitting ? "Drafting..." : "Draft Proposal"}
               </button>
             </div>
           </form>

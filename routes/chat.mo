@@ -25,8 +25,8 @@ use Json
 use Modb{Store}
 use Modb.Grants
 use Modb.Ledger
-use Modb.Table
 use Routes.Auth
+use Routes.ChatMoat
 use VaultOps
 
 fn json_ok(status: Int, body: Json) : Api.Response
@@ -85,6 +85,9 @@ fn tx_authorize_if_agent(tx: Modb.WriteTx, auth: AuthContext, action: Text, now:
 end
 
 fn require_channel_post_access(auth: AuthContext, ch: Json) : Result(Text, AppError)
+  if ch.bool_at("read_only") == Some(true)
+    return Error(Forbidden(reason: "channel is a read-only archive"))
+  end
   if ChatOps.can_access_channel?(auth, ch, "write_direct")
     Ok("write_direct")
   else if ChatOps.can_access_channel?(auth, ch, "comment")
@@ -166,18 +169,28 @@ fn attachment_summary_json(a: Attachment) : Json
   })
 end
 
-fn enrich_message_json(store: Store, msg: Json, reply_count: Int) : Result(Json, AppError)
+fn enrich_message_json(store: Store, auth: AuthContext, msg: Json, reply_count: Int) : Result(
+  Json,
+  AppError
+)
   var att_objs = []
   for aid in VaultOps.json_string_list(msg, "attachment_ids")
-    case try Table.get(store, Db.attachments_table(), aid).map_error(Db.map_table_error)
+    case try Db.get_attachment(store, aid)
       Some(att): att_objs = att_objs.append(attachment_summary_json(att))
       None: Unit
     end
   end
+  moat = try ChatMoat.resolve_message_moat_enrichment(store, auth, msg)
   case msg
     Json.Object(m): Ok(
       Json.Object(
-        m.set("reply_count", Json.int(reply_count)).set("attachments", Json.Array(att_objs))
+        m.set("reply_count", Json.int(reply_count)).set("attachments", Json.Array(att_objs)).set(
+          "linked_rows",
+          moat.get("linked_rows") or Json.Array([])
+        ).set("linked_proposals", moat.get("linked_proposals") or Json.Array([])).set(
+          "inline_refs",
+          moat.get("inline_refs") or Json.Array([])
+        )
       )
     )
     Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): Ok(msg)
@@ -230,18 +243,14 @@ fn chat_page(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: En
       Db.map_ledger_error,
       fn(db)
         store = Ledger.store(db)
-        c_rows = try Table.scan(store, Db.collections_table(), None, None, 200).map_error(
-          Db.map_table_error
-        )
+        c_rows = try Db.scan_collections(store, 200)
         var c_list = []
         for (_cid, c) in c_rows
           if c.archived_at == None and Policy.collection_permitted?(a, c.id)
             c_list = c_list.append(c)
           end
         end
-        d_rows = try Table.scan(store, Db.databases_table(), None, None, 200).map_error(
-          Db.map_table_error
-        )
+        d_rows = try Db.scan_databases(store, 200)
         var d_list = []
         for (_did, d) in d_rows
           if Policy.collection_permitted?(a, d.collection_id)
@@ -375,7 +384,7 @@ fn create_channel(
           store = Ledger.store(db)
           var names = []
           for mid in clean_members
-            p = case try Table.get(store, Db.principals_table(), mid).map_error(Db.map_table_error)
+            p = case try Db.get_principal(store, mid)
               Some(found) if not found.suspended: found
               Some(_) | None: return Error(Missing(entity: "principal", id: mid))
             end
@@ -511,7 +520,7 @@ fn create_channel(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "write_direct", now)
-      _col = case try Table.tx_get(t1, Db.collections_table(), col_id).map_error(Db.map_table_error)
+      _col = case try Db.tx_get_collection(t1, col_id)
         Some(c) if c.archived_at == None: c
         Some(_) | None: return Error(Missing(entity: "collection", id: col_id))
       end
@@ -693,7 +702,7 @@ fn list_messages(
       for m in win
         mid = m.text_at("id") or ""
         rc = reply_counts.get(mid) or 0
-        enr_msgs = enr_msgs.append(try enrich_message_json(store, m, rc))
+        enr_msgs = enr_msgs.append(try enrich_message_json(store, auth, m, rc))
       end
       next_before = case enr_msgs.first
         Some(f): f.text_at("id")
@@ -790,7 +799,7 @@ fn post_message(
                 Some(ex_id):
                   case try ChatOps.get_message(store, id, ex_id.trim)
                     Some(ex_msg):
-                      enr = try enrich_message_json(store, ex_msg, 0)
+                      enr = try enrich_message_json(store, auth, ex_msg, 0)
                       return Ok(
                         Json.Object({
                           "existing": enr,
@@ -840,7 +849,7 @@ fn post_message(
 
       var resolved_atts = []
       for aid in att_ids
-        att = case try Table.get(store, Db.attachments_table(), aid).map_error(Db.map_table_error)
+        att = case try Db.get_attachment(store, aid)
           Some(a): a
           None: return Error(Missing(entity: "attachment", id: aid))
         end
@@ -855,9 +864,7 @@ fn post_message(
             end
             try ChatOps.require_channel_access(auth, src_ch, "read")
           else
-            pg = case try Table.get(store, Db.pages_table(), att.page_id).map_error(
-              Db.map_table_error
-            )
+            pg = case try Db.get_page(store, att.page_id)
               Some(p) if p.archived_at == None: p
               Some(_) | None: return Error(Missing(entity: "page", id: att.page_id))
             end
@@ -935,7 +942,7 @@ fn post_message(
     ) | None: Unit
   end
   post_action = preflight.text_at("post_action") or "comment"
-  att_summaries = preflight.list_at("attachments") or []
+  _att_summaries = preflight.list_at("attachments") or []
   rec_objs = preflight.list_at("recipients") or []
 
   new_msg_id = "msg_#{Id.ulid(rng, clock)}"
@@ -1058,21 +1065,23 @@ fn post_message(
 
   saved_msg = tx_res.get("message") or msg_json
   dedup? = tx_res.bool_at("deduplicated") or false
-  enr_msg = case saved_msg
-    Json.Object(m): Json.Object(
-      m.set("reply_count", Json.int(0)).set("attachments", Json.Array(att_summaries))
-    )
-    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): saved_msg
-  end
+  enr_msg = try Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db) enrich_message_json(Ledger.store(db), auth, saved_msg, 0) end
+  )
   if dedup?
     return Ok(json_ok(200, Json.Object({"message": enr_msg, "deduplicated": Json.Boolean(true)})))
   end
 
+  sse_msg = ChatMoat.strip_msg_for_sse(enr_msg)
   var resp = json_ok(201, Json.Object({"message": enr_msg, "deduplicated": Json.Boolean(false)}))
     .with_sse_publish_json(
       "chat:channel:#{id}",
       "chat.message_created",
-      Json.Object({"channel_id": Json.String(id), "message": enr_msg})
+      Json.Object({"channel_id": Json.String(id), "message": sse_msg})
     )
   for (rec_id, _nid, ntf) in notif_items
     resp = resp.with_sse_publish_json(
@@ -1166,13 +1175,14 @@ fn edit_message(
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
-    fn(db) enrich_message_json(Ledger.store(db), updated, 0) end
+    fn(db) enrich_message_json(Ledger.store(db), auth, updated, 0) end
   )
+  sse_msg = ChatMoat.strip_msg_for_sse(enr_msg)
   Ok(
     json_ok(200, Json.Object({"message": enr_msg})).with_sse_publish_json(
       "chat:channel:#{id}",
       "chat.message_updated",
-      Json.Object({"channel_id": Json.String(id), "message": enr_msg})
+      Json.Object({"channel_id": Json.String(id), "message": sse_msg})
     )
   )
 end
