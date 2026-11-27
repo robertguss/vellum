@@ -37,6 +37,7 @@ use Routes.Databases
 use Routes.Importer
 use Routes.Mcp
 use Routes.Packs
+use Routes.Sync
 use Routes.Workspace
 
 api
@@ -135,6 +136,8 @@ api
     delete "/packs/:id" Packs.delete_pack
     get "/packs/:slug" Packs.compile_pack_json
     get "/packs/:slug/markdown" Packs.compile_pack_markdown
+    get "/sync/snapshot" Sync.sync_snapshot
+    post "/sync/push" Sync.sync_push
     post "/import/notion" Importer.import_notion
     post "/ai/ask" Ai.ask_workspace
     post "/ai/deep-research" Ai.deep_research
@@ -8924,4 +8927,474 @@ test "RLM Tier 1 Deep Research API & MCP vellum.rlm_query: Modb.Views ReadProgra
   )
   assert mcp_denied.status == 200
   assert must_json(mcp_denied.text).bool_at("result.isError") == Some(true)
+end
+
+test "Conflict-safe vellum sync API: grant-filtered snapshot, YAML + Blueprint push, new page create, and version/policy conflict routing to Modb.World Proposals"
+  manifest_json = """
+    {
+      "src/main.tsx": {
+        "file": "assets/main-p31.js",
+        "css": ["assets/main-p31.css"],
+        "isEntry": true
+      }
+    }
+    """
+  files = Files.in_memory({
+    "public/manifest.json": manifest_json,
+    "public/assets/main-p31.js": "console.log('p31');",
+    "public/assets/main-p31.css": "body{margin:0}"
+  })
+  rng = SecureRandom.seeded(20261205)
+  t0 = Time.parse("2026-12-05T10:00:00Z") or stop "t0"
+  clock = Clock.fixed(t0)
+  env = Env.of({"VELLUM_MODE": "solo", "VELLUM_INSECURE_COOKIES": "1"})
+  empty_net = Network.fake(Http.replies([]))
+
+  guest = WebTest.new().with_header("Host", "127.0.0.1:8080")
+  login_res = ApiTest.send(
+    Main,
+    WebTest.prepare(guest, Api.get("/auth/solo/login?return_to=/")),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert login_res.status == 303
+  owner = WebTest.absorb(guest, login_res)
+
+  dir_col_res = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/collections").with_json(
+        Workspace.CreateCollectionInput(
+          slug: "sync-direct",
+          name: "Sync Direct",
+          description: None,
+          icon: None,
+          write_policy: DirectWithAudit,
+          freshness_ttl_days: None
+        )
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert dir_col_res.status == 201
+  dir_col_id = must_json(dir_col_res.text).text_at("id") or stop "dir_col_id"
+
+  gated_col_res = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/collections").with_json(
+        Workspace.CreateCollectionInput(
+          slug: "sync-gated",
+          name: "Sync Gated",
+          description: None,
+          icon: None,
+          write_policy: ProposalsRequiredForAgents,
+          freshness_ttl_days: None
+        )
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert gated_col_res.status == 201
+  gated_col_id = must_json(gated_col_res.text).text_at("id") or stop "gated_col_id"
+
+  sec_col_res = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/collections").with_json(
+        Workspace.CreateCollectionInput(
+          slug: "sync-secret",
+          name: "Sync Secret",
+          description: None,
+          icon: None,
+          write_policy: DirectWithAudit,
+          freshness_ttl_days: None
+        )
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert sec_col_res.status == 201
+  sec_col_id = must_json(sec_col_res.text).text_at("id") or stop "sec_col_id"
+
+  # Blueprint with required tier field
+  bp_res = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/blueprints").with_json(
+        Workspace.CreateBlueprintInput(
+          slug: "runbook-bp",
+          name: "Runbook BP",
+          description: Some("Service runbook metadata"),
+          icon: None,
+          fields: [
+            PropertyDef(
+              id: "tier",
+              name: "Tier",
+              kind: Select(
+                options: [
+                  SelectOption(id: "t1", label: "Tier 1", color: Red),
+                  SelectOption(id: "t2", label: "Tier 2", color: Blue)
+                ]
+              ),
+              required: true,
+              sort_order: "a"
+            )
+          ],
+          default_template_markdown: Some("## Steps")
+        )
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert bp_res.status == 201
+  bp_id = must_json(bp_res.text).text_at("id") or stop "bp_id"
+
+  pg_res = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/pages").with_json(
+        Workspace.CreatePageInput(
+          collection_id: dir_col_id,
+          parent_page_id: None,
+          title: "Failover SOP",
+          markdown: "## Steps\n\nCheck quorum before failover.",
+          icon: None,
+          freshness_ttl_days: None,
+          reason: Some("seed sync page")
+        )
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert pg_res.status == 201
+  pg_id = must_json(pg_res.text).text_at("page.id") or stop "pg_id"
+
+  sec_pg = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/pages").with_json(
+        Workspace.CreatePageInput(
+          collection_id: sec_col_id,
+          parent_page_id: None,
+          title: "Secret Note",
+          markdown: "Confidential secret-xyz.",
+          icon: None,
+          freshness_ttl_days: None,
+          reason: Some("seed secret sync page")
+        )
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert sec_pg.status == 201
+
+  meta_res = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.put("/api/pages/#{pg_id}/meta").with_json(
+        Workspace.SetPageMetaInput(
+          blueprint_id: Some(bp_id),
+          values: Some({"tier": SelectVal(option_id: "t1")}),
+          apply_template_if_empty: None,
+          reason: Some("attach runbook bp")
+        )
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert meta_res.status == 200
+
+  gated_pg = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/pages").with_json(
+        Workspace.CreatePageInput(
+          collection_id: gated_col_id,
+          parent_page_id: None,
+          title: "Gated Doc",
+          markdown: "Original gated line.",
+          icon: None,
+          freshness_ttl_days: None,
+          reason: Some("seed gated doc")
+        )
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert gated_pg.status == 201
+  gated_pg_id = must_json(gated_pg.text).text_at("page.id") or stop "gated_pg_id"
+
+  # Scoped sync agent allowed ONLY on [dir_col_id, gated_col_id]
+  mint = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/admin/agents").with_json(
+        Json.Object({
+          "handle": Json.String("@sync_bot"),
+          "display_name": Json.String("Sync Bot"),
+          "model_id": Json.Null,
+          "label": Json.String("sync"),
+          "allowed_actions": Json.Array([
+            Json.String("read"),
+            Json.String("write_direct"),
+            Json.String("propose")
+          ]),
+          "allowed_collections": Json.Array([Json.String(dir_col_id), Json.String(gated_col_id)]),
+          "max_calls": Json.int(50),
+          "ttl_days": Json.int(7)
+        })
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert mint.status == 201
+  ag_tok = must_json(mint.text).text_at("raw_token") or stop "ag_tok"
+  ag = WebTest.new().with_header("Host", "127.0.0.1:8080").with_header(
+    "Authorization",
+    "Bearer #{ag_tok}"
+  )
+
+  # 1. Snapshot isolation & YAML frontmatter + blk anchor projection
+  snap_res = ApiTest.send(
+    Main,
+    WebTest.prepare(ag, Api.get("/api/sync/snapshot")),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert snap_res.status == 200
+  assert not snap_res.text.contains?("secret-xyz")
+  snap_j = must_json(snap_res.text)
+  snap_pages = snap_j.list_at("pages") or []
+  pg_snap = snap_pages.find(fn(p) p.text_at("page_id") == Some(pg_id) end) or stop "pg_snap"
+  pg_doc = pg_snap.text_at("markdown_document") or ""
+  assert pg_doc.contains?("blueprint: \"runbook-bp\"")
+  assert pg_doc.contains?("<!-- blk:")
+  pg_rel = pg_snap.text_at("rel_path") or stop "pg_rel"
+  pg_ver = pg_snap.int_at("version") or stop "pg_ver"
+
+  # Fail closed when explicitly filtering restricted collection
+  snap_denied = ApiTest.send(
+    Main,
+    WebTest.prepare(ag, Api.get("/api/sync/snapshot?collections=sync-secret")),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert snap_denied.status == 403
+
+  # 2. Clean local push updates block AND YAML blueprint tier (t1 -> t2) directly
+  clean_doc = pg_doc.replace("  tier: \"t1\"", "  tier: \"t2\"").replace(
+    "Check quorum before failover.",
+    "Check quorum and drain canary before failover."
+  )
+  clean_push = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      ag,
+      Api.post("/api/sync/push").with_json(
+        Sync.SyncPushInput(
+          page_id: Some(pg_id),
+          collection_id: Some(dir_col_id),
+          rel_path: pg_rel,
+          markdown_document: clean_doc,
+          expected_version: Some(pg_ver),
+          reason: Some("local clean sync")
+        )
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert clean_push.status == 200
+  cp_j = must_json(clean_push.text)
+  assert cp_j.text_at("outcome") == Some("applied")
+  next_ver = cp_j.int_at("page.version") or stop "next_ver"
+  assert next_ver == pg_ver + 1
+  updated_doc = cp_j.text_at("markdown_document") or ""
+  assert updated_doc.contains?("  tier: \"t2\"")
+  assert updated_doc.contains?("drain canary")
+
+  # 3. Push brand new local Markdown file without frontmatter -> creates page + stamps anchors
+  create_push = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      ag,
+      Api.post("/api/sync/push").with_json(
+        Sync.SyncPushInput(
+          page_id: None,
+          collection_id: None,
+          rel_path: "sync-direct/new-checklist.md",
+          markdown_document: "# On-Call Checklist\n\n- Verify backups",
+          expected_version: None,
+          reason: Some("create from neovim")
+        )
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert create_push.status == 201
+  assert must_json(create_push.text).text_at("outcome") == Some("created")
+  assert (must_json(create_push.text).text_at("markdown_document") or "").contains?("<!-- blk:")
+
+  # 4. Stale expected_version conflict routes cleanly into a Modb.World Change Proposal (HTTP 202)!
+  stale_doc = updated_doc.replace(
+    "Check quorum and drain canary before failover.",
+    "Divergent local developer edit."
+  )
+  conflict_push = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      ag,
+      Api.post("/api/sync/push").with_json(
+        Sync.SyncPushInput(
+          page_id: Some(pg_id),
+          collection_id: Some(dir_col_id),
+          rel_path: pg_rel,
+          markdown_document: stale_doc,
+          expected_version: Some(pg_ver),
+          reason: Some("divergent offline edit")
+        )
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert conflict_push.status == 202
+  cj = must_json(conflict_push.text)
+  assert cj.text_at("outcome") == Some("proposal_opened")
+  assert cj.text_at("conflict_reason") == Some("version_mismatch")
+  cprop_id = cj.text_at("proposal.id") or stop "cprop_id"
+
+  # Verify live page was NOT overwritten and proposal diff captures surgical change
+  live_pg = ApiTest.send(
+    Main,
+    WebTest.prepare(owner, Api.get("/api/pages/#{pg_id}")),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert (must_json(live_pg.text).text_at("anchored_markdown") or "").contains?("drain canary")
+  assert not (must_json(live_pg.text).text_at("anchored_markdown") or "").contains?("Divergent local")
+
+  acc_sync = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/proposals/#{cprop_id}/accept").with_json(
+        Collab.ProposalDecisionInput(reason: Some("Accept local sync conflict proposal"))
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert acc_sync.status == 200
+  after_acc = ApiTest.send(
+    Main,
+    WebTest.prepare(owner, Api.get("/api/pages/#{pg_id}")),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert (must_json(after_acc.text).text_at("anchored_markdown") or "").contains?("Divergent local")
+
+  # 5. Agent pushing even with current version to ProposalsRequiredForAgents routes to proposal_opened!
+  gated_snap = snap_pages.find(fn(p) p.text_at("page_id") == Some(gated_pg_id) end) or stop "gsnap"
+  g_doc = (gated_snap.text_at("markdown_document") or "").replace(
+    "Original gated line.",
+    "Agent gated sync proposal line."
+  )
+  gated_push = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      ag,
+      Api.post("/api/sync/push").with_json(
+        Sync.SyncPushInput(
+          page_id: Some(gated_pg_id),
+          collection_id: Some(gated_col_id),
+          rel_path: gated_snap.text_at("rel_path") or "sync-gated/doc.md",
+          markdown_document: g_doc,
+          expected_version: gated_snap.int_at("version"),
+          reason: Some("agent push to gated col")
+        )
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert gated_push.status == 202
+  assert must_json(gated_push.text).text_at("conflict_reason") == Some("policy_requires_proposal")
 end

@@ -37,6 +37,7 @@ set_page_blueprint_meta,
 sync_page_markdown,
 resolve_metrics,
 show_block_context,
+validate_meta_relations_tx,
 drain_jobs
 use Api
 use Arvo.Flash

@@ -271,9 +271,17 @@ if [[ ! -f "$LIVE_DATA/ready.json" ]]; then
 fi
 
 echo "==> Running live HTTP / OIDC (Dex) / S3 (VersityGW) / MCP / Proposals E2E suite"
+export VELLUM_ROOT_DIR="$ROOT_DIR"
+export VELLUM_LIVE_DATA="$LIVE_DATA"
 node --input-type=module - <<'EOF'
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+
+const ROOT_DIR = process.env.VELLUM_ROOT_DIR;
+const LIVE_DATA = process.env.VELLUM_LIVE_DATA;
 
 const BASE = "http://127.0.0.1:8080";
 
@@ -1737,6 +1745,121 @@ assert.equal(
   "Scoped agent vellum.rlm_query fails closed on restricted collection"
 );
 console.log("✓ Live RLM Tier 1 Deep Research (/api/ai/deep-research + /mcp vellum.rlm_query) verified");
+
+// 12. Live Conflict-Safe Two-Way `vellum sync` CLI (`mo run sync.mo`)
+const mintSyncRes = await apiJson("/api/admin/agents", {
+  method: "POST",
+  body: JSON.stringify({
+    handle: "@live_sync_bot",
+    display_name: "Live Sync Bot",
+    model_id: null,
+    label: "live-sync",
+    allowed_actions: ["read", "write_direct", "propose"],
+    allowed_collections: [colId],
+    max_calls: 50,
+    ttl_days: 7,
+  }),
+});
+assert.equal(mintSyncRes.res.status, 201, mintSyncRes.text);
+const syncTok = mintSyncRes.json.raw_token;
+assert.ok(syncTok && syncTok.startsWith("vlm_ag_"), "sync agent token minted");
+
+function runVellumSync(args = ["sync"]) {
+  return execFileSync(
+    "mo",
+    [
+      "run",
+      path.join(ROOT_DIR, "sync.mo"),
+      "--",
+      ...args,
+      "--dir",
+      "sync-docs",
+      "--url",
+      BASE,
+      "--token",
+      syncTok,
+    ],
+    { cwd: LIVE_DATA, encoding: "utf8" }
+  );
+}
+
+const syncOut1 = runVellumSync(["sync"]);
+assert.ok(syncOut1.includes("[PULL] live-ops/"), `Expected initial pull output, got: ${syncOut1}`);
+assert.ok(!fs.existsSync(path.join(LIVE_DATA, "sync-docs", "secret-exec")), "Restricted collection never mirrored");
+
+const liveOpsDir = path.join(LIVE_DATA, "sync-docs", "live-ops");
+const mirrorFiles = fs.readdirSync(liveOpsDir).filter((f) => f.endsWith(`${pageId}.md`));
+assert.equal(mirrorFiles.length, 1, `Expected mirror file for ${pageId}, found ${mirrorFiles}`);
+const mirrorPath = path.join(liveOpsDir, mirrorFiles[0]);
+const pulledDoc = fs.readFileSync(mirrorPath, "utf8");
+assert.ok(pulledDoc.includes("<!-- blk:"), "Mirror preserves <!-- blk: --> anchor");
+
+// Clean local edit -> direct push applied
+const localCleanEdit = pulledDoc.replace(
+  "Verify gateway healthz, quorum status, and live SSE propagation.",
+  "Verify gateway healthz, quorum status, and vellum-sync round-trip."
+);
+fs.writeFileSync(mirrorPath, localCleanEdit, "utf8");
+const syncOut2 = runVellumSync(["sync"]);
+assert.ok(syncOut2.includes("[PUSH APPLIED]"), `Expected clean push, got: ${syncOut2}`);
+
+const afterCleanPg = await apiJson(`/api/pages/${pageId}`);
+assert.ok(afterCleanPg.json.anchored_markdown.includes("vellum-sync round-trip"));
+
+// Concurrent divergence: live edit bumps remote version, then offline local edit conflicts -> Modb.World Proposal!
+const liveCurBlk = afterCleanPg.json.blocks[0];
+const divergeLiveRes = await apiJson(`/api/pages/${pageId}/blocks`, {
+  method: "PATCH",
+  body: JSON.stringify({
+    ops: [
+      {
+        replace_block: {
+          block_id: liveCurBlk.id,
+          expected_version: liveCurBlk.version,
+          kind: null,
+          markdown: "Remote concurrent web edit winning live version.",
+        },
+      },
+    ],
+    expected_versions: { [liveCurBlk.id]: liveCurBlk.version },
+    reason: "live edit to trigger sync conflict",
+  }),
+});
+assert.equal(divergeLiveRes.res.status, 200, divergeLiveRes.text);
+
+const afterCleanLocal = fs.readFileSync(mirrorPath, "utf8");
+const divergentLocal = afterCleanLocal.replace(
+  "Verify gateway healthz, quorum status, and vellum-sync round-trip.",
+  "Local developer offline edit preserved without merge markers."
+);
+fs.writeFileSync(mirrorPath, divergentLocal, "utf8");
+
+const syncOut3 = runVellumSync(["sync"]);
+assert.ok(syncOut3.includes("[CONFLICT -> PROPOSAL "), `Expected conflict proposal output, got: ${syncOut3}`);
+const preservedLocal = fs.readFileSync(mirrorPath, "utf8");
+assert.equal(preservedLocal, divergentLocal, "Local mirror file must NEVER be clobbered");
+assert.ok(!preservedLocal.includes("<<<<<<<"), "Local mirror must NEVER contain git conflict markers");
+
+const propsList = await apiJson("/api/proposals");
+const syncProp = (propsList.json.proposals ?? []).find(
+  (p) => p.status === "open" && p.target_page_id === pageId && String(p.title).startsWith("Sync:")
+);
+assert.ok(syncProp, "Conflict-safe sync opened inspectable Modb.World Proposal");
+
+const acceptSyncProp = await apiJson(`/api/proposals/${syncProp.id}/accept`, {
+  method: "POST",
+  body: JSON.stringify({ reason: "Accept local vellum sync conflict proposal" }),
+});
+assert.equal(acceptSyncProp.res.status, 200, acceptSyncProp.text);
+
+const afterSyncAccept = await apiJson(`/api/pages/${pageId}`);
+assert.ok(
+  afterSyncAccept.json.anchored_markdown.includes("Local developer offline edit preserved without merge markers"),
+  "Accepted sync proposal updated live page cleanly"
+);
+const syncOut4 = runVellumSync(["sync"]);
+assert.ok(syncOut4.includes("[PULL]") || syncOut4.includes("proposals=0"), "Subsequent sync converges cleanly");
+console.log("✓ Live conflict-safe two-way vellum sync CLI (pull, clean push, World conflict proposal) verified");
 EOF
 
 echo "All Live Vellum E2E checks against mo serve + Dex + VersityGW S3 passed."
