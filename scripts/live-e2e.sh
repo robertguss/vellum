@@ -148,6 +148,8 @@ const server = http.createServer((req, res) => {
         );
         const isRlmSub = allText.includes("Vellum RLM Deep Research sub-agent");
         const isRlmSynth = allText.includes("Vellum RLM Deep Research synthesizer");
+        const isGardener = allText.includes("Vellum Knowledge Gardener");
+        const isPrBridge = allText.includes("Vellum GitHub PR Bridge");
         const isAiColumn = allText.includes("AI-compiled database column");
         const isBrief = allText.includes("Living Brief");
         let replyText =
@@ -158,6 +160,12 @@ const server = http.createServer((req, res) => {
         } else if (isRlmSynth) {
           replyText =
             "Verified rollback command and quorum check from RLM Tier 1 ReadProgram block slices.";
+        } else if (isGardener) {
+          replyText =
+            "Gardener AI reconciliation: verify upstream API rate limit 25 req/s before failover.";
+        } else if (isPrBridge) {
+          replyText =
+            "PR #708 updated gateway failover drain timeout to 45s; verify step 1 before rollout.";
         } else if (isSteer) {
           replyText =
             "Steered incident runbook paragraph revised in-place inside Modb.World branch.";
@@ -244,6 +252,7 @@ export VELLUM_AI_MODEL="gpt-4o-mini"
 export VELLUM_EMBED_BASE_URL="http://127.0.0.1:${MOCK_LLM_PORT}/v1/embeddings"
 export VELLUM_EMBED_MODEL="text-embedding-3-small"
 export VELLUM_EMBED_DIMENSIONS="8"
+export VELLUM_GITHUB_WEBHOOK_SECRET="test-github-webhook-secret"
 
 mo serve "$ROOT_DIR/main.mo" \
   --bind 127.0.0.1 \
@@ -276,7 +285,7 @@ export VELLUM_LIVE_DATA="$LIVE_DATA"
 node --input-type=module - <<'EOF'
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -1860,6 +1869,214 @@ assert.ok(
 const syncOut4 = runVellumSync(["sync"]);
 assert.ok(syncOut4.includes("[PULL]") || syncOut4.includes("proposals=0"), "Subsequent sync converges cleanly");
 console.log("✓ Live conflict-safe two-way vellum sync CLI (pull, clean push, World conflict proposal) verified");
+
+// 13. Live Phase 3.2 Proposals-Only Knowledge Gardeners & Signed GitHub PR Bridge
+const authSpecPg = await apiJson("/api/pages", {
+  method: "POST",
+  body: JSON.stringify({
+    collection_id: colId,
+    title: "Public API Rate Limit Spec",
+    markdown: "Public API rate limit is 100 req/s per tenant.",
+    reason: "seed phase 3.2 citation source",
+  }),
+});
+assert.equal(authSpecPg.res.status, 201, authSpecPg.text);
+const authSpecPgId = authSpecPg.json.page.id;
+const authSpecBlkId = authSpecPg.json.blocks[0].id;
+
+const depSopPg = await apiJson("/api/pages", {
+  method: "POST",
+  body: JSON.stringify({
+    collection_id: colId,
+    title: "Gateway Retry SOP",
+    markdown: "Follow upstream Public API rate limit before retrying gateway failover.",
+    reason: "seed phase 3.2 dependent page",
+  }),
+});
+assert.equal(depSopPg.res.status, 201, depSopPg.text);
+const depSopPgId = depSopPg.json.page.id;
+const depSopBlkId = depSopPg.json.blocks[0].id;
+
+const citeLinkRes = await apiJson(`/api/pages/${depSopPgId}/blocks`, {
+  method: "PATCH",
+  body: JSON.stringify({
+    ops: [
+      {
+        attach_citations: {
+          block_id: depSopBlkId,
+          citations: [
+            {
+              source_kind: "block",
+              source_ref: authSpecBlkId,
+              label: "Rate Limit §1",
+              excerpt: "Public API rate limit is 100 req/s per tenant.",
+            },
+          ],
+        },
+      },
+    ],
+    expected_versions: {},
+    reason: "attach cited block dependency",
+  }),
+});
+assert.equal(citeLinkRes.res.status, 200, citeLinkRes.text);
+
+const bumpSpecRes = await apiJson(`/api/pages/${authSpecPgId}/blocks`, {
+  method: "PATCH",
+  body: JSON.stringify({
+    ops: [
+      {
+        replace_block: {
+          block_id: authSpecBlkId,
+          expected_version: 1,
+          kind: null,
+          markdown: "Public API rate limit is 25 req/s per tenant during failover.",
+        },
+      },
+    ],
+    expected_versions: { [authSpecBlkId]: 1 },
+    reason: "update rate limit to trigger citation drift",
+  }),
+});
+assert.equal(bumpSpecRes.res.status, 200, bumpSpecRes.text);
+
+const dupAlpha = await apiJson("/api/pages", {
+  method: "POST",
+  body: JSON.stringify({
+    collection_id: colId,
+    title: "Deploy Rollback Checklist Alpha",
+    markdown: "Always enable feature flag legacy_auth during canary deploy step 2 within 30 seconds.",
+    reason: "seed phase 3.2 dup alpha",
+  }),
+});
+assert.equal(dupAlpha.res.status, 201, dupAlpha.text);
+
+const dupBeta = await apiJson("/api/pages", {
+  method: "POST",
+  body: JSON.stringify({
+    collection_id: colId,
+    title: "Deploy Rollback Checklist Beta",
+    markdown: "Never enable feature flag legacy_auth during canary deploy step 2 within 10 seconds.",
+    reason: "seed phase 3.2 dup beta",
+  }),
+});
+assert.equal(dupBeta.res.status, 201, dupBeta.text);
+
+const gardenRes = await apiJson("/api/admin/garden");
+assert.equal(gardenRes.res.status, 200, gardenRes.text);
+assert.ok(
+  (gardenRes.json.citation_drifts ?? []).some(
+    (d) =>
+      d.dependent_page_id === depSopPgId &&
+      d.cited_page_id === authSpecPgId &&
+      d.cited_block_id === authSpecBlkId
+  ),
+  "GET /api/admin/garden reports cited-dependency drift"
+);
+assert.ok(
+  (gardenRes.json.duplicate_pairs ?? []).some((p) => p.possible_contradiction === true),
+  "GET /api/admin/garden flags semantic duplicate contradiction"
+);
+
+const depShowRes = await apiJson(`/api/pages/${depSopPgId}`);
+assert.equal(depShowRes.res.status, 200, depShowRes.text);
+assert.ok(
+  (depShowRes.json.citation_drifts ?? []).some((d) => d.cited_block_id === authSpecBlkId),
+  "GET /api/pages/:id includes X-Ray citation_drifts"
+);
+
+const gardenPropRes = await apiJson("/api/admin/garden/propose", {
+  method: "POST",
+  body: JSON.stringify({
+    kind: "citation_drift",
+    target_page_id: depSopPgId,
+    target_block_id: depSopBlkId,
+    related_page_id: authSpecPgId,
+    related_block_id: authSpecBlkId,
+    reason: "Sync Gateway Retry SOP with updated Public API rate limit",
+  }),
+});
+assert.equal(gardenPropRes.res.status, 201, gardenPropRes.text);
+const gardenPropId = gardenPropRes.json.proposal.id;
+assert.equal(gardenPropRes.json.proposal.status, "open");
+
+const depBeforeAccept = await apiJson(`/api/pages/${depSopPgId}`);
+assert.ok(
+  !depBeforeAccept.json.anchored_markdown.includes("Gardener AI reconciliation"),
+  "Proposals-Only Gardener NEVER mutates live page before review"
+);
+
+const acceptGardenRes = await apiJson(`/api/proposals/${gardenPropId}/accept`, {
+  method: "POST",
+  body: JSON.stringify({ reason: "Accept Gardener citation drift proposal" }),
+});
+assert.equal(acceptGardenRes.res.status, 200, acceptGardenRes.text);
+const depAfterAccept = await apiJson(`/api/pages/${depSopPgId}`);
+assert.ok(
+  depAfterAccept.json.anchored_markdown.includes("Gardener AI reconciliation"),
+  "Accepted Gardener proposal updates dependent page cleanly"
+);
+
+// Signed inbound GitHub PR Bridge -> Modb.World Change Proposals
+const ghBody = JSON.stringify({
+  action: "opened",
+  repository: { full_name: "acme/gateway" },
+  changed_files: ["docs/gateway-retry-sop.md"],
+  pull_request: {
+    number: 708,
+    title: "Gateway Retry SOP rate limit failover timeout update",
+    body: "Follow upstream Public API rate limit before retrying gateway failover.",
+    html_url: "https://github.com/acme/gateway/pull/708",
+    merged: false,
+    head: { sha: "708deadbeef" },
+  },
+});
+
+const badGhRes = await rawFetch(`${BASE}/api/webhooks/github`, {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    "X-GitHub-Event": "pull_request",
+    "X-Hub-Signature-256": "sha256=badbadbad",
+  },
+  body: ghBody,
+});
+assert.equal(badGhRes.status, 403, "Invalid GitHub webhook signature must fail closed (403)");
+
+const ghSig = createHmac("sha256", "test-github-webhook-secret").update(ghBody).digest("hex");
+const goodGhRes = await rawFetch(`${BASE}/api/webhooks/github`, {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    "X-GitHub-Event": "pull_request",
+    "X-Hub-Signature-256": `sha256=${ghSig}`,
+  },
+  body: ghBody,
+});
+assert.equal(goodGhRes.status, 201, await goodGhRes.clone().text());
+const goodGhJson = await goodGhRes.json();
+assert.ok((goodGhJson.proposals ?? []).length >= 1, "Signed PR webhook staged Modb.World proposals");
+const prProp = goodGhJson.proposals[0];
+assert.equal(prProp.author_handle, "@github-pr-bridge");
+assert.equal(prProp.status, "open");
+
+const targetBeforePr = await apiJson(`/api/pages/${prProp.target_page_id}`);
+assert.ok(
+  !targetBeforePr.json.anchored_markdown.includes("PR #708 updated gateway failover"),
+  "GitHub PR bridge NEVER mutates live page before review"
+);
+
+const acceptPrRes = await apiJson(`/api/proposals/${prProp.id}/accept`, {
+  method: "POST",
+  body: JSON.stringify({ reason: "Accept PR #708 runbook sync proposal" }),
+});
+assert.equal(acceptPrRes.res.status, 200, acceptPrRes.text);
+const targetAfterPr = await apiJson(`/api/pages/${prProp.target_page_id}`);
+assert.ok(
+  targetAfterPr.json.anchored_markdown.includes("PR #708 updated gateway failover"),
+  "Accepted PR bridge proposal lands cleanly on live page"
+);
+console.log("✓ Live Phase 3.2 Proposals-Only Knowledge Gardeners & Signed GitHub PR Bridge verified");
 EOF
 
 echo "All Live Vellum E2E checks against mo serve + Dex + VersityGW S3 passed."

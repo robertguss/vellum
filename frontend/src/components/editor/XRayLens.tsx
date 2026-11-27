@@ -1,5 +1,11 @@
-import { Activity, Bot, Calculator, Layers, Shield, User } from "lucide-react";
-import type { AuditFeedItem, Block, Page, ResolvedMetric } from "../../lib/types";
+import { Activity, AlertTriangle, Bot, Calculator, GitPullRequest, Layers, Shield, User } from "lucide-react";
+import type {
+  AuditFeedItem,
+  Block,
+  GardenCitationDrift,
+  Page,
+  ResolvedMetric,
+} from "../../lib/types";
 import { formatNumberCell, formatSignedDecimal } from "../database/InlineCellEditor";
 
 interface XRayLensProps {
@@ -8,6 +14,9 @@ interface XRayLensProps {
   resolvedMetrics: Record<string, ResolvedMetric>;
   yamlFrontmatter: string;
   pageAudit: AuditFeedItem[];
+  citationDrifts?: GardenCitationDrift[];
+  stagingDriftId?: string | null;
+  onStageDriftProposal?: (drift: GardenCitationDrift) => void;
   onInspectBlock: (blockId: string) => void;
 }
 
@@ -17,12 +26,58 @@ export default function XRayLens({
   resolvedMetrics,
   yamlFrontmatter,
   pageAudit,
+  citationDrifts = [],
+  stagingDriftId = null,
+  onStageDriftProposal,
   onInspectBlock,
 }: XRayLensProps) {
   const metricEntries = Object.values(resolvedMetrics);
 
   return (
     <div className="space-y-6">
+      {citationDrifts.length > 0 && (
+        <section className="rounded-2xl border border-amber-300 bg-amber-50/70 p-5 space-y-3">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-sm font-semibold text-amber-950">
+              <AlertTriangle className="h-4 w-4 text-amber-700" />
+              Cited-Dependency Drift ({citationDrifts.length})
+            </div>
+            <span className="text-[11px] font-medium text-amber-800">
+              Proposals-Only Safeguard Active
+            </span>
+          </div>
+          <div className="space-y-2">
+            {citationDrifts.map((d) => {
+              const driftKey = `${d.dependent_block_id}->${d.cited_block_id}`;
+              return (
+                <div
+                  key={driftKey}
+                  className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-white px-3.5 py-2.5 text-xs"
+                >
+                  <div className="space-y-0.5">
+                    <div className="font-medium text-stone-900">{d.summary}</div>
+                    <div className="font-mono text-[11px] text-stone-500">
+                      Local block {d.dependent_block_id} cites {d.cited_page_title} §
+                      {d.cited_block_id} (v{d.cited_block_version})
+                    </div>
+                  </div>
+                  {onStageDriftProposal && (
+                    <button
+                      type="button"
+                      disabled={stagingDriftId === driftKey}
+                      onClick={() => onStageDriftProposal(d)}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-amber-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-800 disabled:opacity-50"
+                    >
+                      <GitPullRequest className="h-3.5 w-3.5" />
+                      {stagingDriftId === driftKey ? "Staging..." : "Stage Refresh Proposal"}
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
       {/* Live Metric Computation Audit */}
       <section className="rounded-2xl border border-stone-200 bg-white p-5 space-y-3">
         <div className="flex items-center gap-2 text-sm font-semibold text-stone-900">

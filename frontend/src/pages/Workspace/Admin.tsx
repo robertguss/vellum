@@ -2,9 +2,12 @@ import { Link } from "@inertiajs/react";
 import {
   AlertTriangle,
   Bot,
+  GitCompare,
+  GitPullRequest,
   History,
   KeyRound,
   Leaf,
+  Link2,
   Lock,
   RotateCcw,
   Upload,
@@ -57,6 +60,7 @@ export default function AdminConsole({
   // Knowledge Gardening
   const [garden, setGarden] = useState<GardenReport | null>(null);
   const [gardenLoading, setGardenLoading] = useState(false);
+  const [gardenProposingKey, setGardenProposingKey] = useState<string | null>(null);
 
   // Notion Importer
   const [impColId, setImpColId] = useState(collections[0]?.id ?? "col_general");
@@ -170,6 +174,38 @@ export default function AdminConsole({
       setError(err instanceof ApiError ? err.message : "Garden scan failed");
     } finally {
       setGardenLoading(false);
+    }
+  }
+
+  async function handleProposeGardenFix(
+    key: string,
+    payload: {
+      kind: "stale_refresh" | "duplicate_contradiction" | "citation_drift";
+      target_page_id: string;
+      target_block_id?: string | null;
+      related_page_id?: string | null;
+      related_block_id?: string | null;
+      reason: string;
+    }
+  ) {
+    setGardenProposingKey(key);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await apiFetch<{ proposal: { id: string; title: string } }>(
+        "/api/admin/garden/propose",
+        {
+          method: "POST",
+          body: JSON.stringify(payload),
+        }
+      );
+      setNotice(
+        `Staged Proposals-Only Gardener PR ${res.proposal.id} (${res.proposal.title}). Review in Change Proposals.`
+      );
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to stage gardener proposal");
+    } finally {
+      setGardenProposingKey(null);
     }
   }
 
@@ -512,8 +548,9 @@ export default function AdminConsole({
                   Knowledge Gardening Scan
                 </h2>
                 <p className="text-xs text-stone-500">
-                  Detects pages exceeding freshness TTL (page → collection → workspace) and broken{" "}
-                  <code className="font-mono">[[page_id]]</code> links.
+                  Detects stale pages, broken <code className="font-mono">[[page_id]]</code> links,{" "}
+                  <code className="font-mono">Modb.Vec</code> semantic near-duplicates/contradictions,
+                  and cited-dependency drift. All fixes stage strictly as Proposals-Only PRs.
                 </p>
               </div>
               <button
@@ -534,16 +571,38 @@ export default function AdminConsole({
                     Stale Pages ({garden.stale_pages.length} / {garden.checked_pages} checked)
                   </div>
                   {garden.stale_pages.map((sp) => (
-                    <Link
+                    <div
                       key={sp.page_id}
-                      href={`/p/${sp.page_id}`}
-                      className="block rounded-lg bg-amber-50 border border-amber-200 p-2.5 text-xs"
+                      className="rounded-lg bg-amber-50 border border-amber-200 p-2.5 text-xs space-y-1.5"
                     >
-                      <div className="font-medium text-amber-950">{sp.title}</div>
+                      <div className="flex items-start justify-between gap-2">
+                        <Link
+                          href={`/p/${sp.page_id}`}
+                          className="font-medium text-amber-950 hover:underline"
+                        >
+                          {sp.title}
+                        </Link>
+                        <button
+                          type="button"
+                          disabled={gardenProposingKey === `stale:${sp.page_id}`}
+                          onClick={() =>
+                            void handleProposeGardenFix(`stale:${sp.page_id}`, {
+                              kind: "stale_refresh",
+                              target_page_id: sp.page_id,
+                              reason: `Page stale (${sp.days_since_verified}d vs ${sp.ttl_days}d TTL)`,
+                            })
+                          }
+                          className="shrink-0 rounded border border-amber-300 bg-white px-2 py-0.5 text-[11px] font-medium text-amber-900 hover:bg-amber-100 disabled:opacity-50"
+                        >
+                          {gardenProposingKey === `stale:${sp.page_id}`
+                            ? "Staging..."
+                            : "Stage Proposal"}
+                        </button>
+                      </div>
                       <div className="text-amber-800">
                         {sp.days_since_verified}d since verified (TTL {sp.ttl_days}d)
                       </div>
-                    </Link>
+                    </div>
                   ))}
                   {garden.stale_pages.length === 0 && (
                     <p className="text-xs text-stone-400">All checked pages are fresh.</p>
@@ -569,6 +628,124 @@ export default function AdminConsole({
                   ))}
                   {garden.broken_links.length === 0 && (
                     <p className="text-xs text-stone-400">Zero broken PageLinks detected.</p>
+                  )}
+                </div>
+
+                <div className="rounded-xl border border-stone-200 p-4 space-y-2">
+                  <div className="text-xs font-semibold text-stone-700 flex items-center gap-1.5">
+                    <GitCompare className="h-3.5 w-3.5 text-violet-600" />
+                    Near-Duplicates &amp; Contradictions ({garden.duplicate_pairs?.length ?? 0})
+                  </div>
+                  {(garden.duplicate_pairs ?? []).map((dp, idx) => {
+                    const pkey = `dup:${dp.page_a_id}:${dp.page_b_id}`;
+                    return (
+                      <div
+                        key={`${pkey}-${idx}`}
+                        className="rounded-lg bg-violet-50 border border-violet-200 p-2.5 text-xs space-y-1.5"
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="space-y-0.5">
+                            <div className="font-medium text-violet-950">
+                              <Link href={`/p/${dp.page_a_id}`} className="hover:underline">
+                                {dp.page_a_title}
+                              </Link>{" "}
+                              ↔{" "}
+                              <Link href={`/p/${dp.page_b_id}`} className="hover:underline">
+                                {dp.page_b_title}
+                              </Link>
+                            </div>
+                            <div className="text-[11px] text-violet-800">
+                              Cosine {(dp.similarity * 100).toFixed(0)}%
+                              {dp.possible_contradiction ? " · Potential contradiction" : " · High overlap"}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={gardenProposingKey === pkey}
+                            onClick={() =>
+                              void handleProposeGardenFix(pkey, {
+                                kind: "duplicate_contradiction",
+                                target_page_id: dp.page_a_id,
+                                related_page_id: dp.page_b_id,
+                                reason:
+                                  dp.contradiction_reason ??
+                                  `Semantic overlap ${(dp.similarity * 100).toFixed(0)}% with ${dp.page_b_title}`,
+                              })
+                            }
+                            className="shrink-0 rounded border border-violet-300 bg-white px-2 py-0.5 text-[11px] font-medium text-violet-900 hover:bg-violet-100 disabled:opacity-50"
+                          >
+                            {gardenProposingKey === pkey ? "Staging..." : "Stage Proposal"}
+                          </button>
+                        </div>
+                        {dp.contradiction_reason && (
+                          <div className="text-[11px] text-rose-700 font-medium">
+                            {dp.contradiction_reason}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                  {(garden.duplicate_pairs?.length ?? 0) === 0 && (
+                    <p className="text-xs text-stone-400">
+                      No semantic duplicates or contradictions flagged.
+                    </p>
+                  )}
+                </div>
+
+                <div className="rounded-xl border border-stone-200 p-4 space-y-2">
+                  <div className="text-xs font-semibold text-stone-700 flex items-center gap-1.5">
+                    <Link2 className="h-3.5 w-3.5 text-amber-600" />
+                    Cited-Dependency Drift ({garden.citation_drifts?.length ?? 0})
+                  </div>
+                  {(garden.citation_drifts ?? []).map((cd, idx) => {
+                    const pkey = `drift:${cd.dependent_block_id}:${cd.cited_block_id}`;
+                    return (
+                      <div
+                        key={`${pkey}-${idx}`}
+                        className="rounded-lg bg-amber-50 border border-amber-200 p-2.5 text-xs space-y-1.5"
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <Link
+                              href={`/p/${cd.dependent_page_id}#${cd.dependent_block_id}`}
+                              className="font-medium text-amber-950 hover:underline"
+                            >
+                              {cd.dependent_page_title}
+                            </Link>
+                            <div className="text-[11px] text-amber-800">
+                              Cites{" "}
+                              <Link
+                                href={`/p/${cd.cited_page_id}#${cd.cited_block_id}`}
+                                className="underline"
+                              >
+                                {cd.cited_page_title} §{cd.cited_block_id} (v{cd.cited_block_version})
+                              </Link>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={gardenProposingKey === pkey}
+                            onClick={() =>
+                              void handleProposeGardenFix(pkey, {
+                                kind: "citation_drift",
+                                target_page_id: cd.dependent_page_id,
+                                target_block_id: cd.dependent_block_id,
+                                related_page_id: cd.cited_page_id,
+                                related_block_id: cd.cited_block_id,
+                                reason: cd.summary,
+                              })
+                            }
+                            className="shrink-0 rounded border border-amber-300 bg-white px-2 py-0.5 text-[11px] font-medium text-amber-900 hover:bg-amber-100 disabled:opacity-50"
+                          >
+                            {gardenProposingKey === pkey ? "Staging..." : "Stage Proposal"}
+                          </button>
+                        </div>
+                        <div className="text-[11px] text-amber-900">{cd.summary}</div>
+                      </div>
+                    );
+                  })}
+                  {(garden.citation_drifts?.length ?? 0) === 0 && (
+                    <p className="text-xs text-stone-400">All cited block dependencies are in sync.</p>
                   )}
                 </div>
               </div>
@@ -805,6 +982,23 @@ export default function AdminConsole({
                   </div>
                 </div>
               ))}
+            </div>
+
+            <div className="lg:col-span-2 rounded-2xl border border-stone-200 bg-white p-5 space-y-2 text-xs">
+              <div className="flex items-center gap-2 text-sm font-semibold text-stone-900">
+                <GitPullRequest className="h-4 w-4 text-teal-700" />
+                Inbound GitHub PR-to-Runbook Bridge
+              </div>
+              <p className="text-stone-600">
+                Signed <code className="font-mono">pull_request</code> webhooks sent to{" "}
+                <code className="font-mono">POST /api/webhooks/github</code> (verified via{" "}
+                <code className="font-mono">X-Hub-Signature-256</code> against{" "}
+                <code className="font-mono">VELLUM_GITHUB_WEBHOOK_SECRET</code>) run under{" "}
+                <code className="font-mono">@github-pr-bridge</code> (<code className="font-mono">read</code> +{" "}
+                <code className="font-mono">propose</code> only), match affected docs with{" "}
+                <code className="font-mono">Db.search_pages_hybrid</code>, and open inspectable{" "}
+                <code className="font-mono">Modb.World</code> Change Proposals without ever writing live content.
+              </p>
             </div>
           </div>
         )}

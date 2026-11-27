@@ -102,10 +102,13 @@ map_feeds_error,
 ai_col_feed_id,
 ensure_ai_col_feed_locked,
 sync_ai_col_feed_locked,
-rlm_view_catalog
+rlm_view_catalog,
+detect_page_citation_drifts,
+detect_duplicate_contradictions
 use Domain.Blocks
 use Domain.Blueprints{BlueprintDef, PageBlueprintMeta}
 use Domain.FeedBridge
+use Domain.Garden{GardenCitationDrift, GardenDuplicatePair, detect_contradiction_signal, parse_block_citation_ref}
 use Domain.Packs{ContextPack, LivingSummary}
 use Domain.Rlm
 use Domain.TaintBridge
@@ -2784,6 +2787,149 @@ fn rlm_collection_views(cat: Views.ViewCatalog, cid: Text) : Views.ViewCatalog
       blk_v
     ),
     row_v
+  )
+end
+
+## Detects cited-dependency drift when any block on `page` cites an active `blk_...` whose content
+## or update timestamp post-dates the dependent block or page verification timestamp.
+fn detect_page_citation_drifts(
+  store: Store,
+  auth_opt: Option(AuthContext),
+  page: Page,
+  blocks: List(Block)
+) : Result(List(GardenCitationDrift), AppError)
+  var drifts = []
+  var seen = Set.empty
+  for blk in blocks
+    for cit in blk.provenance.citations
+      case parse_block_citation_ref(cit.source_ref)
+        Some((_pg_hint, cited_bid)):
+          pair_k = "#{blk.id}->#{cited_bid}"
+          if not seen.has?(pair_k)
+            cited_blk = case try Table.get(store, blocks_table(), cited_bid).map_error(
+              map_table_error
+            )
+              Some(b): b
+              None: continue
+            end
+            cited_pg = case try Table.get(store, pages_table(), cited_blk.page_id).map_error(
+              map_table_error
+            )
+              Some(p) if p.archived_at == None: p
+              Some(_) | None: continue
+            end
+            permitted = case auth_opt
+              Some(a): Policy.collection_permitted?(a, cited_pg.collection_id)
+              None: true
+            end
+            continue if not permitted
+
+            newer_blk = cited_blk.provenance.updated_at > blk.provenance.updated_at
+            newer_ver = case page.verified_at
+              Some(vt): cited_blk.provenance.updated_at > vt
+              None: false
+            end
+            excerpt_changed = case cit.excerpt
+              Some(ex) if not ex.trim.empty?: not cited_blk.markdown.contains?(ex.trim)
+              Some(_) | None: false
+            end
+            if newer_blk or newer_ver or excerpt_changed
+              seen = seen.add(pair_k)
+              drifts = drifts.append(
+                GardenCitationDrift(
+                  dependent_page_id: page.id,
+                  dependent_page_title: page.title,
+                  dependent_collection_id: page.collection_id,
+                  dependent_block_id: blk.id,
+                  cited_page_id: cited_pg.id,
+                  cited_page_title: cited_pg.title,
+                  cited_block_id: cited_blk.id,
+                  cited_block_version: cited_blk.version,
+                  dependent_updated_at: blk.provenance.updated_at,
+                  cited_updated_at: cited_blk.provenance.updated_at,
+                  summary: "Cited block #{cited_blk.id} (v#{cited_blk.version}) on '#{cited_pg.title}' changed since last sync/verification"
+                )
+              )
+            end
+          end
+        None: Unit
+      end
+    end
+  end
+  Ok(drifts)
+end
+
+## Scans `permitted_docs` using `Modb.Vec` Q16 cosine similarity for near-duplicates and deterministic
+## numeric/polarity contradictions (grant-filtered so unauthorized collections never leak).
+fn detect_duplicate_contradictions(
+  store: Store,
+  auth_opt: Option(AuthContext),
+  permitted_docs: List((Page, List(Block)))
+) : Result(List(GardenDuplicatePair), AppError)
+  allow_doc = case auth_opt
+    Some(a): make_allow_doc(a)
+    None: fn(_doc_id, _scope) true end
+  end
+  var by_id = {}
+  for (pg, blks) in permitted_docs
+    plain = Blocks.blocks_plain_text(blks).trim
+    by_id = by_id.set(pg.id, (pg, plain))
+  end
+
+  var seen_pairs = Set.empty
+  var out = []
+  for (pg_raw, blks) in permitted_docs.take(120)
+    plain = Blocks.blocks_plain_text(blks).trim
+    continue if plain.byte_count < 8
+    qvec = Vec.text_sketch_embedding("#{pg_raw.title}\n#{plain}", sketch_vec_dims)
+    vopts = Vec.VecSearchOptions(
+      limit: 5,
+      required_scope: None,
+      min_score: Some(0.45.to_float)
+    )
+    hits = try Vec.search_filtered(store, sketch_vec_index(), qvec, vopts, allow_doc).map_error(
+      map_vec_error
+    )
+    for vh in hits
+      continue if vh.doc_id == pg_raw.id
+      (other_pg, other_plain) = case by_id.get(vh.doc_id)
+        Some(pair): pair
+        None: continue
+      end
+      pair_k = if pg_raw.id < other_pg.id
+        "#{pg_raw.id}|#{other_pg.id}"
+      else
+        "#{other_pg.id}|#{pg_raw.id}"
+      end
+      continue if seen_pairs.has?(pair_k)
+      seen_pairs = seen_pairs.add(pair_k)
+
+      (pg_a, txt_a, pg_b, txt_b) = if pg_raw.id < other_pg.id
+        (pg_raw, plain, other_pg, other_plain)
+      else
+        (other_pg, other_plain, pg_raw, plain)
+      end
+      contra_opt = detect_contradiction_signal(txt_a, txt_b)
+      out = out.append(
+        GardenDuplicatePair(
+          page_a_id: pg_a.id,
+          page_a_title: pg_a.title,
+          collection_a_id: pg_a.collection_id,
+          page_b_id: pg_b.id,
+          page_b_title: pg_b.title,
+          collection_b_id: pg_b.collection_id,
+          similarity: vh.score,
+          possible_contradiction: contra_opt != None,
+          contradiction_reason: contra_opt
+        )
+      )
+    end
+  end
+
+  Ok(
+    out.sort_by(fn(p)
+      if p.possible_contradiction: 0 else: 1
+    end)
   )
 end
 
