@@ -140,12 +140,29 @@ const server = http.createServer((req, res) => {
         return;
       }
       if (lastBody.stream !== true) {
-        const isBrief = (lastBody.messages || []).some((m) =>
-          String(m.content || "").includes("Living Brief")
-        );
-        const replyText = isBrief
-          ? "- Live incident brief synthesized from permitted workspace summaries."
-          : "Concise workspace semantic summary generated for progressive disclosure.";
+        const allText = (lastBody.messages || [])
+          .map((m) => String(m.content || ""))
+          .join("\n");
+        const isAiColumn = allText.includes("AI-compiled database column");
+        const isBrief = allText.includes("Living Brief");
+        let replyText =
+          "Concise workspace semantic summary generated for progressive disclosure.";
+        if (isAiColumn) {
+          if (allText.includes("ai_select") || allText.toLowerCase().includes("tier")) {
+            replyText = JSON.stringify({
+              value: "high",
+              rationale: "Cost exceeds threshold",
+            });
+          } else {
+            replyText = JSON.stringify({
+              value: "92.50",
+              rationale: "Computed live risk index",
+            });
+          }
+        } else if (isBrief) {
+          replyText =
+            "- Live incident brief synthesized from permitted workspace summaries.";
+        }
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
@@ -759,6 +776,176 @@ const packsInertiaRes = await apiJson("/packs");
 assert.equal(packsInertiaRes.res.status, 200, packsInertiaRes.text);
 assert.ok(packsInertiaRes.json.packs.some((p) => p.slug === "ops-brief"));
 console.log("✓ Context Studio + Living Summaries + /llms.txt + Context Pack compiler verified");
+
+// 6e. Phase 2.2 AI-Compiled Columns (AutoApply, Modb.Feeds sync-feed staleness, StageProposal -> accept)
+const dbGetRes = await apiJson(`/api/databases/${dbId}`);
+assert.equal(dbGetRes.res.status, 200, dbGetRes.text);
+const existingDb = dbGetRes.json.database;
+
+const patchAiDbRes = await apiJson(`/api/databases/${dbId}`, {
+  method: "PATCH",
+  body: JSON.stringify({
+    title: existingDb.title,
+    description: existingDb.description ?? null,
+    expected_version: existingDb.version,
+    properties: [
+      ...existingDb.properties,
+      { id: "ai_notes", name: "AI Notes", kind: "rich_text", required: false, sort_order: "w" },
+      {
+        id: "ai_tier",
+        name: "AI Triage Tier",
+        kind: {
+          ai_derived: {
+            prompt: "Classify incident tier low or high",
+            source_prop_ids: ["title", "cost", "ai_notes"],
+            include_row_body: false,
+            output_kind: {
+              ai_select: {
+                options: [
+                  { id: "low", label: "Low", color: "gray" },
+                  { id: "high", label: "High", color: "red" },
+                ],
+              },
+            },
+            mode: "auto_apply",
+            daily_call_cap: 10,
+          },
+        },
+        required: false,
+        sort_order: "x",
+      },
+      {
+        id: "ai_score",
+        name: "AI Risk Score",
+        kind: {
+          ai_derived: {
+            prompt: "Compute numeric risk score",
+            source_prop_ids: ["title", "cost", "ai_notes"],
+            include_row_body: false,
+            output_kind: { ai_number: { format: "plain" } },
+            mode: "stage_proposal",
+            daily_call_cap: 10,
+          },
+        },
+        required: false,
+        sort_order: "y",
+      },
+    ],
+  }),
+});
+assert.equal(patchAiDbRes.res.status, 200, patchAiDbRes.text);
+
+const runTierRes = await apiJson(`/api/databases/${dbId}/ai-columns/ai_tier/run`, {
+  method: "POST",
+  body: JSON.stringify({
+    row_ids: [rowId],
+    only_stale: false,
+    mode_override: null,
+    deterministic_fallback: false,
+  }),
+});
+assert.equal(runTierRes.res.status, 200, runTierRes.text);
+assert.equal(runTierRes.json.updated_count, 1);
+assert.equal(runTierRes.json.proposal, null);
+
+const afterTierQ = await apiJson(`/api/databases/${dbId}/query`, {
+  method: "POST",
+  body: JSON.stringify({
+    view_id: null,
+    filters: [],
+    filter_match_all: true,
+    sorts: [],
+    from_date: null,
+    to_date: null,
+  }),
+});
+assert.equal(afterTierQ.res.status, 200, afterTierQ.text);
+const rowAfterTier = afterTierQ.json.rows.find((er) => er.row.id === rowId);
+assert.ok(rowAfterTier, "rowId present after ai_tier run");
+assert.equal(rowAfterTier.row.cells.ai_tier?.select_val?.option_id, "high");
+
+const status1Res = await apiJson(`/api/databases/${dbId}/ai-columns/status`);
+assert.equal(status1Res.res.status, 200, status1Res.text);
+assert.ok(status1Res.json.cells?.[`${rowId}:ai_tier`]);
+assert.equal(status1Res.json.cells[`${rowId}:ai_tier`].stale, false);
+
+const mutNotesRes = await apiJson(`/api/databases/${dbId}/rows/${rowId}`, {
+  method: "PATCH",
+  body: JSON.stringify({
+    cells: { ai_notes: { text_val: "Failover verified in us-east" } },
+    expected_version: rowAfterTier.row.version,
+    reason: "update source cell for feed sync",
+  }),
+});
+assert.equal(mutNotesRes.res.status, 200, mutNotesRes.text);
+
+const syncAiRes = await apiJson(`/api/databases/${dbId}/ai-columns/sync-feed`, {
+  method: "POST",
+  body: JSON.stringify({}),
+});
+assert.equal(syncAiRes.res.status, 200, syncAiRes.text);
+assert.ok(syncAiRes.json.events_seen >= 1, syncAiRes.text);
+assert.ok(syncAiRes.json.marked_stale_count >= 1, syncAiRes.text);
+
+const status2Res = await apiJson(`/api/databases/${dbId}/ai-columns/status`);
+assert.equal(status2Res.res.status, 200, status2Res.text);
+assert.equal(status2Res.json.cells?.[`${rowId}:ai_tier`]?.stale, true);
+
+const runScoreRes = await apiJson(`/api/databases/${dbId}/ai-columns/ai_score/run`, {
+  method: "POST",
+  body: JSON.stringify({
+    row_ids: [rowId],
+    only_stale: false,
+    mode_override: null,
+    deterministic_fallback: false,
+  }),
+});
+assert.equal(runScoreRes.res.status, 201, runScoreRes.text);
+const aiPropId = runScoreRes.json.proposal?.id;
+assert.ok(aiPropId, "ai_score proposal id returned");
+
+const beforeScoreQ = await apiJson(`/api/databases/${dbId}/query`, {
+  method: "POST",
+  body: JSON.stringify({
+    view_id: null,
+    filters: [],
+    filter_match_all: true,
+    sorts: [],
+    from_date: null,
+    to_date: null,
+  }),
+});
+assert.equal(beforeScoreQ.res.status, 200, beforeScoreQ.text);
+const rowBeforeScoreAccept = beforeScoreQ.json.rows.find((er) => er.row.id === rowId);
+assert.equal(rowBeforeScoreAccept.row.cells.ai_score, undefined);
+
+const acceptScoreRes = await apiJson(`/api/proposals/${aiPropId}/accept`, {
+  method: "POST",
+  body: JSON.stringify({ reason: "Approve AI risk score" }),
+});
+assert.equal(acceptScoreRes.res.status, 200, acceptScoreRes.text);
+
+const afterScoreQ = await apiJson(`/api/databases/${dbId}/query`, {
+  method: "POST",
+  body: JSON.stringify({
+    view_id: null,
+    filters: [],
+    filter_match_all: true,
+    sorts: [],
+    from_date: null,
+    to_date: null,
+  }),
+});
+assert.equal(afterScoreQ.res.status, 200, afterScoreQ.text);
+const rowAfterScoreAccept = afterScoreQ.json.rows.find((er) => er.row.id === rowId);
+assert.equal(Number(rowAfterScoreAccept.row.cells.ai_score?.number_val), 92.5);
+assert.equal(rowAfterScoreAccept.row.cells.cost?.number_val, "142.75");
+
+const status3Res = await apiJson(`/api/databases/${dbId}/ai-columns/status`);
+assert.equal(status3Res.res.status, 200, status3Res.text);
+assert.ok(status3Res.json.cells?.[`${rowId}:ai_score`]);
+assert.equal(status3Res.json.cells[`${rowId}:ai_score`].stale, false);
+console.log("✓ Phase 2.2 AI-Compiled Columns (AutoApply, Modb.Feeds sync-feed staleness, StageProposal -> accept) verified");
 
 // 7. Mint Agent Token + live /mcp tool workflow + Modb.World Proposal Accept
 const mintRes = await apiJson("/api/admin/agents", {

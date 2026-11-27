@@ -27,6 +27,8 @@ use Date
 use Db
 use Domain.Blocks
 use Domain.DatabaseModel{
+  AiCellMeta,
+  AiOutputKind,
   CellValue,
   DatabaseDef,
   DbFilterRule,
@@ -36,7 +38,9 @@ use Domain.DatabaseModel{
   DbViewKind,
   PropertyDef,
   PropertyKind,
-  ViewQueryResult
+  ViewQueryResult,
+  compute_ai_input_hash,
+  compute_ai_prompt_hash
 }
 use Domain.Policy
 use Domain.Types{AppError, AuthContext, AuthorKind, Page, PageKind, PrincipalKind, Provenance}
@@ -166,11 +170,33 @@ fn validate_view_def(def: DatabaseDef, v: DbViewDef) : Option(Text)
       end
       case gb_prop.kind
         Select(options: _) | Checkbox: Unit
+        AiDerived(
+          prompt: _,
+          source_prop_ids: _,
+          include_row_body: _,
+          output_kind: AiSelect(options: _),
+          mode: _,
+          daily_call_cap: _
+        ) | AiDerived(
+          prompt: _,
+          source_prop_ids: _,
+          include_row_body: _,
+          output_kind: AiBool,
+          mode: _,
+          daily_call_cap: _
+        ): Unit
         Title | RichText | Number(format: _) | DateProp(include_time: _) | MultiSelect(options: _) | Person | Url | Relation(
           target_db_id: _,
           inverse_prop_id: _
-        ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): return Some(
-          "BoardView group_by_prop_id '#{gb_id}' must be Select or Checkbox"
+        ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
+          prompt: _,
+          source_prop_ids: _,
+          include_row_body: _,
+          output_kind: _,
+          mode: _,
+          daily_call_cap: _
+        ): return Some(
+          "BoardView group_by_prop_id '#{gb_id}' must be Select, Checkbox, or AI Select/Bool"
         )
       end
       for pid in cpids
@@ -184,12 +210,26 @@ fn validate_view_def(def: DatabaseDef, v: DbViewDef) : Option(Text)
         None: return Some("CalendarView date_prop_id '#{dp_id}' not found")
       end
       case dp_prop.kind
-        DateProp(include_time: _): Unit
+        DateProp(include_time: _) | AiDerived(
+          prompt: _,
+          source_prop_ids: _,
+          include_row_body: _,
+          output_kind: AiDate,
+          mode: _,
+          daily_call_cap: _
+        ): Unit
         Title | RichText | Number(format: _) | Select(options: _) | MultiSelect(options: _) | Checkbox | Person | Url | Relation(
           target_db_id: _,
           inverse_prop_id: _
-        ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): return Some(
-          "CalendarView date_prop_id '#{dp_id}' must be a DateProp"
+        ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
+          prompt: _,
+          source_prop_ids: _,
+          include_row_body: _,
+          output_kind: _,
+          mode: _,
+          daily_call_cap: _
+        ): return Some(
+          "CalendarView date_prop_id '#{dp_id}' must be a DateProp or AI Date column"
         )
       end
       for pid in cpids
@@ -355,6 +395,10 @@ fn create_database(
     end
   )
 
+  if DatabaseModel.has_ai_derived_columns?(saved_def)
+    try Db.ensure_ai_col_feed_locked(files, saved_def.id, now)
+  end
+
   Ok(
     json_ok(
       201,
@@ -368,7 +412,14 @@ fn create_database(
 end
 
 ## `GET /d/:id` and `GET /api/databases/:id` — Returns database schema, saved views, and enriched rows (`ReadFiles`-only).
-fn show_database(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFiles, env: Env) : Result(
+fn show_database(
+  req: Api.Request,
+  id: Text,
+  auth: Option(AuthContext),
+  rf: ReadFiles,
+  clock: Clock,
+  env: Env
+) : Result(
   Api.Response,
   AppError
 )
@@ -380,8 +431,21 @@ fn show_database(req: Api.Request, id: Text, auth: Option(AuthContext), rf: Read
     return Error(Missing(entity: "database", id: id))
   end
 
+  now = clock.now
+  today_iso = now.to_text.bytes.slice(0, 10).decode_utf8 or "1970-01-01"
   read_act = db_read_action(a)
-  (cols, dbs, def, views, enriched, principals_json, relation_targets_json, scenarios_json) = try Ledger
+  (
+    cols,
+    dbs,
+    def,
+    views,
+    enriched,
+    principals_json,
+    relation_targets_json,
+    scenarios_json,
+    ai_meta_json,
+    ai_usage_json
+  ) = try Ledger
     .read_locked(
       rf,
       Db.ledger_db_path,
@@ -466,7 +530,14 @@ fn show_database(req: Api.Request, id: Text, auth: Option(AuthContext), rf: Read
               end
             Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
               options: _
-            ) | Checkbox | Person | Url | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): Unit
+            ) | Checkbox | Person | Url | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
+              prompt: _,
+              source_prop_ids: _,
+              include_row_body: _,
+              output_kind: _,
+              mode: _,
+              daily_call_cap: _
+            ): Unit
           end
         end
 
@@ -483,6 +554,109 @@ fn show_database(req: Api.Request, id: Text, auth: Option(AuthContext), rf: Read
           end
         end
 
+        var prop_by_id = {}
+        var usage_map = {}
+        for p in def.properties
+          prop_by_id = prop_by_id.set(p.id, p)
+          case p.kind
+            AiDerived(
+              prompt: _,
+              source_prop_ids: _,
+              include_row_body: _,
+              output_kind: _,
+              mode: _,
+              daily_call_cap: cap
+            ):
+              uk = DatabaseModel.ai_col_usage_key(def.id, p.id, today_iso)
+              used = case try Table.get(store, Db.ai_col_usage_table(), uk).map_error(
+                Db.map_table_error
+              )
+                Some(u): u.calls_used
+                None: 0
+              end
+              rem = if cap > used: cap - used else: 0
+              usage_map = usage_map.set(
+                p.id,
+                Json.Object({
+                  "calls_used": Json.int(used),
+                  "daily_call_cap": Json.int(cap),
+                  "remaining_calls": Json.int(rem),
+                  "day_iso": Json.String(today_iso)
+                })
+              )
+            Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
+              options: _
+            ) | Checkbox | Person | Url | Relation(target_db_id: _, inverse_prop_id: _) | Rollup(
+              relation_prop_id: _,
+              target_prop_id: _,
+              agg: _
+            ): Unit
+          end
+        end
+
+        var row_by_id = {}
+        for r in active_rows
+          row_by_id = row_by_id.set(r.id, r)
+        end
+        meta_pairs = try Table.lookup(
+          store,
+          Db.ai_cell_meta_table(),
+          Db.ai_cell_meta_by_database(),
+          def.id
+        ).map_error(Db.map_table_error)
+        var cell_meta_map = {}
+        for (_mk, m) in meta_pairs
+          row_opt = row_by_id.get(m.row_id)
+          prop_opt = prop_by_id.get(m.prop_id)
+          live_stale = if m.stale
+            true
+          else
+            case (prop_opt, row_opt)
+              (Some(prop), Some(row)):
+                case prop.kind
+                  AiDerived(
+                    prompt: pr,
+                    source_prop_ids: _,
+                    include_row_body: body?,
+                    output_kind: out_k,
+                    mode: _,
+                    daily_call_cap: _
+                  ):
+                    pr_h = compute_ai_prompt_hash(pr, out_k)
+                    b_plain = if body?
+                      Blocks.blocks_plain_text(try Db.load_page_blocks(store, row.page_id))
+                    else
+                      ""
+                    end
+                    in_h = compute_ai_input_hash(def, prop, row, b_plain)
+                    pr_h != m.prompt_hash or in_h != m.input_hash
+                  Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(
+                    options: _
+                  ) | MultiSelect(options: _) | Checkbox | Person | Url | Relation(
+                    target_db_id: _,
+                    inverse_prop_id: _
+                  ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): false
+                end
+              (_, _): true
+            end
+          end
+          eff_m = AiCellMeta(
+            id: m.id,
+            database_id: m.database_id,
+            row_id: m.row_id,
+            prop_id: m.prop_id,
+            model: m.model,
+            prompt_hash: m.prompt_hash,
+            input_hash: m.input_hash,
+            stale: live_stale,
+            rationale: m.rationale,
+            citations: m.citations,
+            proposal_id: m.proposal_id,
+            computed_at: m.computed_at
+          )
+          cell_meta_map = cell_meta_map.set("#{m.row_id}:#{m.prop_id}", eff_m.to_json)
+        end
+
         Ok((
           cols,
           dbs,
@@ -491,7 +665,9 @@ fn show_database(req: Api.Request, id: Text, auth: Option(AuthContext), rf: Read
           DatabaseModel.sort_enriched_rows(enr, []),
           Json.Array(principals_list),
           Json.Object(rel_targets_map),
-          open_scenarios.to_json
+          open_scenarios.to_json,
+          Json.Object(cell_meta_map),
+          Json.Object(usage_map)
         ))
       end
     )
@@ -506,7 +682,9 @@ fn show_database(req: Api.Request, id: Text, auth: Option(AuthContext), rf: Read
           "rows": enriched.to_json,
           "principals": principals_json,
           "relation_targets": relation_targets_json,
-          "scenarios": scenarios_json
+          "scenarios": scenarios_json,
+          "ai_cell_meta": ai_meta_json,
+          "ai_usage": ai_usage_json
         })
       )
     )
@@ -529,7 +707,9 @@ fn show_database(req: Api.Request, id: Text, auth: Option(AuthContext), rf: Read
       "rows": enriched.to_json,
       "principals": principals_json,
       "relation_targets": relation_targets_json,
-      "scenarios": scenarios_json
+      "scenarios": scenarios_json,
+      "ai_cell_meta": ai_meta_json,
+      "ai_usage": ai_usage_json
     },
     shared
   )
@@ -609,6 +789,9 @@ fn update_database_schema(
       Ok((t3, next_def))
     end
   )
+  if DatabaseModel.has_ai_derived_columns?(updated)
+    try Db.ensure_ai_col_feed_locked(files, updated.id, now)
+  end
   schema_ev = Json.Object({
     "database_id": Json.String(updated.id),
     "version": Json.int(updated.version),

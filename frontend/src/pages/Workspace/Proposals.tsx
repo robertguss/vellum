@@ -67,6 +67,12 @@ function formatPropertyKind(kind: PropertyKind | null): string {
   if ("multi_select" in kind) return `multi_select(${kind.multi_select.options.length} opts)`;
   if ("relation" in kind) return `relation(${kind.relation.target_db_id})`;
   if ("rollup" in kind) return `rollup(${kind.rollup.agg})`;
+  if ("ai_derived" in kind) {
+    const out = kind.ai_derived.output_kind;
+    const outStr =
+      typeof out === "string" ? out : "ai_number" in out ? `ai_number(${out.ai_number.format})` : "ai_select";
+    return `ai_derived(${outStr})`;
+  }
   return "property";
 }
 

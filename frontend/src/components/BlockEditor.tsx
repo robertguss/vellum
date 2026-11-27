@@ -731,7 +731,12 @@ export default function BlockEditor({
     if (!db) return;
     const numProps = db.properties.filter(
       (p) =>
-        (typeof p.kind === "object" && ("number" in p.kind || "rollup" in p.kind)) ||
+        (typeof p.kind === "object" &&
+          ("number" in p.kind ||
+            "rollup" in p.kind ||
+            ("ai_derived" in p.kind &&
+              typeof p.kind.ai_derived.output_kind === "object" &&
+              "ai_number" in p.kind.ai_derived.output_kind))) ||
         metricAgg === "count" ||
         metricAgg === "count_values"
     );

@@ -355,7 +355,14 @@ fn infer_database_from_csv(table: ParsedCsvTable) : Result(InferredDbImport, Tex
           RichText | Title | MultiSelect(options: _) | Person | Relation(
             target_db_id: _,
             inverse_prop_id: _
-          ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): TextVal(raw_val)
+          ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
+            prompt: _,
+            source_prop_ids: _,
+            include_row_body: _,
+            output_kind: _,
+            mode: _,
+            daily_call_cap: _
+          ): TextVal(raw_val)
         end
       end
       cells = cells.set(pid, cell)

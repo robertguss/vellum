@@ -1,5 +1,6 @@
 import { Link, router } from "@inertiajs/react";
 import {
+  Bot,
   Calendar as CalIcon,
   Check,
   Columns,
@@ -7,13 +8,22 @@ import {
   GitBranch,
   Layers,
   Pencil,
+  Play,
   Plus,
+  RefreshCw,
   Save,
   SlidersHorizontal,
+  Sparkles,
   Table2,
   Trash2,
   X,
 } from "lucide-react";
+import type {
+  AiCellMeta,
+  AiColumnUsageSummary,
+  AiFeedSyncResult,
+  RunAiColumnResponse,
+} from "../../lib/types";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import WorkspaceLayout from "../../components/WorkspaceLayout";
 import InlineCellEditor, {
@@ -55,6 +65,8 @@ interface DatabasePageProps {
   principals?: PrincipalSummary[];
   relation_targets?: Record<string, RelationTargetOption[]>;
   scenarios?: ProposalMeta[];
+  ai_cell_meta?: Record<string, AiCellMeta>;
+  ai_usage?: Record<string, AiColumnUsageSummary>;
 }
 
 function encodeInputToCell(prop: PropertyDef, raw: string): CellValue {
@@ -90,6 +102,8 @@ export default function DatabaseView({
   principals = [],
   relation_targets: initialRelationTargets = {},
   scenarios: initialScenarios = [],
+  ai_cell_meta: initialAiCellMeta = {},
+  ai_usage: initialAiUsage = {},
 }: DatabasePageProps) {
   const [liveDb, setLiveDb] = useState<DatabaseDef>(initialDatabase);
   const [views, setViews] = useState<DbViewDef[]>(initialViews);
@@ -146,10 +160,105 @@ export default function DatabaseView({
     [views, activeViewId]
   );
 
+  const [aiCellMeta, setAiCellMeta] = useState<Record<string, AiCellMeta>>(initialAiCellMeta);
+  const [aiUsage, setAiUsage] = useState<Record<string, AiColumnUsageSummary>>(initialAiUsage);
+  const [aiBusyPropId, setAiBusyPropId] = useState<string | null>(null);
+  const [aiSyncing, setAiSyncing] = useState(false);
+  const [aiLastSync, setAiLastSync] = useState<AiFeedSyncResult | null>(null);
+  const [aiProposalNotice, setAiProposalNotice] = useState<{
+    propName: string;
+    proposalId: string;
+    processed: number;
+  } | null>(null);
+
+  const hasAiDerivedProps = useMemo(
+    () =>
+      activeDb.properties.some(
+        (p) => typeof p.kind === "object" && "ai_derived" in p.kind
+      ),
+    [activeDb.properties]
+  );
+
+  async function refreshAiStatus() {
+    try {
+      const data = await apiFetch<{
+        cells?: Record<string, AiCellMeta>;
+        usage?: Record<string, AiColumnUsageSummary>;
+      }>(`/api/databases/${activeDb.id}/ai-columns/status`);
+      if (data?.cells) setAiCellMeta(data.cells);
+      if (data?.usage) setAiUsage(data.usage);
+    } catch {
+      // ignore background status refresh failures
+    }
+  }
+
+  async function handleSyncAiFeed() {
+    setAiSyncing(true);
+    setError(null);
+    try {
+      const syncData = await apiFetch<AiFeedSyncResult>(
+        `/api/databases/${activeDb.id}/ai-columns/sync-feed`,
+        {
+          method: "POST",
+          body: "{}",
+        }
+      );
+      setAiLastSync(syncData);
+      await refreshAiStatus();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to sync AI column feed");
+    } finally {
+      setAiSyncing(false);
+    }
+  }
+
+  async function handleRunAiColumn(
+    propId: string,
+    rowIds: string[] | null = null,
+    onlyStale = false
+  ) {
+    setAiBusyPropId(propId);
+    setError(null);
+    try {
+      const data = await apiFetch<RunAiColumnResponse>(
+        `/api/databases/${activeDb.id}/ai-columns/${propId}/run`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            row_ids: rowIds,
+            only_stale: onlyStale,
+            mode_override: null,
+            deterministic_fallback: false,
+          }),
+        }
+      );
+      const prop = activeDb.properties.find((p) => p.id === propId);
+      if (data.proposal) {
+        setAiProposalNotice({
+          propName: prop?.name ?? propId,
+          proposalId: data.proposal.id,
+          processed: data.updated_count,
+        });
+      }
+      await Promise.all([runQuery(activeViewId), refreshAiStatus()]);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "AI column execution failed");
+    } finally {
+      setAiBusyPropId(null);
+    }
+  }
+
   const groupableProps = useMemo(
     () =>
       activeDb.properties.filter(
-        (p) => p.kind === "checkbox" || (typeof p.kind === "object" && "select" in p.kind)
+        (p) =>
+          p.kind === "checkbox" ||
+          (typeof p.kind === "object" && "select" in p.kind) ||
+          (typeof p.kind === "object" &&
+            "ai_derived" in p.kind &&
+            (p.kind.ai_derived.output_kind === "ai_bool" ||
+              (typeof p.kind.ai_derived.output_kind === "object" &&
+                "ai_select" in p.kind.ai_derived.output_kind)))
       ),
     [activeDb.properties]
   );
@@ -160,17 +269,17 @@ export default function DatabaseView({
       const found = activeDb.properties.find((p) => p.id === gid);
       if (found) return found;
     }
-    return (
-      activeDb.properties.find((p) => typeof p.kind === "object" && "select" in p.kind) ??
-      activeDb.properties.find((p) => p.kind === "checkbox") ??
-      null
-    );
-  }, [activeDb.properties, activeView]);
+    return groupableProps[0] ?? null;
+  }, [activeDb.properties, activeView, groupableProps]);
 
   const dateProps = useMemo(
     () =>
       activeDb.properties.filter(
-        (p) => typeof p.kind === "object" && "date_prop" in p.kind
+        (p) =>
+          (typeof p.kind === "object" && "date_prop" in p.kind) ||
+          (typeof p.kind === "object" &&
+            "ai_derived" in p.kind &&
+            p.kind.ai_derived.output_kind === "ai_date")
       ),
     [activeDb.properties]
   );
@@ -199,6 +308,14 @@ export default function DatabaseView({
   useEffect(() => {
     setLiveDb(initialDatabase);
   }, [initialDatabase]);
+
+  useEffect(() => {
+    setAiCellMeta(initialAiCellMeta);
+  }, [initialAiCellMeta]);
+
+  useEffect(() => {
+    setAiUsage(initialAiUsage);
+  }, [initialAiUsage]);
 
   useEffect(() => {
     setLiveRows(initialRows);
@@ -389,6 +506,9 @@ export default function DatabaseView({
         });
       }
       await runQuery(activeViewId);
+      if (hasAiDerivedProps) {
+        await refreshAiStatus();
+      }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to update cell");
     } finally {
@@ -449,7 +569,9 @@ export default function DatabaseView({
           }),
         });
         setLiveDb(updatedDef);
-        router.reload({ only: ["database", "views", "rows", "relation_targets"] });
+        router.reload({
+          only: ["database", "views", "rows", "relation_targets", "ai_cell_meta", "ai_usage"],
+        });
       }
     } finally {
       setBusy(false);
@@ -665,8 +787,23 @@ export default function DatabaseView({
       items: EnrichedRow[];
     }> = [];
 
-    if (typeof boardGroupProp.kind === "object" && "select" in boardGroupProp.kind) {
-      for (const o of boardGroupProp.kind.select.options) {
+    const selectOpts =
+      typeof boardGroupProp.kind === "object" && "select" in boardGroupProp.kind
+        ? boardGroupProp.kind.select.options
+        : typeof boardGroupProp.kind === "object" &&
+            "ai_derived" in boardGroupProp.kind &&
+            typeof boardGroupProp.kind.ai_derived.output_kind === "object" &&
+            "ai_select" in boardGroupProp.kind.ai_derived.output_kind
+          ? boardGroupProp.kind.ai_derived.output_kind.ai_select.options
+          : null;
+    const isBoolGroup =
+      boardGroupProp.kind === "checkbox" ||
+      (typeof boardGroupProp.kind === "object" &&
+        "ai_derived" in boardGroupProp.kind &&
+        boardGroupProp.kind.ai_derived.output_kind === "ai_bool");
+
+    if (selectOpts) {
+      for (const o of selectOpts) {
         colBuckets.push({ id: o.id, label: o.label, color: o.color, items: [] });
       }
       const uncategorized: EnrichedRow[] = [];
@@ -681,7 +818,7 @@ export default function DatabaseView({
       if (uncategorized.length > 0 || colBuckets.length === 0) {
         colBuckets.push({ id: "__none__", label: "Unassigned", color: "gray", items: uncategorized });
       }
-    } else if (boardGroupProp.kind === "checkbox") {
+    } else if (isBoolGroup) {
       const checkedItems: EnrichedRow[] = [];
       const uncheckedItems: EnrichedRow[] = [];
       for (const r of rows) {
@@ -726,7 +863,17 @@ export default function DatabaseView({
       eventName === "proposal.rejected" ||
       eventName === "resync_required"
     ) {
-      router.reload({ only: ["database", "views", "rows", "scenarios", "relation_targets"] });
+      router.reload({
+        only: [
+          "database",
+          "views",
+          "rows",
+          "scenarios",
+          "relation_targets",
+          "ai_cell_meta",
+          "ai_usage",
+        ],
+      });
     }
     if (
       eventName === "db.row_created" ||
@@ -742,7 +889,12 @@ export default function DatabaseView({
 
   function moveRowToBoardCol(er: EnrichedRow, targetColId: string) {
     if (!boardGroupProp) return;
-    if (boardGroupProp.kind === "checkbox") {
+    if (
+      boardGroupProp.kind === "checkbox" ||
+      (typeof boardGroupProp.kind === "object" &&
+        "ai_derived" in boardGroupProp.kind &&
+        boardGroupProp.kind.ai_derived.output_kind === "ai_bool")
+    ) {
       const targetBool = targetColId === "true";
       const curCell = getEffectiveCell(er, boardGroupProp.id);
       const curBool = typeof curCell === "object" && "bool_val" in curCell ? curCell.bool_val : false;
@@ -829,6 +981,23 @@ export default function DatabaseView({
                 Fork Scenario
               </button>
 
+              {hasAiDerivedProps && (
+                <button
+                  type="button"
+                  onClick={handleSyncAiFeed}
+                  disabled={aiSyncing || aiBusyPropId !== null}
+                  title="Sync persistent MoDB feed to detect stale AI cells"
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-violet-200 bg-violet-50 px-3 py-1.5 text-xs font-medium text-violet-700 hover:bg-violet-100 disabled:opacity-50"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 ${aiSyncing ? "animate-spin" : ""}`} />
+                  Sync Stale Feed
+                  {aiLastSync && aiLastSync.marked_stale_count > 0 && (
+                    <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800">
+                      {aiLastSync.marked_stale_count}
+                    </span>
+                  )}
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => setSchemaDrawerOpen(true)}
@@ -1086,6 +1255,33 @@ export default function DatabaseView({
           )}
         </div>
 
+        {aiProposalNotice && (
+          <div className="mb-4 flex items-center justify-between gap-3 rounded-xl border border-violet-200 bg-violet-50 px-4 py-2.5 text-xs text-violet-900">
+            <div className="flex items-center gap-2">
+              <Bot className="h-4 w-4 text-violet-600" />
+              <span>
+                AI column <strong>{aiProposalNotice.propName}</strong> staged{" "}
+                <strong>{aiProposalNotice.processed}</strong> row update(s) into a{" "}
+                <Link
+                  href={`/proposals/${aiProposalNotice.proposalId}`}
+                  className="font-semibold underline hover:text-violet-700"
+                >
+                  World Proposal
+                </Link>{" "}
+                for review.
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setAiProposalNotice(null)}
+              className="rounded p-1 text-violet-600 hover:bg-violet-100"
+              aria-label="Dismiss AI proposal notice"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        )}
+
         {/* Active Scenario Delta Ribbon */}
         {activeScenario && scenarioData && (
           <ScenarioDeltaRibbon
@@ -1184,11 +1380,51 @@ export default function DatabaseView({
                 <thead className="border-b border-stone-200 bg-stone-50/70 text-xs text-stone-500">
                   <tr>
                     {activeScenario && <th className="px-3 py-3 font-medium w-16">State</th>}
-                    {activeDb.properties.map((p) => (
-                      <th key={p.id} className="px-4 py-3 font-medium whitespace-nowrap">
-                        {p.name}
-                      </th>
-                    ))}
+                    {activeDb.properties.map((p) => {
+                      const aiCfg =
+                        typeof p.kind === "object" && "ai_derived" in p.kind
+                          ? p.kind.ai_derived
+                          : null;
+                      const isAi = aiCfg !== null;
+                      const usage = isAi ? aiUsage[p.id] : undefined;
+                      return (
+                        <th key={p.id} className="px-4 py-3 font-medium whitespace-nowrap">
+                          <div className="inline-flex items-center gap-1.5">
+                            {isAi && <Sparkles className="h-3.5 w-3.5 text-violet-600" />}
+                            <span>{p.name}</span>
+                            {aiCfg && (
+                              <>
+                                <span
+                                  className={`rounded-full px-1.5 py-0.5 text-[10px] font-medium ${
+                                    aiCfg.mode === "auto_apply"
+                                      ? "bg-emerald-50 text-emerald-700"
+                                      : "bg-violet-50 text-violet-700"
+                                  }`}
+                                >
+                                  {aiCfg.mode === "auto_apply" ? "Auto" : "PR"}
+                                </span>
+                                <span
+                                  className="text-[10px] font-normal text-stone-400"
+                                  title="Daily AI calls used / cap"
+                                >
+                                  {usage?.calls_used ?? 0}/{aiCfg.daily_call_cap}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => handleRunAiColumn(p.id, null, false)}
+                                  disabled={busy || aiBusyPropId !== null}
+                                  title={`Run AI column "${p.name}"`}
+                                  className="inline-flex items-center gap-0.5 rounded border border-violet-200 bg-violet-50 px-1.5 py-0.5 text-[10px] font-medium text-violet-700 hover:bg-violet-100 disabled:opacity-50"
+                                >
+                                  <Play className="h-2.5 w-2.5" />
+                                  {aiBusyPropId === p.id ? "Running" : "Run"}
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        </th>
+                      );
+                    })}
                     <th className="px-3 py-3 font-medium text-right">Actions</th>
                   </tr>
                 </thead>
@@ -1232,7 +1468,13 @@ export default function DatabaseView({
                               databases={databases}
                               principals={principals}
                               relationTargets={relationTargets}
-                              disabled={busy}
+                              disabled={busy || aiBusyPropId === p.id}
+                              aiMeta={aiCellMeta[`${er.row.id}:${p.id}`]}
+                              onRunSingleRowAi={
+                                typeof p.kind === "object" && "ai_derived" in p.kind
+                                  ? () => handleRunAiColumn(p.id, [er.row.id], false)
+                                  : undefined
+                              }
                               onCommit={(val) => handleUpdateRowCell(er, p.id, val)}
                             />
                           </td>

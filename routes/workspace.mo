@@ -51,7 +51,15 @@ use Db
 use Domain.Blocks
 use Domain.Blueprints{BlueprintDef, PageBlueprintMeta}
 use Domain.Collab{WebhookJobPayload}
-use Domain.DatabaseModel{CellValue, DatabaseDef, EnrichedRow, PropertyDef, PropertyKind, RollupAgg}
+use Domain.DatabaseModel{
+  AiOutputKind,
+  CellValue,
+  DatabaseDef,
+  EnrichedRow,
+  PropertyDef,
+  PropertyKind,
+  RollupAgg
+}
 use Domain.Packs{LivingSummary}
 use Domain.Policy
 use Domain.Types{
@@ -199,7 +207,14 @@ fn prop_is_relation_target(kind: PropertyKind) : Option(Text)
     Relation(target_db_id: tdb_id, inverse_prop_id: _): Some(tdb_id)
     Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
       options: _
-    ) | Checkbox | Person | Url | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): None
+    ) | Checkbox | Person | Url | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
+      prompt: _,
+      source_prop_ids: _,
+      include_row_body: _,
+      output_kind: _,
+      mode: _,
+      daily_call_cap: _
+    ): None
   end
 end
 
@@ -586,10 +601,25 @@ end
 fn metric_format_of_prop(kind: PropertyKind) : Text
   case kind
     Number(format: f): f
+    AiDerived(
+      prompt: _,
+      source_prop_ids: _,
+      include_row_body: _,
+      output_kind: AiNumber(format: f),
+      mode: _,
+      daily_call_cap: _
+    ): f
     Title | RichText | DateProp(include_time: _) | Select(options: _) | MultiSelect(options: _) | Checkbox | Person | Url | Relation(
       target_db_id: _,
       inverse_prop_id: _
-    ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): "plain"
+    ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
+      prompt: _,
+      source_prop_ids: _,
+      include_row_body: _,
+      output_kind: _,
+      mode: _,
+      daily_call_cap: _
+    ): "plain"
   end
 end
 

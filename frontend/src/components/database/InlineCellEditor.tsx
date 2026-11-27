@@ -1,7 +1,19 @@
 import { Link } from "@inertiajs/react";
-import { Calendar, Check, ExternalLink, Link2, Pencil, Sigma, User, X } from "lucide-react";
+import {
+  Calendar,
+  Check,
+  ExternalLink,
+  Link2,
+  Pencil,
+  RefreshCw,
+  Sigma,
+  Sparkles,
+  User,
+  X,
+} from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type {
+  AiCellMeta,
   CellValue,
   DatabaseDef,
   EnrichedRow,
@@ -91,6 +103,14 @@ export function getSelectOptions(prop: PropertyDef): SelectOption[] {
   if (typeof prop.kind === "object" && "multi_select" in prop.kind) {
     return prop.kind.multi_select.options;
   }
+  if (
+    typeof prop.kind === "object" &&
+    "ai_derived" in prop.kind &&
+    typeof prop.kind.ai_derived.output_kind === "object" &&
+    "ai_select" in prop.kind.ai_derived.output_kind
+  ) {
+    return prop.kind.ai_derived.output_kind.ai_select.options;
+  }
   return [];
 }
 
@@ -117,10 +137,18 @@ export function renderCellDisplay(
   if (!cell || cell === "empty") return "—";
   if ("text_val" in cell) return cell.text_val || "—";
   if ("number_val" in cell) {
-    const fmt =
-      prop && typeof prop.kind === "object" && "number" in prop.kind
-        ? prop.kind.number.format
-        : "plain";
+    let fmt = "plain";
+    if (prop && typeof prop.kind === "object") {
+      if ("number" in prop.kind) {
+        fmt = prop.kind.number.format;
+      } else if (
+        "ai_derived" in prop.kind &&
+        typeof prop.kind.ai_derived.output_kind === "object" &&
+        "ai_number" in prop.kind.ai_derived.output_kind
+      ) {
+        fmt = prop.kind.ai_derived.output_kind.ai_number.format;
+      }
+    }
     return formatNumberCell(cell.number_val, fmt);
   }
   if ("date_val" in cell) {
@@ -169,6 +197,8 @@ interface InlineCellEditorProps {
   databases: DatabaseDef[];
   principals: PrincipalSummary[];
   relationTargets: Record<string, RelationTargetOption[]>;
+  aiMeta?: AiCellMeta;
+  onRunSingleRowAi?: () => void;
   disabled?: boolean;
   onCommit: (cellValue: CellValue) => Promise<void>;
 }
@@ -180,6 +210,8 @@ export default function InlineCellEditor({
   databases,
   principals,
   relationTargets,
+  aiMeta,
+  onRunSingleRowAi,
   disabled = false,
   onCommit,
 }: InlineCellEditorProps) {
@@ -344,6 +376,116 @@ export default function InlineCellEditor({
         <Sigma className="h-3 w-3 text-stone-400" />
         {display}
       </span>
+    );
+  }
+
+  // 4b. AI-COMPILED CELL (strictly typed value + citation/staleness popover)
+  if (typeof prop.kind === "object" && "ai_derived" in prop.kind) {
+    const aiDef = prop.kind.ai_derived;
+    const isEmpty = !cell || cell === "empty";
+    const selectOpt =
+      typeof cell === "object" && "select_val" in cell
+        ? getSelectOptions(prop).find((o) => o.id === cell.select_val.option_id)
+        : undefined;
+    const displayStr = isEmpty ? "Not run" : renderCellDisplay(cell, prop, principals);
+
+    return (
+      <div ref={containerRef} className="relative inline-flex items-center gap-1.5">
+        <button
+          type="button"
+          onClick={() => setEditing((prev) => !prev)}
+          title={aiMeta?.rationale || aiDef.prompt}
+          className={`inline-flex items-center gap-1.5 rounded-lg border px-2 py-0.5 text-xs transition ${
+            selectOpt
+              ? SELECT_COLOR_CLASSES[selectOpt.color]
+              : isEmpty
+                ? "border-dashed border-stone-300 bg-stone-50 text-stone-400 hover:border-purple-300 hover:text-purple-700"
+                : aiMeta?.stale
+                  ? "border-amber-300 bg-amber-50/70 text-stone-900"
+                  : "border-purple-200 bg-purple-50/60 text-stone-900 hover:bg-purple-100/70"
+          }`}
+        >
+          <Sparkles className="h-3 w-3 text-purple-600 shrink-0" />
+          <span className="max-w-[180px] truncate">{displayStr}</span>
+          {aiMeta?.stale && (
+            <span className="rounded bg-amber-200/80 px-1 py-0 text-[9px] font-semibold uppercase text-amber-900">
+              Stale
+            </span>
+          )}
+        </button>
+
+        {editing && (
+          <div className="absolute left-0 top-full mt-1 z-30 w-72 rounded-xl border border-stone-200 bg-white p-3 shadow-xl space-y-2.5 text-xs">
+            <div className="flex items-center justify-between border-b border-stone-100 pb-2">
+              <div className="flex items-center gap-1.5 font-semibold text-purple-950">
+                <Sparkles className="h-3.5 w-3.5 text-purple-600" />
+                <span>{prop.name}</span>
+              </div>
+              {aiMeta && (
+                <span className="rounded bg-stone-100 px-1.5 py-0.5 font-mono text-[10px] text-stone-600">
+                  {aiMeta.model}
+                </span>
+              )}
+            </div>
+
+            {aiMeta?.rationale && (
+              <div className="text-xs text-stone-700 leading-relaxed">{aiMeta.rationale}</div>
+            )}
+
+            {aiMeta && aiMeta.citations.length > 0 && (
+              <div className="space-y-1">
+                <div className="text-[10px] font-semibold uppercase tracking-wider text-stone-400">
+                  Citations
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {aiMeta.citations.map((cit, idx) => (
+                    <Link
+                      key={idx}
+                      href={
+                        cit.source_kind === "block"
+                          ? `/p/${er.row.page_id}#${cit.source_ref}`
+                          : `/p/${er.row.page_id}`
+                      }
+                      className="inline-flex items-center rounded border border-blue-200 bg-blue-50 px-1.5 py-0.5 text-[10px] text-blue-700 hover:bg-blue-100"
+                    >
+                      {cit.label}
+                    </Link>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {aiMeta?.proposal_id && (
+              <Link
+                href="/proposals"
+                className="inline-flex items-center gap-1 text-[11px] font-medium text-teal-700 hover:underline"
+              >
+                Proposal {aiMeta.proposal_id} →
+              </Link>
+            )}
+
+            <div className="flex items-center justify-between gap-2 border-t border-stone-100 pt-2">
+              <span className="font-mono text-[10px] text-stone-400">
+                {aiMeta ? (aiMeta.stale ? "Needs recompute" : "Up to date") : "Not computed"}
+              </span>
+              {onRunSingleRowAi && (
+                <button
+                  type="button"
+                  disabled={disabled}
+                  onClick={() => {
+                    setEditing(false);
+                    onRunSingleRowAi();
+                  }}
+                  className="inline-flex items-center gap-1 rounded-md bg-purple-700 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-purple-800 disabled:opacity-50"
+                >
+                  <RefreshCw className="h-3 w-3" />
+                  Re-run row
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
     );
   }
 

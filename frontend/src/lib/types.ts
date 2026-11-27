@@ -221,6 +221,66 @@ export interface SelectOption {
 
 export type RollupAgg = "count_all" | "count_values" | "sum_values" | "min_value" | "max_value";
 
+export type AiOutputKind =
+  | "ai_text"
+  | { ai_number: { format: string } }
+  | "ai_date"
+  | "ai_bool"
+  | { ai_select: { options: SelectOption[] } };
+
+export type AiColumnMode = "auto_apply" | "stage_proposal";
+
+export interface AiCellMeta {
+  id: string;
+  database_id: string;
+  row_id: string;
+  prop_id: string;
+  model: string;
+  prompt_hash: string;
+  input_hash: string;
+  stale: boolean;
+  rationale: string | null;
+  citations: Citation[];
+  proposal_id: string | null;
+  computed_at: string;
+}
+
+export interface AiColumnUsageSummary {
+  calls_used: number;
+  daily_call_cap: number;
+  remaining_calls: number;
+  day_iso?: string;
+}
+
+export interface AiFeedSyncResult {
+  feed_id: string;
+  from_txid: number;
+  to_txid: number;
+  events_seen: number;
+  pages_read: number;
+  subtrees_skipped: number;
+  marked_stale_count: number;
+}
+
+export interface RunAiColumnResponse {
+  database_id: string;
+  prop_id: string;
+  mode: AiColumnMode;
+  model: string;
+  attempted_calls: number;
+  updated_count: number;
+  skipped_budget_count: number;
+  usage: AiColumnUsageSummary;
+  results: Array<{
+    row_id: string;
+    status: "applied" | "staged" | "validation_error";
+    value?: CellValue;
+    rationale?: string | null;
+    error?: string;
+  }>;
+  proposal: ProposalMeta | null;
+}
+
 export type PropertyKind =
   | "title"
   | "rich_text"
@@ -232,7 +292,17 @@ export type PropertyKind =
   | "person"
   | "url"
   | { relation: { target_db_id: string; inverse_prop_id: string | null } }
-  | { rollup: { relation_prop_id: string; target_prop_id: string; agg: RollupAgg } };
+  | { rollup: { relation_prop_id: string; target_prop_id: string; agg: RollupAgg } }
+  | {
+      ai_derived: {
+        prompt: string;
+        source_prop_ids: string[];
+        include_row_body: boolean;
+        output_kind: AiOutputKind;
+        mode: AiColumnMode;
+        daily_call_cap: number;
+      };
+    };
 
 export interface PropertyDef {
   id: string;
