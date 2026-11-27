@@ -2,24 +2,42 @@ import { Link, router } from "@inertiajs/react";
 import {
   CheckCircle2,
   Clock,
+  Eye,
   FileText,
+  GitBranch,
+  GitPullRequest,
   MessageSquare,
   Paperclip,
+  PenTool,
+  RefreshCw,
+  Save,
   Send,
   Upload,
 } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import BlockEditor from "../../components/BlockEditor";
 import WorkspaceLayout from "../../components/WorkspaceLayout";
+import BlueprintBar from "../../components/editor/BlueprintBar";
+import PatchworkLens from "../../components/editor/PatchworkLens";
+import SlideOverInspector, { type InspectorTarget } from "../../components/editor/SlideOverInspector";
+import XRayLens from "../../components/editor/XRayLens";
 import { ApiError, apiFetch } from "../../lib/api";
 import type {
   Attachment,
+  AuditFeedItem,
   Block,
+  BlueprintDef,
   ClaimRecord,
   Collection,
   Comment,
   DatabaseDef,
+  EditorLens,
   Page,
+  PageBlueprintMeta,
+  PrincipalSummary,
+  ProposalMeta,
+  RelationTargetOption,
+  ResolvedMetric,
 } from "../../lib/types";
 
 interface PageProps {
@@ -29,8 +47,18 @@ interface PageProps {
   page: Page;
   blocks: Block[];
   anchored_markdown: string;
+  yaml_frontmatter?: string;
   comments: Comment[];
   attachments: Attachment[];
+  blueprints?: BlueprintDef[];
+  page_blueprint?: BlueprintDef | null;
+  page_meta?: PageBlueprintMeta | null;
+  page_proposals?: ProposalMeta[];
+  principals?: PrincipalSummary[];
+  relation_targets?: Record<string, RelationTargetOption[]>;
+  resolved_metrics?: Record<string, ResolvedMetric>;
+  open_scenarios?: ProposalMeta[];
+  page_audit?: AuditFeedItem[];
 }
 
 async function sha256Hex(file: File): Promise<string> {
@@ -41,6 +69,24 @@ async function sha256Hex(file: File): Promise<string> {
     .join("");
 }
 
+function collectMetricTokens(blks: Block[]): string[] {
+  const re = /\{\{metric:[^}\n]+\}\}/g;
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const b of blks) {
+    const matches = b.markdown.match(re) ?? [];
+    for (const m of matches) {
+      if (!seen.has(m)) {
+        seen.add(m);
+        out.push(m);
+      }
+    }
+  }
+  return out;
+}
+
+const LENS_ORDER: EditorLens[] = ["studio", "markdown", "patchwork", "xray"];
+
 export default function PageView({
   collections = [],
   databases = [],
@@ -48,17 +94,43 @@ export default function PageView({
   page: initialPage,
   blocks: initialBlocks = [],
   anchored_markdown: initialAnchored = "",
+  yaml_frontmatter: initialYaml = "",
   comments: initialComments = [],
   attachments: initialAttachments = [],
+  blueprints: initialBlueprints = [],
+  page_blueprint: initialPageBlueprint = null,
+  page_meta: initialPageMeta = null,
+  page_proposals: initialProposals = [],
+  principals = [],
+  relation_targets = {},
+  resolved_metrics: initialResolvedMetrics = {},
+  open_scenarios: initialScenarios = [],
+  page_audit = [],
 }: PageProps) {
   const [page, setPage] = useState<Page>(initialPage);
   const [blocks, setBlocks] = useState<Block[]>(initialBlocks);
   const [anchoredMd, setAnchoredMd] = useState<string>(initialAnchored);
+  const [yamlFm, setYamlFm] = useState<string>(initialYaml || initialAnchored);
+  const [blueprints, setBlueprints] = useState<BlueprintDef[]>(initialBlueprints);
+  const [pageBlueprint, setPageBlueprint] = useState<BlueprintDef | null>(initialPageBlueprint);
+  const [pageMeta, setPageMeta] = useState<PageBlueprintMeta | null>(initialPageMeta);
+  const [pageProposals, setPageProposals] = useState<ProposalMeta[]>(initialProposals);
+  const [openScenarios, setOpenScenarios] = useState<ProposalMeta[]>(initialScenarios);
+  const [metricsMap, setMetricsMap] =
+    useState<Record<string, ResolvedMetric>>(initialResolvedMetrics);
+  const [activeScenarioId, setActiveScenarioId] = useState<string | null>(null);
+
   const [comments, setComments] = useState<Comment[]>(initialComments);
   const [attachments, setAttachments] = useState<Attachment[]>(initialAttachments);
   const [activeClaims, setActiveClaims] = useState<ClaimRecord[]>([]);
   const [liveNotice, setLiveNotice] = useState<string | null>(null);
-  const [tab, setTab] = useState<"editor" | "markdown">("editor");
+
+  const [lens, setLens] = useState<EditorLens>("studio");
+  const [mdDraft, setMdDraft] = useState<string>(initialAnchored);
+  const [mdSaving, setMdSaving] = useState(false);
+  const [mdConflict, setMdConflict] = useState<string | null>(null);
+  const [inspectorTarget, setInspectorTarget] = useState<InspectorTarget>(null);
+
   const [verifying, setVerifying] = useState(false);
   const [commentBody, setCommentBody] = useState("");
   const [commentSaving, setCommentSaving] = useState(false);
@@ -68,32 +140,140 @@ export default function PageView({
   useEffect(() => {
     setPage(initialPage);
   }, [initialPage]);
-
   useEffect(() => {
     setBlocks(initialBlocks);
   }, [initialBlocks]);
-
   useEffect(() => {
     setAnchoredMd(initialAnchored);
+    setMdDraft(initialAnchored);
   }, [initialAnchored]);
-
+  useEffect(() => {
+    setYamlFm(initialYaml || initialAnchored);
+  }, [initialYaml, initialAnchored]);
+  useEffect(() => {
+    setBlueprints(initialBlueprints);
+  }, [initialBlueprints]);
+  useEffect(() => {
+    setPageBlueprint(initialPageBlueprint);
+  }, [initialPageBlueprint]);
+  useEffect(() => {
+    setPageMeta(initialPageMeta);
+  }, [initialPageMeta]);
+  useEffect(() => {
+    setPageProposals(initialProposals);
+  }, [initialProposals]);
+  useEffect(() => {
+    setOpenScenarios(initialScenarios);
+  }, [initialScenarios]);
+  useEffect(() => {
+    setMetricsMap(initialResolvedMetrics);
+  }, [initialResolvedMetrics]);
   useEffect(() => {
     setComments(initialComments);
   }, [initialComments]);
-
   useEffect(() => {
     setAttachments(initialAttachments);
   }, [initialAttachments]);
 
-  const blockIds = new Set(blocks.map((b) => `block:${b.id}`));
+  // ⌘⇧L / Ctrl+Shift+L Lens Switcher Shortcut
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "l") {
+        e.preventDefault();
+        setLens((cur) => LENS_ORDER[(LENS_ORDER.indexOf(cur) + 1) % LENS_ORDER.length]);
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  const refreshMetrics = useCallback(
+    async (blks: Block[], scenId: string | null) => {
+      const tokens = collectMetricTokens(blks);
+      if (tokens.length === 0) {
+        setMetricsMap({});
+        return;
+      }
+      try {
+        const res = await apiFetch<{ metrics: Record<string, ResolvedMetric> }>(
+          "/api/metrics/resolve",
+          {
+            method: "POST",
+            body: JSON.stringify({ tokens, scenario_id: scenId }),
+          }
+        );
+        setMetricsMap(res.metrics ?? {});
+      } catch {
+        // Keep existing metrics snapshot on transient errors
+      }
+    },
+    []
+  );
+
+  useEffect(() => {
+    void refreshMetrics(blocks, activeScenarioId);
+  }, [blocks, activeScenarioId, refreshMetrics]);
+
+  const handleSaveMarkdown = useCallback(async () => {
+    setMdSaving(true);
+    setMdConflict(null);
+    setError(null);
+    try {
+      const res = await apiFetch<{
+        page: Page;
+        blocks: Block[];
+        anchored_markdown: string;
+        yaml_frontmatter: string;
+      }>(`/api/pages/${page.id}/markdown`, {
+        method: "PUT",
+        body: JSON.stringify({
+          markdown: mdDraft,
+          expected_page_version: page.version,
+          reason: "Synced directly from Markdown Lens",
+        }),
+      });
+      setPage(res.page);
+      setBlocks(res.blocks);
+      setAnchoredMd(res.anchored_markdown);
+      setMdDraft(res.anchored_markdown);
+      setYamlFm(res.yaml_frontmatter);
+      router.reload({ only: ["page", "blocks", "anchored_markdown", "yaml_frontmatter", "page_audit"] });
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409) {
+        setMdConflict(err.message);
+      } else {
+        setError(err instanceof ApiError ? err.message : "Failed to save Markdown");
+      }
+    } finally {
+      setMdSaving(false);
+    }
+  }, [mdDraft, page.id, page.version]);
+
+  // ⌘S / Ctrl+S Save inside Markdown Lens
+  useEffect(() => {
+    if (lens !== "markdown") return;
+    function onKeyDown(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        void handleSaveMarkdown();
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [lens, handleSaveMarkdown]);
+
+  const blockIds = useMemo(() => new Set(blocks.map((b) => `block:${b.id}`)), [blocks]);
   const pageLeases = activeClaims.filter(
     (c) => c.resource === `page:${page.id}` || blockIds.has(c.resource)
   );
+  const openProposalsCount = pageProposals.filter((p) => p.status === "open").length;
+  const mdDirty = mdDraft !== anchoredMd;
 
   const handleRealtimeEvent = useCallback((eventName: string, data: Record<string, unknown>) => {
     const actor = typeof data.actor === "string" ? data.actor : "collaborator";
     if (
       eventName === "page.blocks_updated" ||
+      eventName === "page.meta_updated" ||
       eventName === "page.verified" ||
       eventName === "comment.created" ||
       eventName === "proposal.accepted" ||
@@ -104,7 +284,21 @@ export default function PageView({
           ? "Re-synced page snapshot from server"
           : `Updated live by ${actor} (${eventName})`
       );
-      router.reload({ only: ["page", "blocks", "anchored_markdown", "comments"] });
+      router.reload({
+        only: [
+          "page",
+          "blocks",
+          "anchored_markdown",
+          "yaml_frontmatter",
+          "comments",
+          "page_blueprint",
+          "page_meta",
+          "page_proposals",
+          "resolved_metrics",
+          "open_scenarios",
+          "page_audit",
+        ],
+      });
     }
   }, []);
 
@@ -235,7 +429,8 @@ export default function PageView({
             </button>
           </div>
         )}
-        {/* Breadcrumb + Freshness Banner */}
+
+        {/* Breadcrumb + Freshness + 4-Lens Switcher */}
         <div className="rounded-2xl border border-stone-200 bg-white p-6 space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-4">
             <div>
@@ -247,10 +442,12 @@ export default function PageView({
                 <span className="font-mono">{page.id}</span>
                 <span>· v{page.version}</span>
               </div>
-              <h1 className="mt-1 text-2xl font-semibold text-stone-950">{page.title}</h1>
+              <h1 className="mt-1 text-2xl font-semibold tracking-tight text-stone-950">
+                {page.title}
+              </h1>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               {page.database_id && (
                 <Link
                   href={`/d/${page.database_id}`}
@@ -283,29 +480,123 @@ export default function PageView({
               )}
             </div>
 
-            <div className="flex items-center rounded-lg border border-stone-200 p-0.5 bg-stone-50">
+            {/* 4 Lenses Switcher */}
+            <div
+              className="flex flex-wrap items-center rounded-lg border border-stone-200 p-0.5 bg-stone-50"
+              title="Switch Lenses (⌘⇧L)"
+            >
               <button
                 type="button"
-                onClick={() => setTab("editor")}
-                className={`rounded-md px-3 py-1 text-xs font-medium transition ${
-                  tab === "editor" ? "bg-white text-stone-900 shadow-2xs" : "text-stone-500"
+                onClick={() => setLens("studio")}
+                className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1 text-xs font-medium transition ${
+                  lens === "studio" ? "bg-white text-stone-900 shadow-2xs" : "text-stone-500"
                 }`}
               >
-                Blocks &amp; TipTap
+                <PenTool className="h-3 w-3" />
+                Studio
               </button>
               <button
                 type="button"
-                onClick={() => setTab("markdown")}
-                className={`inline-flex items-center gap-1 rounded-md px-3 py-1 text-xs font-medium transition ${
-                  tab === "markdown" ? "bg-white text-stone-900 shadow-2xs" : "text-stone-500"
+                onClick={() => setLens("markdown")}
+                className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1 text-xs font-medium transition ${
+                  lens === "markdown" ? "bg-white text-stone-900 shadow-2xs" : "text-stone-500"
                 }`}
               >
                 <FileText className="h-3 w-3" />
-                Anchored Markdown
+                Markdown
+              </button>
+              <button
+                type="button"
+                onClick={() => setLens("patchwork")}
+                className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1 text-xs font-medium transition ${
+                  lens === "patchwork" ? "bg-white text-stone-900 shadow-2xs" : "text-stone-500"
+                }`}
+              >
+                <GitPullRequest className="h-3 w-3" />
+                Patchwork
+                {openProposalsCount > 0 && (
+                  <span className="rounded-full bg-teal-600 px-1.5 py-0 text-[10px] font-semibold text-white">
+                    {openProposalsCount}
+                  </span>
+                )}
+              </button>
+              <button
+                type="button"
+                onClick={() => setLens("xray")}
+                className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1 text-xs font-medium transition ${
+                  lens === "xray" ? "bg-white text-stone-900 shadow-2xs" : "text-stone-500"
+                }`}
+              >
+                <Eye className="h-3 w-3" />
+                X-Ray
               </button>
             </div>
           </div>
         </div>
+
+        {/* Scenario Comparison Strip */}
+        {openScenarios.length > 0 && (
+          <div className="rounded-xl border border-indigo-200 bg-indigo-50/60 px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
+            <div className="flex items-center gap-2 font-medium text-indigo-950">
+              <GitBranch className="h-3.5 w-3.5 text-indigo-700" />
+              <span>Scenario Lens Overlay:</span>
+              <select
+                value={activeScenarioId ?? ""}
+                onChange={(e) => setActiveScenarioId(e.target.value || null)}
+                className="rounded-lg border border-indigo-200 bg-white px-2.5 py-1 text-xs text-indigo-950"
+              >
+                <option value="">Live Workspace State</option>
+                {openScenarios.map((sc) => (
+                  <option key={sc.id} value={sc.id}>
+                    What-If: {sc.title} ({sc.author_handle})
+                  </option>
+                ))}
+              </select>
+            </div>
+            {activeScenarioId && (
+              <button
+                type="button"
+                onClick={() => setActiveScenarioId(null)}
+                className="text-indigo-700 hover:underline font-medium"
+              >
+                Reset to Live
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Statamic-Style Blueprint Metadata Bar */}
+        <BlueprintBar
+          page={page}
+          blueprints={blueprints}
+          pageBlueprint={pageBlueprint}
+          pageMeta={pageMeta}
+          yamlFrontmatter={yamlFm}
+          databases={databases}
+          principals={principals}
+          relationTargets={relation_targets}
+          onBlueprintCreated={(createdBp) => setBlueprints((prev) => [...prev, createdBp])}
+          onMetaSaved={(res) => {
+            setPage(res.page);
+            setBlocks(res.blocks);
+            setAnchoredMd(res.anchored_markdown);
+            setMdDraft(res.anchored_markdown);
+            setYamlFm(res.yaml_frontmatter);
+            setPageBlueprint(res.page_blueprint);
+            setPageMeta(res.page_meta);
+            router.reload({
+              only: [
+                "page",
+                "blocks",
+                "anchored_markdown",
+                "yaml_frontmatter",
+                "page_blueprint",
+                "page_meta",
+                "page_audit",
+              ],
+            });
+          }}
+        />
 
         {error && (
           <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-2.5 text-sm text-red-800">
@@ -313,22 +604,113 @@ export default function PageView({
           </div>
         )}
 
-        {tab === "editor" ? (
+        {/* Lens Content */}
+        {lens === "studio" && (
           <BlockEditor
             page={page}
             blocks={blocks}
+            databases={databases}
+            principals={principals}
+            relationTargets={relation_targets}
+            resolvedMetrics={metricsMap}
+            activeScenarioId={activeScenarioId}
             onBlocksUpdated={(nextBlocks, nextAnchored) => {
               setBlocks(nextBlocks);
               setAnchoredMd(nextAnchored);
-              router.reload({ only: ["page"] });
+              setMdDraft(nextAnchored);
+              router.reload({ only: ["page", "yaml_frontmatter", "resolved_metrics", "page_audit"] });
             }}
+            onProposalCreated={(p) => setPageProposals((prev) => [p, ...prev])}
+            onInspectBlock={(blockId) => setInspectorTarget({ kind: "block", blockId })}
+            onInspectRow={(databaseId, rowId, pageId) =>
+              setInspectorTarget({ kind: "row", databaseId, rowId, pageId })
+            }
+            onMetricInvalidated={() => void refreshMetrics(blocks, activeScenarioId)}
           />
-        ) : (
-          <div className="rounded-2xl border border-stone-200 bg-stone-950 text-stone-100 p-5 overflow-x-auto">
-            <pre className="text-xs font-mono leading-relaxed whitespace-pre-wrap">
-              {anchoredMd}
-            </pre>
+        )}
+
+        {lens === "markdown" && (
+          <div className="rounded-2xl border border-stone-200 bg-white overflow-hidden">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-stone-200 bg-stone-50 px-4 py-2.5 text-xs">
+              <div className="flex items-center gap-2 text-stone-600">
+                <FileText className="h-3.5 w-3.5 text-stone-500" />
+                <span>
+                  Anchored Markdown Source · <strong className="font-mono">v{page.version}</strong>
+                </span>
+                {mdDirty && (
+                  <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-800">
+                    Unsaved (⌘S)
+                  </span>
+                )}
+              </div>
+              <button
+                type="button"
+                disabled={mdSaving || !mdDirty}
+                onClick={() => void handleSaveMarkdown()}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-stone-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-stone-800 disabled:opacity-50"
+              >
+                <Save className="h-3.5 w-3.5" />
+                {mdSaving ? "Reconciling..." : "Sync Markdown"}
+              </button>
+            </div>
+
+            {mdConflict && (
+              <div className="border-b border-red-200 bg-red-50 px-4 py-2.5 flex items-center justify-between gap-3 text-xs text-red-900">
+                <span>Version conflict: {mdConflict}</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMdConflict(null);
+                    router.reload();
+                  }}
+                  className="inline-flex items-center gap-1 rounded-md border border-red-300 bg-white px-2.5 py-1 font-medium text-red-800 hover:bg-red-100"
+                >
+                  <RefreshCw className="h-3 w-3" />
+                  Reload Latest
+                </button>
+              </div>
+            )}
+
+            <textarea
+              rows={20}
+              value={mdDraft}
+              onChange={(e) => setMdDraft(e.target.value)}
+              spellCheck={false}
+              className="w-full bg-stone-950 text-stone-100 p-5 font-mono text-xs leading-relaxed outline-none resize-y"
+            />
           </div>
+        )}
+
+        {lens === "patchwork" && (
+          <PatchworkLens
+            page={page}
+            proposals={pageProposals}
+            onResolved={() =>
+              router.reload({
+                only: [
+                  "page",
+                  "blocks",
+                  "anchored_markdown",
+                  "yaml_frontmatter",
+                  "page_proposals",
+                  "resolved_metrics",
+                  "open_scenarios",
+                  "page_audit",
+                ],
+              })
+            }
+          />
+        )}
+
+        {lens === "xray" && (
+          <XRayLens
+            page={page}
+            blocks={blocks}
+            resolvedMetrics={metricsMap}
+            yamlFrontmatter={yamlFm}
+            pageAudit={page_audit}
+            onInspectBlock={(blockId) => setInspectorTarget({ kind: "block", blockId })}
+          />
         )}
 
         {/* Comments + Attachments */}
@@ -352,7 +734,7 @@ export default function PageView({
                 </div>
               ))}
             </div>
-            <form onSubmit={handleCommentSubmit} className="flex gap-2">
+            <form onSubmit={(e) => void handleCommentSubmit(e)} className="flex gap-2">
               <input
                 value={commentBody}
                 onChange={(e) => setCommentBody(e.target.value)}
@@ -417,6 +799,19 @@ export default function PageView({
           </section>
         </div>
       </div>
+
+      {/* Right Slide-Over Inspector Drawer */}
+      <SlideOverInspector
+        target={inspectorTarget}
+        databases={databases}
+        principals={principals}
+        relationTargets={relation_targets}
+        onClose={() => setInspectorTarget(null)}
+        onRowUpdated={() => {
+          void refreshMetrics(blocks, activeScenarioId);
+          router.reload({ only: ["resolved_metrics"] });
+        }}
+      />
     </WorkspaceLayout>
   );
 }

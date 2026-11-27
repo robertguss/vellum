@@ -33,6 +33,7 @@ mo check domain/types.mo
 mo check domain/blocks.mo
 mo check domain/policy.mo
 mo check domain/database-model.mo
+mo check domain/blueprints.mo
 mo check domain/collab.mo
 mo check domain/notion-import.mo
 mo check db.mo
@@ -48,6 +49,7 @@ mo check main.mo
 mo test domain/blocks.mo
 mo test domain/policy.mo
 mo test domain/database-model.mo
+mo test domain/blueprints.mo
 mo test domain/collab.mo
 mo test domain/notion-import.mo
 mo test db.mo

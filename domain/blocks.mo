@@ -1,11 +1,14 @@
 ## Canonical Block Tree, lexicographic rank ordering, lossless anchored Markdown projection,
 ## and surgical `BlockOp` mutation engine for Vellum pages.
 module Domain.Blocks
-expose rank_between,
+expose MetricRef(..),
+rank_between,
 sort_blocks,
 to_anchored_markdown,
 parse_markdown_blocks,
 blocks_plain_text,
+extract_metric_refs,
+blocks_metric_refs,
 apply_block_ops
 use Domain.Types{AuthorKind, Block, BlockKind, BlockOp, Citation, Provenance}
 
@@ -190,6 +193,11 @@ fn render_block_body(blk: Block) : Text
     Image(attachment_id: aid, caption: cap): "![#{cap}](vellum://attachment/#{aid})"
     FileEmbed(attachment_id: aid, filename: fname): "[#{fname}](vellum://attachment/#{aid})"
     PageLink(target_page_id: tid): "[[#{tid}|#{blk.markdown}]]"
+    DatabaseViewEmbed(database_id: did, view_id: vid):
+      case vid
+        Some(v) if not v.trim.empty?: "<!-- db_embed:#{did}|#{v.trim} -->"
+        Some(_) | None: "<!-- db_embed:#{did} -->"
+      end
   end
 end
 
@@ -260,6 +268,88 @@ fn parse_callout_header(line: Text) : Option((Text, Option(Text)))
   Some((tone, icon))
 end
 
+fn parse_db_embed(line: Text) : Option((Text, Option(Text)))
+  t = line.trim
+  rest = try t.drop_prefix("<!-- db_embed:")
+  inner = (try rest.drop_suffix("-->")).trim
+  return None if inner.empty?
+  parts = inner.split("|")
+  db_id = (parts.first or "").trim
+  return None if db_id.empty?
+  vid = if parts.size > 1
+    raw_v = parts.drop(1).join("|").trim
+    if raw_v.empty?: None else: Some(raw_v)
+  else
+    None
+  end
+  Some((db_id, vid))
+end
+
+## Inline live metric token parsed from `{{metric:<database_id>.<property_id>:<agg>}}`.
+struct MetricRef
+  raw_token: Text
+  database_id: Text
+  property_id: Text
+  agg: Text
+end
+
+## Scans `markdown` for valid `{{metric:<database_id>.<property_id>:<agg>}}` tokens in source order.
+fn extract_metric_refs(markdown: Text) : List(MetricRef)
+  parts = markdown.split("{{metric:")
+  return [] if parts.size <= 1
+  var out = []
+  var seen = {}
+  for seg in parts.drop(1)
+    close_parts = seg.split("}}")
+    if close_parts.size < 2
+      continue
+    end
+    inner = close_parts.first or ""
+    if inner.contains?("\n") or inner.contains?("\r")
+      continue
+    end
+    colon_parts = inner.split(":")
+    if colon_parts.size != 2
+      continue
+    end
+    target = (colon_parts.first or "").trim
+    agg = (colon_parts.get(1) or "").trim
+    dot_parts = target.split(".")
+    if dot_parts.size != 2
+      continue
+    end
+    db_id = (dot_parts.first or "").trim
+    prop_id = (dot_parts.get(1) or "").trim
+    if db_id.empty? or prop_id.empty? or agg.empty?
+      continue
+    end
+    if db_id.contains?(" ") or prop_id.contains?(" ") or agg.contains?(" ")
+      continue
+    end
+    raw = "{{metric:#{inner}}}"
+    if seen.get(raw) == None
+      seen = seen.set(raw, true)
+      out = out.append(MetricRef(raw_token: raw, database_id: db_id, property_id: prop_id, agg: agg))
+    end
+  end
+  out
+end
+
+## Collects unique `MetricRef` tokens across an ordered list of canonical `Block`s.
+fn blocks_metric_refs(blocks: List(Block)) : List(MetricRef)
+  var out = []
+  var seen = {}
+  for b in sort_blocks(blocks)
+    for m in extract_metric_refs(b.markdown)
+      if seen.get(m.raw_token) == None
+        seen = seen.set(m.raw_token, true)
+        out = out.append(m)
+      end
+    end
+  end
+  out
+end
+
 fn parse_single_line_block(line: Text) : Option((BlockKind, Text))
   if line == "---"
     return Some((Divider, ""))
@@ -297,6 +387,10 @@ fn parse_single_line_block(line: Text) : Option((BlockKind, Text))
   end
   case parse_page_link(line)
     Some((tid, label)): return Some((PageLink(target_page_id: tid), label))
+    None: Unit
+  end
+  case parse_db_embed(line)
+    Some((did, vid)): return Some((DatabaseViewEmbed(database_id: did, view_id: vid), ""))
     None: Unit
   end
   None
@@ -480,8 +574,10 @@ fn blocks_plain_text(blocks: List(Block)) : Text
     piece = case b.kind
       Paragraph | Heading(level: _) | BulletListItem | OrderedListItem(start: _) | TaskItem(
         checked: _
-      ) | Quote | Callout(tone: _, icon: _) | CodeBlock(language: _) | PageLink(target_page_id: _): b
-        .markdown
+      ) | Quote | Callout(tone: _, icon: _) | CodeBlock(language: _) | PageLink(target_page_id: _) | DatabaseViewEmbed(
+        database_id: _,
+        view_id: _
+      ): b.markdown
       Divider: ""
       Image(attachment_id: _, caption: cap): cap
       FileEmbed(attachment_id: _, filename: fname): fname
@@ -761,4 +857,43 @@ test "lossless anchored Markdown round-trip and surgical BlockOp patching"
   assert after_extra == sort_blocks(after_extra)
   assert (after_extra.get(1) or stop "moved").id == "blk_04"
   assert (after_extra.get(0) or stop "cited").provenance.citations == cites
+end
+
+test "database view embed round-trip and metric ref extraction"
+  now = Time.parse("2026-11-26T12:00:00Z") or stop "now"
+  prov = Provenance(
+    author_id: "usr_1",
+    author_kind: HumanAuthor,
+    grant_id: None,
+    proposal_id: None,
+    reason: None,
+    citations: [],
+    updated_at: now
+  )
+  md = "<!-- blk:blk_intro -->\nTotal budget: {{metric:db_01.p_cost:sum}} across {{metric:db_01.p_cost:count}} items.\n\n<!-- blk:blk_view -->\n<!-- db_embed:db_01|view_99 -->\n\n<!-- blk:blk_view2 -->\n<!-- db_embed:db_02 -->"
+  blks = parse_markdown_blocks("pg_1", md, prov, "blk")
+  assert blks.size == 3
+  b1 = blks.get(1) or Block(
+    id: "",
+    page_id: "",
+    parent_block_id: None,
+    rank: "",
+    kind: Paragraph,
+    markdown: "",
+    provenance: prov,
+    version: 0
+  )
+  b2 = blks.get(2) or b1
+  assert b1.id == "blk_view"
+  assert b1.kind == DatabaseViewEmbed(database_id: "db_01", view_id: Some("view_99"))
+  assert b2.kind == DatabaseViewEmbed(database_id: "db_02", view_id: None)
+  round = to_anchored_markdown(blks)
+  assert round == md
+
+  refs = blocks_metric_refs(blks)
+  assert refs.size == 2
+  m0 = refs.get(0) or MetricRef(raw_token: "", database_id: "", property_id: "", agg: "")
+  m1 = refs.get(1) or m0
+  assert m0.raw_token == "{{metric:db_01.p_cost:sum}}"
+  assert m1.agg == "count"
 end
