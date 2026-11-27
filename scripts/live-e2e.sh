@@ -3925,6 +3925,153 @@ pack(sys.argv[3], sys.argv[4])`,
 
   console.log("✓ Live v3 M2.1 FERPA Vault, Department Groups, Zero-Exfiltration Lock & Modb.Ledger Read Audit verified");
 }
+
+// 23. Live v3 M2.2: Extended PII Detection & Modb.Erasure DB-Row Purge + Encrypted VersityGW S3 Backup/Verify/Restore
+{
+  const ssnTok = "214-88-4321";
+  const stuTok = "STU-90123456";
+
+  const piiPgRes = await apiJson("/api/pages", {
+    method: "POST",
+    body: JSON.stringify({
+      collection_id: colId,
+      parent_page_id: null,
+      title: "M22 Synthetic PII Document",
+      markdown: `Confidential SSN ${ssnTok} filed for verification.`,
+      icon: null,
+      freshness_ttl_days: null,
+      reason: "live e2e m2.2 PII page",
+    }),
+  });
+  assert.equal(piiPgRes.res.status, 201, piiPgRes.text);
+  const piiPgId = piiPgRes.json.page.id;
+
+  const piiDbRes = await apiJson("/api/databases", {
+    method: "POST",
+    body: JSON.stringify({
+      collection_id: colId,
+      parent_page_id: null,
+      title: "M22 PII Roster",
+      description: null,
+      properties: [
+        { id: "title", name: "Title", kind: "title", required: true, sort_order: "a" },
+        { id: "notes", name: "Notes", kind: "rich_text", required: false, sort_order: "b" },
+      ],
+    }),
+  });
+  assert.equal(piiDbRes.res.status, 201, piiDbRes.text);
+  const piiDbId = piiDbRes.json.database.id;
+
+  const piiRowRes = await apiJson(`/api/databases/${piiDbId}/rows`, {
+    method: "POST",
+    body: JSON.stringify({
+      cells: {
+        title: { text_val: "Synthetic Record Row" },
+        notes: { text_val: `Registrar ID ${stuTok} pending cleanup` },
+      },
+      markdown: null,
+      reason: "live e2e m2.2 PII db row",
+    }),
+  });
+  assert.equal(piiRowRes.res.status, 201, piiRowRes.text);
+
+  const stBefore = await apiJson("/api/admin/erasure/status");
+  assert.equal(stBefore.res.status, 200, stBefore.text);
+  assert.ok(!stBefore.text.includes(ssnTok), "status omits raw SSN");
+  assert.ok(!stBefore.text.includes(stuTok), "status omits raw Student ID");
+  const kindsBefore = (stBefore.json.findings ?? []).map((f) => f.kind);
+  assert.ok(kindsBefore.includes("us_ssn"), "status detects us_ssn");
+  assert.ok(kindsBefore.includes("student_id"), "status detects student_id");
+
+  const purgeRes = await apiJson("/api/admin/erasure/purge", {
+    method: "POST",
+    body: JSON.stringify({
+      mode: "redact",
+      compact: true,
+      reason: `M2.2 live PII purge ${ssnTok}`,
+    }),
+  });
+  assert.equal(purgeRes.res.status, 200, purgeRes.text);
+  assert.ok(!purgeRes.text.includes(ssnTok), "purge response omits raw SSN");
+  assert.ok(!purgeRes.text.includes(stuTok), "purge response omits raw Student ID");
+  assert.equal(purgeRes.json.receipt?.key_shredded, true);
+  assert.equal(purgeRes.json.receipt?.compacted, true);
+
+  const piiPgAfter = await apiJson(`/api/pages/${piiPgId}`);
+  assert.equal(piiPgAfter.res.status, 200, piiPgAfter.text);
+  assert.ok(piiPgAfter.json.anchored_markdown?.includes("[REDACTED]"));
+  assert.ok(!piiPgAfter.text.includes(ssnTok));
+
+  const piiDbAfter = await apiJson(`/api/databases/${piiDbId}`);
+  assert.equal(piiDbAfter.res.status, 200, piiDbAfter.text);
+  assert.ok(piiDbAfter.text.includes("[REDACTED]"), "DB row cell redacted");
+  assert.ok(!piiDbAfter.text.includes(stuTok), "DB row no longer contains raw Student ID");
+
+  for (const tok of [ssnTok, stuTok]) {
+    const sRes = await apiJson(`/api/search?q=${encodeURIComponent(tok)}&mode=bm25`);
+    assert.equal(sRes.res.status, 200, sRes.text);
+    assert.equal((sRes.json.results ?? []).length, 0, `BM25 search yields 0 hits for purged ${tok}`);
+    const hyRes = await apiJson(`/api/search?q=${encodeURIComponent(tok)}`);
+    assert.equal(hyRes.res.status, 200, hyRes.text);
+    assert.ok(!hyRes.text.includes(tok), `Hybrid search omits purged ${tok}`);
+  }
+
+  const stAfter = await apiJson("/api/admin/erasure/status");
+  assert.equal(stAfter.res.status, 200, stAfter.text);
+  assert.equal((stAfter.json.findings ?? []).length, 0, "Zero remaining PII findings");
+
+  const bakOut = execFileSync(
+    "mo",
+    ["run", path.join(ROOT_DIR, "backup.mo"), "--", "backup", "--db", "vellum.modb"],
+    { cwd: LIVE_DATA, encoding: "utf8" }
+  );
+  const bakJson = JSON.parse(bakOut.trim().split("\n").pop());
+  assert.equal(bakJson.ok, true, bakOut);
+  assert.equal(bakJson.target, "s3", bakOut);
+  assert.ok(typeof bakJson.object_key === "string" && bakJson.object_key.length > 0, bakOut);
+
+  const verifyOut = execFileSync(
+    "mo",
+    [
+      "run",
+      path.join(ROOT_DIR, "backup.mo"),
+      "--",
+      "verify",
+      "--key",
+      bakJson.object_key,
+      "--tmp",
+      "drill.modb",
+    ],
+    { cwd: LIVE_DATA, encoding: "utf8" }
+  );
+  const verifyJson = JSON.parse(verifyOut.trim().split("\n").pop());
+  assert.equal(verifyJson.verified, true, verifyOut);
+  assert.ok((verifyJson.audit_entries ?? 0) > 0, verifyOut);
+  assert.equal(verifyJson.drill_cleaned, true, verifyOut);
+  assert.equal(fs.existsSync(path.join(LIVE_DATA, "drill.modb")), false, "drill.modb cleaned up");
+
+  const restoredPath = path.join(LIVE_DATA, "restored.modb");
+  const restoreOut = execFileSync(
+    "mo",
+    [
+      "run",
+      path.join(ROOT_DIR, "backup.mo"),
+      "--",
+      "restore",
+      "--key",
+      bakJson.object_key,
+      "--out",
+      "restored.modb",
+    ],
+    { cwd: LIVE_DATA, encoding: "utf8" }
+  );
+  const restoreJson = JSON.parse(restoreOut.trim().split("\n").pop());
+  assert.equal(restoreJson.verified, true, restoreOut);
+  assert.equal(fs.existsSync(restoredPath), true, "restored.modb created");
+  fs.rmSync(restoredPath, { force: true });
+
+  console.log("✓ Live v3 M2.2 Extended PII Erasure (Pages + DB Rows) & Encrypted S3 Backup/Verify/Restore verified");
+}
 EOF
 
 echo "All Live Vellum E2E checks against mo serve + Dex + VersityGW S3 passed."

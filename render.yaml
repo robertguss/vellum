@@ -1,0 +1,53 @@
+# Render Blueprint for Sovereign Single-Instance Vellum Deployment
+# Note: Render persistent disks attach to a single service. Keep stateful writes
+# (`vellum.modb`, `sessions.modb`) on `/var/lib/vellum` and ship encrypted S3
+# snapshots via `mo run /app/backup.mo -- backup` (see docs/deployment-operations.md).
+services:
+  - type: web
+    name: vellum
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: standard
+    healthCheckPath: /healthz
+    disk:
+      name: vellum-modb-data
+      mountPath: /var/lib/vellum
+      sizeGB: 20
+    envVars:
+      # Required 64-char hex (32 bytes): openssl rand -hex 32
+      - key: VELLUM_SECRET_KEY
+        sync: false
+      - key: VELLUM_BACKUP_KEY
+        sync: false
+      - key: VELLUM_BACKUP_PREFIX
+        value: backups/vellum
+      - key: VELLUM_SESSION_TTL_SECONDS
+        value: "28800"
+      - key: VELLUM_OIDC_PROVIDER_ID
+        value: google
+      - key: VELLUM_OIDC_CLIENT_ID
+        sync: false
+      - key: VELLUM_OIDC_CLIENT_SECRET
+        sync: false
+      - key: VELLUM_OIDC_REDIRECT_URI
+        sync: false
+      - key: VELLUM_OIDC_ALLOWED_DOMAINS
+        sync: false
+      - key: VELLUM_OIDC_REQUIRE_VERIFIED_EMAIL
+        value: "1"
+      - key: VELLUM_S3_ENDPOINT
+        value: https://s3.us-east-1.amazonaws.com
+      - key: VELLUM_S3_REGION
+        value: us-east-1
+      - key: VELLUM_S3_BUCKET
+        sync: false
+      - key: VELLUM_S3_ACCESS_KEY_ID
+        sync: false
+      - key: VELLUM_S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: VELLUM_S3_PATH_STYLE
+        value: "0"
+      - key: VELLUM_AI_PROVIDER
+        value: openai
+      - key: VELLUM_AI_API_KEY
+        sync: false

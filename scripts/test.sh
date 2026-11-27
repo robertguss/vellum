@@ -57,6 +57,8 @@ mo check routes/ai.mo
 mo check routes/packs.mo
 mo check routes/sync.mo
 mo check sync.mo
+mo check backup-ops.mo
+mo check backup.mo
 mo check main.mo
 mo check tests/stage1.mo
 mo check tests/stage2.mo
@@ -86,7 +88,9 @@ mo check tests/unit-domain-misc.mo
 mo check tests/unit-rlm.mo
 mo check tests/unit-sync-cli.mo
 mo check tests/unit-vault.mo
+mo check tests/unit-backup.mo
 mo check tests/v3m2a.mo
+mo check tests/v3m2b.mo
 
 mo test domain/blocks.mo
 mo test domain/policy.mo
@@ -119,6 +123,8 @@ mo test tests/v3m1.mo
 mo test tests/v3m1b.mo
 mo test tests/v3m1c.mo
 mo test tests/unit-vault.mo
+mo test tests/unit-backup.mo
 mo test tests/v3m2a.mo
+mo test tests/v3m2b.mo
 
 echo "All Vellum Stage 1-5 checks, frontend build checks, and tests passed."

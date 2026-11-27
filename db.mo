@@ -136,7 +136,12 @@ tx_delete_summary,
 tx_get_principal,
 tx_get_collection,
 scan_collections,
-scan_principals
+scan_principals,
+scan_db_rows,
+get_db_row,
+tx_get_db_row,
+get_database,
+tx_get_database
 use Domain.Blocks
 use Domain.Blueprints{BlueprintDef, PageBlueprintMeta}
 use Domain.Formulas{FormulaRelatedRow}
@@ -3800,4 +3805,24 @@ end
 
 fn scan_principals(store: Store, limit: Int) : Result(List((Text, Principal)), AppError)
   Table.scan(store, principals_table(), None, None, limit).map_error(map_table_error)
+end
+
+fn scan_db_rows(store: Store, limit: Int) : Result(List((Text, DbRow)), AppError)
+  Table.scan(store, db_rows_table(), None, None, limit).map_error(map_table_error)
+end
+
+fn get_db_row(store: Store, id: Text) : Result(Option(DbRow), AppError)
+  Table.get(store, db_rows_table(), id).map_error(map_table_error)
+end
+
+fn tx_get_db_row(tx: WriteTx, id: Text) : Result(Option(DbRow), AppError)
+  Table.tx_get(tx, db_rows_table(), id).map_error(map_table_error)
+end
+
+fn get_database(store: Store, id: Text) : Result(Option(DatabaseDef), AppError)
+  Table.get(store, databases_table(), id).map_error(map_table_error)
+end
+
+fn tx_get_database(tx: WriteTx, id: Text) : Result(Option(DatabaseDef), AppError)
+  Table.tx_get(tx, databases_table(), id).map_error(map_table_error)
 end

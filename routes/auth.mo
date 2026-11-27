@@ -198,13 +198,29 @@ fn secure_cookies?(env: Env) : Bool
   (env.get("VELLUM_INSECURE_COOKIES") or "").trim != "1"
 end
 
-## Session cookie configuration (`vellum_session`, 7-day TTL, AES-256-GCM + SHA-256 MoDB backing).
+## Session cookie configuration (`vellum_session`, AES-256-GCM + SHA-256 MoDB backing,
+## configurable via `VELLUM_SESSION_TTL_SECONDS`, default 7 days / clamped 300s..30d).
 fn session_cfg(env: Env) : Session.SessionConfig
+  ttl = case env.get("VELLUM_SESSION_TTL_SECONDS")
+    Some(raw):
+      case raw.trim.to_int
+        Some(n): if n < 300: 300 else if n > 2592000: 2592000 else: n
+        None: 604800
+      end
+    None: 604800
+  end
   Session.SessionConfig(
     cookie_name: "vellum_session",
-    ttl_seconds: 604800,
+    ttl_seconds: ttl,
     secure?: secure_cookies?(env)
   )
+end
+
+fn optional_env_text(env: Env, key_name: Text) : Option(Text)
+  case env.get(key_name)
+    Some(v) if not v.trim.empty?: Some(v.trim)
+    Some(_) | None: None
+  end
 end
 
 fn require_env_text(env: Env, key_name: Text) : Result(Text, AppError)
@@ -223,21 +239,37 @@ fn parse_csv_list(raw: Option(Text)) : List(Text)
   end
 end
 
-## Builds `Arvo.Oidc.OidcConfig` from environment variables (fail-closed if unconfigured).
+## Builds `Arvo.Oidc.OidcConfig` from environment variables (`VELLUM_OIDC_PROVIDER_ID=google`
+## automatically presets Google Workspace endpoints with optional overrides; fail-closed otherwise).
 fn oidc_config(env: Env) : Result(Oidc.OidcConfig, AppError)
-  provider_id = case env.get("VELLUM_OIDC_PROVIDER_ID")
-    Some(v) if not v.trim.empty?: v.trim
-    Some(_) | None: "oidc"
-  end
+  provider_id = optional_env_text(env, "VELLUM_OIDC_PROVIDER_ID") or "oidc"
   client_id = try require_env_text(env, "VELLUM_OIDC_CLIENT_ID")
   client_secret = try require_env_text(env, "VELLUM_OIDC_CLIENT_SECRET")
   redirect_uri = try require_env_text(env, "VELLUM_OIDC_REDIRECT_URI")
-  issuer = try require_env_text(env, "VELLUM_OIDC_ISSUER")
-  auth_url = try require_env_text(env, "VELLUM_OIDC_AUTH_URL")
-  token_url = try require_env_text(env, "VELLUM_OIDC_TOKEN_URL")
-  userinfo_opt = case env.get("VELLUM_OIDC_USERINFO_URL")
-    Some(u) if not u.trim.empty?: Some(u.trim)
-    Some(_) | None: None
+  is_google? = provider_id.ascii_lowercase == "google"
+  gp = Oidc.google_endpoints()
+  issuer = if is_google?
+    optional_env_text(env, "VELLUM_OIDC_ISSUER") or gp.issuer
+  else
+    try require_env_text(env, "VELLUM_OIDC_ISSUER")
+  end
+  auth_url = if is_google?
+    optional_env_text(env, "VELLUM_OIDC_AUTH_URL") or gp.authorization_endpoint
+  else
+    try require_env_text(env, "VELLUM_OIDC_AUTH_URL")
+  end
+  token_url = if is_google?
+    optional_env_text(env, "VELLUM_OIDC_TOKEN_URL") or gp.token_endpoint
+  else
+    try require_env_text(env, "VELLUM_OIDC_TOKEN_URL")
+  end
+  userinfo_opt = case optional_env_text(env, "VELLUM_OIDC_USERINFO_URL")
+    Some(u): Some(u)
+    None: if is_google?: gp.userinfo_endpoint else: None
+  end
+  jwks_opt = case optional_env_text(env, "VELLUM_OIDC_JWKS_URI")
+    Some(u): Some(u)
+    None: if is_google?: gp.jwks_uri else: None
   end
   allowed_domains = parse_csv_list(env.get("VELLUM_OIDC_ALLOWED_DOMAINS"))
   require_verified? = (env.get("VELLUM_OIDC_REQUIRE_VERIFIED_EMAIL") or "").trim != "0"
@@ -254,7 +286,7 @@ fn oidc_config(env: Env) : Result(Oidc.OidcConfig, AppError)
         authorization_endpoint: auth_url,
         token_endpoint: token_url,
         userinfo_endpoint: userinfo_opt,
-        jwks_uri: None
+        jwks_uri: jwks_opt
       ),
       allowed_domains: allowed_domains,
       require_verified_email?: require_verified?,
@@ -768,7 +800,22 @@ fn start_oidc_login(req: Api.Request, rng: SecureRandom, clock: Clock, env: Env)
 )
   key = try app_secret_key(env)
   cfg = try oidc_config(env)
-  Oidc.start_login(cfg, key, rng, clock, req.query_param("return_to")).map_error(map_oidc_error)
+  res = try Oidc.start_login(cfg, key, rng, clock, req.query_param("return_to")).map_error(
+    map_oidc_error
+  )
+  if cfg.provider_id.ascii_lowercase == "google"
+    hd_opt = case optional_env_text(env, "VELLUM_OIDC_GOOGLE_HD")
+      Some(hd): Some(hd)
+      None: if cfg.allowed_domains.size == 1: cfg.allowed_domains.first else: None
+    end
+    case (hd_opt, res.header("Location"))
+      (Some(hd), Some(loc)):
+        sep = if loc.contains?("?"): "&" else: "?"
+        return Ok(res.with_header("Location", "#{loc}#{sep}hd=#{S3.uri_encode(hd, true)}"))
+      (_, _): Unit
+    end
+  end
+  Ok(res)
 end
 
 ## `GET /auth/oidc/callback` — Completes OIDC PKCE callback, JIT-provisions human `Principal` + root `Grant`,

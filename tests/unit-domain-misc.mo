@@ -321,6 +321,34 @@ test "Domain.Secrets scans every secret class, avoids false positives, masks saf
   assert scan_text(redacted) == []
   assert not redacted.contains?("sk-proj-AbCdEf1234567890XyZ")
   assert redacted.contains?("[REDACTED]")
+
+  # Extended calibrated PII detection & false-positive guards (v3 M2.2)
+  pii_safe = "Invalid SSNs: 000-12-3456, 666-12-3456, 900-12-3456. Phone: 1-800-555-1234 or (555) 123-4567. Bad routing: Routing #021000022. Bad Luhn: 4532-1111-2222-3331. Plain number: 901234567."
+  assert scan_text(pii_safe) == []
+
+  pii_sample = "SSN: 214-88-4321 | ID1: STU-90123456 | ID2: Student ID: 901234567 | ABA: Routing #021000021 | Card: 4532-1111-2222-3336"
+  pii_found = scan_text(pii_sample)
+  pii_kinds = pii_found.map(fn(f) f.kind end)
+  assert pii_kinds == ["us_ssn", "student_id", "student_id", "bank_routing", "payment_card"]
+
+  assert (pii_found.get(0) or stop "f0").masked_preview == "***-**-4321"
+  assert (pii_found.get(1) or stop "f1").masked_preview == "***3456"
+  assert (pii_found.get(2) or stop "f2").masked_preview == "***4567"
+  assert (pii_found.get(3) or stop "f3").masked_preview == "ABA-*****0021"
+  assert (pii_found.get(4) or stop "f4").masked_preview == "****-****-****-3336"
+
+  for pf in pii_found
+    pub2 = finding_to_public_json(pf).to_text
+    assert not pub2.contains?(pf.raw_token)
+  end
+
+  (pii_red, pii_repl) = redact_tokens(pii_sample, pii_found.map(fn(f) f.raw_token end))
+  assert pii_repl == 5
+  assert scan_text(pii_red) == []
+  assert not pii_red.contains?("214-88-4321")
+  assert not pii_red.contains?("STU-90123456")
+  assert not pii_red.contains?("021000021")
+  assert not pii_red.contains?("4532-1111-2222-3336")
 end
 
 test "NotionImport ID stripping, internal link rewriting, RFC 4180 CSV parsing, and typed schema inference"

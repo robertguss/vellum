@@ -11,6 +11,7 @@ execute_secret_purge_locked
 use Crypto
 use Db
 use Domain.Blocks
+use Domain.DatabaseModel{CellValue, DbRow, row_plain_text}
 use Domain.Secrets
 use Domain.Types{AppError, Block, Comment, Page, PageKind, Provenance}
 use Json
@@ -103,7 +104,67 @@ fn scan_page_secret_hints(
   hints
 end
 
-## Scans all active workspace pages, blocks, and comments for exposed credentials.
+fn cell_text_candidates(row: DbRow) : List(Text)
+  var out = []
+  for (_prop_id, cv) in row.cells.entries
+    case cv
+      TextVal(t):
+        if not t.empty?
+          out = out.append(t)
+        end
+      UrlVal(u):
+        if not u.empty?
+          out = out.append(u)
+        end
+      Empty | NumberVal(_) | DateVal(start: _, end_date: _) | SelectVal(option_id: _) |
+        MultiSelectVal(option_ids: _) |
+        BoolVal(_) |
+        PrincipalVal(_) |
+        FilesVal(attachment_ids: _) |
+        RelationVal(row_ids: _): Unit
+    end
+  end
+  out
+end
+
+fn row_contains_any_token?(row: DbRow, tokens: List(Text)) : Bool
+  for txt in cell_text_candidates(row)
+    for tok in tokens
+      return true if txt.contains?(tok)
+    end
+  end
+  false
+end
+
+fn redact_row_cells(cells: Map(Text, CellValue), tokens: List(Text)) : (Map(Text, CellValue), Int)
+  var next = cells
+  var total = 0
+  for (prop_id, cv) in cells.entries
+    case cv
+      TextVal(t):
+        (rt, cnt) = Secrets.redact_tokens(t, tokens)
+        if cnt > 0
+          next = next.set(prop_id, TextVal(rt))
+          total += cnt
+        end
+      UrlVal(u):
+        (ru, cnt) = Secrets.redact_tokens(u, tokens)
+        if cnt > 0
+          next = next.set(prop_id, UrlVal(ru))
+          total += cnt
+        end
+      Empty | NumberVal(_) | DateVal(start: _, end_date: _) | SelectVal(option_id: _) |
+        MultiSelectVal(option_ids: _) |
+        BoolVal(_) |
+        PrincipalVal(_) |
+        FilesVal(attachment_ids: _) |
+        RelationVal(row_ids: _): Unit
+    end
+  end
+  (next, total)
+end
+
+## Scans all active workspace pages, blocks, comments, and database rows for exposed credentials/PII.
 fn scan_workspace_secrets(store: Store) : Result(List(Json), AppError)
   rows = try Table.scan(store, Db.pages_table(), None, None, 500).map_error(Db.map_table_error)
   var out = []
@@ -115,6 +176,19 @@ fn scan_workspace_secrets(store: Store) : Result(List(Json), AppError)
       cmts = cmt_rows.map(fn(x) x.1 end)
       for h in scan_page_secret_hints(store, pg, blks, cmts)
         out = out.append(h)
+      end
+      case pg.kind
+        DatabaseRow(database_id: _, row_id: rid):
+          case try Db.get_db_row(store, rid)
+            Some(drow) if drow.archived_at == None:
+              for txt in cell_text_candidates(drow)
+                for f in Secrets.scan_text(txt)
+                  out = out.append(make_hint_json("db_row", pg, None, None, f))
+                end
+              end
+            Some(_) | None: Unit
+          end
+        Document: Unit
       end
     end
   end
@@ -248,6 +322,19 @@ fn execute_secret_purge_locked(
                   toks = append_unique_text(toks, f.raw_token)
                 end
               end
+              case pg.kind
+                DatabaseRow(database_id: _, row_id: rid):
+                  case try Db.get_db_row(store, rid)
+                    Some(drow) if drow.archived_at == None:
+                      for txt in cell_text_candidates(drow)
+                        for f in Secrets.scan_text(txt)
+                          toks = append_unique_text(toks, f.raw_token)
+                        end
+                      end
+                    Some(_) | None: Unit
+                  end
+                Document: Unit
+              end
           end
         None:
           all_pgs = try Table.scan(store, Db.pages_table(), None, None, 500).map_error(
@@ -278,6 +365,16 @@ fn execute_secret_purge_locked(
               end
             end
           end
+          all_rows = try Db.scan_db_rows(store, 500)
+          for (_rid, drow) in all_rows
+            if drow.archived_at == None
+              for txt in cell_text_candidates(drow)
+                for f in Secrets.scan_text(txt)
+                  toks = append_unique_text(toks, f.raw_token)
+                end
+              end
+            end
+          end
       end
 
       if clean_mode == "redact" and toks.empty?
@@ -303,7 +400,15 @@ fn execute_secret_purge_locked(
               pg2.id
             ).map_error(Db.map_table_error)
             cmts2 = cmt_rows2.map(fn(x) x.1 end)
-            if page_contains_any_token?(pg2, blks2, cmts2, toks)
+            row_hit? = case pg2.kind
+              DatabaseRow(database_id: _, row_id: rid2):
+                case try Db.get_db_row(store, rid2)
+                  Some(dr2): dr2.archived_at == None and row_contains_any_token?(dr2, toks)
+                  None: false
+                end
+              Document: false
+            end
+            if row_hit? or page_contains_any_token?(pg2, blks2, cmts2, toks)
               aff = append_unique_text(aff, pg2.id)
             end
           end
@@ -442,7 +547,15 @@ fn execute_secret_purge_locked(
             None: Unit
           end
           case try Table.tx_get(cur, Db.pages_table(), pid).map_error(Db.map_table_error)
-            Some(_pg): cur = try Db.tx_delete_page_row(cur, pid)
+            Some(pg_del):
+              case pg_del.kind
+                DatabaseRow(database_id: db_id_del, row_id: rid_del):
+                  case try Db.tx_get_database(cur, db_id_del)
+                    Some(def_del): cur = try Db.tx_delete_db_row(cur, def_del, rid_del)
+                    None: cur = try Db.tx_delete_page_row(cur, pid)
+                  end
+                Document: cur = try Db.tx_delete_page_row(cur, pid)
+              end
             None: Unit
           end
         else
@@ -539,9 +652,34 @@ fn execute_secret_purge_locked(
                 archived_at: pg.archived_at,
                 version: pg.version + 1
               )
-              cur = try Db.tx_put_page_row(cur, bumped_pg)
-              if bumped_pg.kind == Document
-                cur = try Db.tx_refresh_page_summary(cur, bumped_pg, sorted_next_blks)
+              row_saved? = case bumped_pg.kind
+                DatabaseRow(database_id: db_id, row_id: rid):
+                  case (try Db.tx_get_database(cur, db_id), try Db.tx_get_db_row(cur, rid))
+                    (Some(def), Some(drow)):
+                      (red_cells, cell_cnt) = redact_row_cells(drow.cells, tokens)
+                      b_cnt += cell_cnt
+                      red_row = DbRow(
+                        id: drow.id,
+                        database_id: drow.database_id,
+                        page_id: drow.page_id,
+                        cells: red_cells,
+                        created_by: drow.created_by,
+                        created_at: drow.created_at,
+                        updated_at: now,
+                        archived_at: drow.archived_at,
+                        version: drow.version + 1
+                      )
+                      cur = try Db.tx_put_db_row(cur, def, red_row, bumped_pg, sorted_next_blks)
+                      true
+                    (_, _): false
+                  end
+                Document: false
+              end
+              if not row_saved?
+                cur = try Db.tx_put_page_row(cur, bumped_pg)
+                if bumped_pg.kind == Document
+                  cur = try Db.tx_refresh_page_summary(cur, bumped_pg, sorted_next_blks)
+                end
               end
             None: Unit
           end
@@ -611,7 +749,20 @@ fn execute_secret_purge_locked(
             Some(pg):
               b_rows = try Table.tx_lookup(cur, Db.blocks_table(), Db.blocks_by_page(), pid)
                 .map_error(Db.map_table_error)
-              cur = try Db.tx_index_page(cur, pg, Blocks.sort_blocks(b_rows.map(fn(x) x.1 end)))
+              extra_opt = case pg.kind
+                DatabaseRow(database_id: db_id, row_id: rid):
+                  case (try Db.tx_get_database(cur, db_id), try Db.tx_get_db_row(cur, rid))
+                    (Some(def), Some(drow)): Some(row_plain_text(def, drow))
+                    (_, _): None
+                  end
+                Document: None
+              end
+              cur = try Db.tx_index_page_with_extra(
+                cur,
+                pg,
+                Blocks.sort_blocks(b_rows.map(fn(x) x.1 end)),
+                extra_opt
+              )
             None: Unit
           end
         end
