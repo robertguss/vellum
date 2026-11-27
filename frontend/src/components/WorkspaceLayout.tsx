@@ -7,6 +7,7 @@ import {
   FolderPlus,
   GitPullRequest,
   Home,
+  Layers,
   LogOut,
   Search,
   Settings,
@@ -257,6 +258,24 @@ export default function WorkspaceLayout({
                 <GitPullRequest className="h-4 w-4 text-teal-700" />
                 Change Proposals
               </Link>
+              <div className="flex items-center justify-between gap-1">
+                <Link
+                  href="/packs"
+                  className="flex-1 flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-stone-700 hover:bg-stone-200/70 transition"
+                >
+                  <Layers className="h-4 w-4 text-indigo-700" />
+                  Context Studio
+                </Link>
+                <a
+                  href="/llms.txt"
+                  target="_blank"
+                  rel="noreferrer"
+                  title="Open grant-filtered /llms.txt index"
+                  className="rounded-md px-1.5 py-1 font-mono text-[10px] text-stone-500 hover:bg-stone-200/70 hover:text-stone-900 transition"
+                >
+                  /llms.txt
+                </a>
+              </div>
               <Link
                 href="/admin"
                 className="flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-stone-700 hover:bg-stone-200/70 transition"

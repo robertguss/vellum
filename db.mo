@@ -46,6 +46,13 @@ blueprints_by_slug,
 blueprints_table,
 page_meta_by_blueprint,
 page_meta_table,
+summaries_by_collection,
+summaries_table,
+packs_by_slug,
+packs_table,
+page_summary_key,
+db_summary_key,
+tx_refresh_db_summary,
 tx_put_page_neural_vector,
 tx_remove_page_vectors,
 neural_vec_populated,
@@ -87,6 +94,7 @@ world_catalog,
 replay_catalog
 use Domain.Blocks
 use Domain.Blueprints{BlueprintDef, PageBlueprintMeta}
+use Domain.Packs{ContextPack, LivingSummary}
 use Domain.Collab{
   DecimalDelta,
   ProposalMeta,
@@ -315,6 +323,30 @@ fn page_meta_table() : Table.Table(Text, PageBlueprintMeta)
   Table.text_key[PageBlueprintMeta]("vlm_page_meta").with_index(page_meta_by_blueprint())
 end
 
+fn page_summary_key(page_id: Text) : Text
+  "page:#{page_id}"
+end
+
+fn db_summary_key(db_id: Text) : Text
+  "db:#{db_id}"
+end
+
+fn summaries_by_collection() : Table.Index(Text, LivingSummary, Text)
+  Table.text_index[Text, LivingSummary]("vlm_summaries_by_collection", fn(s) s.collection_id end)
+end
+
+fn summaries_table() : Table.Table(Text, LivingSummary)
+  Table.text_key[LivingSummary]("vlm_summaries").with_index(summaries_by_collection())
+end
+
+fn packs_by_slug() : Table.Index(Text, ContextPack, Text)
+  Table.unique_text_index[Text, ContextPack]("vlm_packs_by_slug", fn(p) p.slug end)
+end
+
+fn packs_table() : Table.Table(Text, ContextPack)
+  Table.text_key[ContextPack]("vlm_packs").with_index(packs_by_slug())
+end
+
 ## Converts `Modb.Table` errors to `AppError`.
 fn map_table_error(err: Table.TableError) : AppError
   case err
@@ -538,6 +570,7 @@ fn vellum_schema() : Ledger.Schema
   db_rows = db_rows_table()
   bps = blueprints_table()
   page_metas = page_meta_table()
+  packs = packs_table()
   Ledger.schema(1).with_require_reason(true).with_migration(
     Ledger.migration(1, "initialize default workspace and general collection", init_v1_migration)
   ).with_invariant(
@@ -572,6 +605,7 @@ fn vellum_schema() : Ledger.Schema
         bad_block = case b.kind
           Heading(level: lvl): lvl < 1 or lvl > 3
           DatabaseViewEmbed(database_id: db_id, view_id: _): db_id.trim.empty?
+          AiBrief(prompt: pr, source_scope: _, refreshed_at: _): pr.trim.empty?
           Paragraph | BulletListItem | OrderedListItem(start: _) | TaskItem(checked: _) | Quote | Callout(
             tone: _,
             icon: _
@@ -655,6 +689,8 @@ fn vellum_schema() : Ledger.Schema
         end
       end
     )
+  ).with_invariant(
+    Ledger.row_invariant("pack_valid", packs, fn(_id, p) Packs.validate_context_pack(p) end)
   )
 end
 
@@ -822,7 +858,19 @@ fn tx_remove_page_vectors(tx: WriteTx, page_id: Text) : Result(WriteTx, AppError
   end
 end
 
-## Atomically persists `page`, replaces its blocks, and updates `Modb.Fts` + `Modb.Vec` inside `tx`.
+fn tx_refresh_page_summary(tx: WriteTx, page: Page, blocks: List(Block)) : Result(WriteTx, AppError)
+  pm_opt = try Table.tx_get(tx, page_meta_table(), page.id).map_error(map_table_error)
+  bp_opt = case pm_opt
+    Some(pm): try Table.tx_get(tx, blueprints_table(), pm.blueprint_id).map_error(map_table_error)
+    None: None
+  end
+  key = page_summary_key(page.id)
+  prev_opt = try Table.tx_get(tx, summaries_table(), key).map_error(map_table_error)
+  summary = Packs.build_page_summary(page, blocks, bp_opt, pm_opt, prev_opt, page.updated_at)
+  Table.put(tx, summaries_table(), summary.id, summary).map_error(map_table_error)
+end
+
+## Atomically persists `page`, replaces its blocks, and updates `Modb.Fts`, `Modb.Vec`, and `LivingSummary` inside `tx`.
 fn tx_save_page_and_blocks(tx: WriteTx, page: Page, blocks: List(Block)) : Result(WriteTx, AppError)
   btbl = blocks_table()
   bidx = blocks_by_page()
@@ -846,15 +894,25 @@ fn tx_save_page_and_blocks(tx: WriteTx, page: Page, blocks: List(Block)) : Resul
     end
   end
   if page.archived_at == None
-    tx_index_page(cur, page, blocks)
+    t_idx = try tx_index_page(cur, page, blocks)
+    if page.kind == Document
+      tx_refresh_page_summary(t_idx, page, blocks)
+    else
+      Ok(t_idx)
+    end
   else
     t_fts = try Fts.tx_remove_document(cur, fts_index(), page.id).map_error(map_fts_error)
-    tx_remove_page_vectors(t_fts, page.id)
+    t_vec = try tx_remove_page_vectors(t_fts, page.id)
+    sum_key = page_summary_key(page.id)
+    case try Table.tx_get(t_vec, summaries_table(), sum_key).map_error(map_table_error)
+      Some(_sm): Table.delete(t_vec, summaries_table(), sum_key).map_error(map_table_error)
+      None: Ok(t_vec)
+    end
   end
 end
 
-## Atomically removes `page_id`, any attached blueprint metadata, all of its blocks, its FTS entry,
-## and its vector index entries inside `tx`.
+## Atomically removes `page_id`, any attached blueprint metadata, its living summary, all of its blocks,
+## its FTS entry, and its vector index entries inside `tx`.
 fn tx_delete_page_and_blocks(tx: WriteTx, page_id: Text) : Result(WriteTx, AppError)
   btbl = blocks_table()
   bidx = blocks_by_page()
@@ -865,6 +923,11 @@ fn tx_delete_page_and_blocks(tx: WriteTx, page_id: Text) : Result(WriteTx, AppEr
   end
   case try Table.tx_get(cur, page_meta_table(), page_id).map_error(map_table_error)
     Some(_pm): cur = try Table.delete(cur, page_meta_table(), page_id).map_error(map_table_error)
+    None: Unit
+  end
+  sum_key = page_summary_key(page_id)
+  case try Table.tx_get(cur, summaries_table(), sum_key).map_error(map_table_error)
+    Some(_sm): cur = try Table.delete(cur, summaries_table(), sum_key).map_error(map_table_error)
     None: Unit
   end
   cur = try Table.delete(cur, pages_table(), page_id).map_error(map_table_error)
@@ -1294,8 +1357,20 @@ fn tx_update_db_cell_index(tx: WriteTx, db_id: Text, old_row: Option(DbRow), new
   Ok(cur)
 end
 
+fn tx_refresh_db_summary(tx: WriteTx, def: DatabaseDef, now: Time) : Result(WriteTx, AppError)
+  pairs = try Table.tx_lookup(tx, db_rows_table(), db_rows_by_database(), def.id).map_error(
+    map_table_error
+  )
+  active = pairs.filter(fn(p) p.1.archived_at == None end).map(fn(p) p.1 end)
+  enriched = try tx_enrich_rows_with_rollups(tx, def, active)
+  key = db_summary_key(def.id)
+  prev_opt = try Table.tx_get(tx, summaries_table(), key).map_error(map_table_error)
+  sum = Packs.build_database_summary(def, enriched, prev_opt, now)
+  Table.put(tx, summaries_table(), sum.id, sum).map_error(map_table_error)
+end
+
 ## Atomically persists a `DbRow`, its `vlm_db_cells` composite indexes, its backing `Page` + `Block`s,
-## and combined title + properties + body text in `Modb.Fts`.
+## combined title + properties + body text in `Modb.Fts`, and the database `LivingSummary`.
 fn tx_put_db_row(tx: WriteTx, def: DatabaseDef, row: DbRow, page: Page, blocks: List(Block)) : Result(
   WriteTx,
   AppError
@@ -1329,13 +1404,15 @@ fn tx_put_db_row(tx: WriteTx, def: DatabaseDef, row: DbRow, page: Page, blocks: 
       scope: page.collection_id,
       values: Vec.text_sketch_embedding(embed_txt, sketch_vec_dims)
     )
-    Vec.tx_put_vector(t4, sketch_vec_index(), vec_inp).map_error(map_vec_error)
+    t5 = try Vec.tx_put_vector(t4, sketch_vec_index(), vec_inp).map_error(map_vec_error)
+    tx_refresh_db_summary(t5, def, row.updated_at)
   else
-    Ok(t3)
+    tx_refresh_db_summary(t3, def, row.updated_at)
   end
 end
 
-## Atomically deletes a `DbRow`, its `vlm_db_cells` entries, backing `Page` + `Block`s, and FTS entry.
+## Atomically deletes a `DbRow`, its `vlm_db_cells` entries, backing `Page` + `Block`s, FTS entry,
+## and updates the parent database `LivingSummary`.
 fn tx_delete_db_row(tx: WriteTx, def: DatabaseDef, row_id: Text) : Result(WriteTx, AppError)
   old_row = case try Table.tx_get(tx, db_rows_table(), row_id).map_error(map_table_error)
     Some(r): r
@@ -1343,7 +1420,8 @@ fn tx_delete_db_row(tx: WriteTx, def: DatabaseDef, row_id: Text) : Result(WriteT
   end
   t1 = try tx_update_db_cell_index(tx, def.id, Some(old_row), None)
   t2 = try Table.delete(t1, db_rows_table(), row_id).map_error(map_table_error)
-  tx_delete_page_and_blocks(t2, old_row.page_id)
+  t3 = try tx_delete_page_and_blocks(t2, old_row.page_id)
+  tx_refresh_db_summary(t3, def, old_row.updated_at)
 end
 
 ## Resolves all `Rollup` columns for `rows` of `def` by fetching referenced target rows from `Store`.
@@ -2441,7 +2519,7 @@ test "Db relational database composite cell indexes, rollup enrichment, and Ledg
       end
 
       rep = try Ledger.verify_all(db).map_error(map_ledger_error)
-      return Error(BadInput(reason: "expected 7 invariants")) if rep.invariants_checked != 7
+      return Error(BadInput(reason: "expected 8 invariants")) if rep.invariants_checked != 8
       Ok(Unit)
     end
   )
@@ -2795,7 +2873,7 @@ test "Db Modb.Vec hybrid RRF search, neural vector updates/dimension switches, a
       new_other = try Vec.get_doc(store, neural_vec_index(8), pg_other.id).map_error(map_vec_error)
       return Error(BadInput(reason: "expected 8d vector present")) if new_other == None
       rep = try Ledger.verify_all(db).map_error(map_ledger_error)
-      return Error(BadInput(reason: "expected 7 invariants")) if rep.invariants_checked != 7
+      return Error(BadInput(reason: "expected 8 invariants")) if rep.invariants_checked != 8
       Ok(Unit)
     end
   )
@@ -3118,6 +3196,123 @@ test "blueprints and page_meta integrity, FTS indexing, and delete cleanup"
       t1 = try tx_delete_page_and_blocks(tx, pg.id)
       rem = try Table.tx_get(t1, page_meta_table(), pg.id).map_error(map_table_error)
       Ok((t1, rem))
+    end
+  )
+  assert del_res == Ok(None)
+end
+
+test "living summaries auto-persist on page/db writes, clean up on delete, and enforce pack_valid invariant"
+  files = Files.in_memory({})
+  schema = vellum_schema()
+  t0 = Time.parse("2026-11-27T10:00:00Z") or stop "t0"
+  meta = Ledger.WriteMeta(principal: "usr_ada", action: "test.packs", reason: "pack test", at: t0)
+  prov = Provenance(
+    author_id: "usr_ada",
+    author_kind: HumanAuthor,
+    grant_id: None,
+    proposal_id: None,
+    reason: None,
+    citations: [],
+    updated_at: t0
+  )
+  pg = Page(
+    id: "pg_ls1",
+    collection_id: default_collection_id,
+    parent_page_id: None,
+    title: "Release Checklist",
+    icon: None,
+    cover_attachment_id: None,
+    kind: Document,
+    sort_order: "a",
+    database_id: None,
+    freshness_ttl_days: None,
+    verified_at: None,
+    verified_by: None,
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+  blk = Block(
+    id: "blk_ls1",
+    page_id: pg.id,
+    parent_block_id: None,
+    rank: "i0001",
+    kind: Heading(level: 2),
+    markdown: "Rollback Plan",
+    provenance: prov,
+    version: 1
+  )
+  pk = ContextPack(
+    id: "pk_ls1",
+    slug: "release-pack",
+    name: "Release Pack",
+    description: "Essential release context",
+    collection_ids: [default_collection_id],
+    pinned_page_ids: [pg.id],
+    database_ids: [],
+    query_hint: None,
+    fresh_only: false,
+    include_full_blocks: true,
+    token_budget: 2048,
+    created_by: "usr_ada",
+    updated_at: t0,
+    version: 1
+  )
+
+  w_res = Ledger.transact_locked(
+    files,
+    ledger_db_path,
+    schema,
+    meta,
+    "save page and context pack",
+    Json.Null,
+    map_ledger_error,
+    fn(tx)
+      t1 = try tx_save_page_and_blocks(tx, pg, [blk])
+      t2 = try Table.put(t1, packs_table(), pk.id, pk).map_error(map_table_error)
+      Ok((t2, Unit))
+    end
+  )
+  assert w_res is Ok(Unit)
+
+  chk_res = Ledger.read_locked(
+    files.read_only,
+    ledger_db_path,
+    schema,
+    map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      s_opt = try Table.get(store, summaries_table(), page_summary_key(pg.id)).map_error(
+        map_table_error
+      )
+      rep = try Ledger.verify_all(db).map_error(map_ledger_error)
+      Ok((s_opt, rep.invariants_checked))
+    end
+  )
+  case chk_res
+    Ok((Some(s), inv_cnt)):
+      assert s.title == "Release Checklist"
+      assert s.headings == ["Rollback Plan"]
+      assert inv_cnt == 8
+    Ok((None, _)) | Error(_): assert false
+  end
+
+  del_res = Ledger.transact_locked(
+    files,
+    ledger_db_path,
+    schema,
+    meta,
+    "delete page removes living summary",
+    Json.Null,
+    map_ledger_error,
+    fn(tx)
+      t1 = try tx_delete_page_and_blocks(tx, pg.id)
+      s_rem = try Table.tx_get(t1, summaries_table(), page_summary_key(pg.id)).map_error(
+        map_table_error
+      )
+      Ok((t1, s_rem))
     end
   )
   assert del_res == Ok(None)

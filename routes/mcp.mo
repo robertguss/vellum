@@ -19,6 +19,7 @@ use Modb.Ledger
 use Modb.Table
 use Modb.World
 use Routes.Ai
+use Routes.Packs
 
 fn vellum_server_info() : Mcp.ServerInfo
   Mcp.ServerInfo(
@@ -146,12 +147,48 @@ fn vellum_tools() : List(Mcp.ToolDef)
         ["database_id"]
       ),
       read_only?: true
+    ),
+    Mcp.ToolDef(
+      name: "vellum.list_summaries",
+      description: "List compact grant-filtered Living Summaries (~50 tokens each) for accessible pages and databases.",
+      input_schema: Mcp.object_schema(
+        {
+          "collection_id": str_prop("Optional collection filter"),
+          "kind": str_prop("Optional entity kind: 'page' or 'database'")
+        },
+        []
+      ),
+      read_only?: true
+    ),
+    Mcp.ToolDef(
+      name: "vellum.list_packs",
+      description: "List reusable Context Packs available to this grant (progressive-disclosure bundles).",
+      input_schema: Mcp.object_schema({}, []),
+      read_only?: true
+    ),
+    Mcp.ToolDef(
+      name: "vellum.read_pack",
+      description: "Compile a Context Pack under its token budget and return Markdown + token utilization telemetry.",
+      input_schema: Mcp.object_schema(
+        {
+          "slug": str_prop("Pack slug or ID"),
+          "q": str_prop("Optional query hint to prioritize relevant pages")
+        },
+        ["slug"]
+      ),
+      read_only?: true
     )
   ]
 end
 
-fn vellum_resources() : List(Mcp.ResourceDef)
-  [
+fn vellum_resources_for(auth: AuthContext, rf: ReadFiles) : List(Mcp.ResourceDef)
+  base = [
+    Mcp.ResourceDef(
+      uri: "vellum://index",
+      name: "Workspace Index (/llms.txt)",
+      description: "Compact grant-filtered progressive-disclosure index of Context Packs, collections, and Living Summaries",
+      mime_type: "text/markdown"
+    ),
     Mcp.ResourceDef(
       uri: "vellum://workspace/overview",
       name: "Workspace Overview",
@@ -159,6 +196,33 @@ fn vellum_resources() : List(Mcp.ResourceDef)
       mime_type: "application/json"
     )
   ]
+  if not rf.exists?(Db.ledger_db_path) or auth.principal.suspended or
+    not Policy.action_permitted?(auth, "read")
+    return base
+  end
+  pack_res = Ledger.read_locked(
+    rf,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db) Packs.list_permitted_packs(Ledger.store(db), auth) end
+  )
+  case pack_res
+    Error(_): base
+    Ok(pks):
+      var out = base
+      for pk in pks
+        out = out.append(
+          Mcp.ResourceDef(
+            uri: "vellum://packs/#{pk.slug}",
+            name: pk.name,
+            description: "Context Pack (#{pk.token_budget} tok): #{pk.description}",
+            mime_type: "text/markdown"
+          )
+        )
+      end
+      out
+  end
 end
 
 fn make_provenance(auth: AuthContext, reason: Text, now: Time) : Provenance
@@ -806,17 +870,131 @@ fn handle_tool_call(
     end
   end
 
+  if name == "vellum.list_summaries"
+    col_f = case args.text_at("collection_id")
+      Some(s) if not s.trim.empty?: Some(s.trim)
+      Some(_) | None: None
+    end
+    kind_f = case args.text_at("kind")
+      Some(s) if not s.trim.empty?: Some(s.trim)
+      Some(_) | None: None
+    end
+    res = Ledger.read_locked(
+      files.read_only,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      Db.map_ledger_error,
+      fn(db) Packs.list_permitted_summaries(Ledger.store(db), auth, col_f, kind_f) end
+    )
+    return case res
+      Ok(sums): Ok(
+        Mcp.tool_ok(id, "Returned #{sums.size} living summaries.", Some(Json.Object({"summaries": sums.to_json})))
+      )
+      Error(e): Ok(Mcp.tool_error(id, e.to_text))
+    end
+  end
+
+  if name == "vellum.list_packs"
+    res = Ledger.read_locked(
+      files.read_only,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      Db.map_ledger_error,
+      fn(db) Packs.list_permitted_packs(Ledger.store(db), auth) end
+    )
+    return case res
+      Ok(pks): Ok(
+        Mcp.tool_ok(id, "Returned #{pks.size} context packs.", Some(Json.Object({"packs": pks.to_json})))
+      )
+      Error(e): Ok(Mcp.tool_error(id, e.to_text))
+    end
+  end
+
+  if name == "vellum.read_pack"
+    slug = case args.text_at("slug")
+      Some(s) if not s.trim.empty?: s.trim
+      Some(_) | None: return Ok(Mcp.tool_error(id, "missing 'slug'"))
+    end
+    q_hint = case args.text_at("q")
+      Some(s) if not s.trim.empty?: Some(s.trim)
+      Some(_) | None: None
+    end
+    res = Ledger.read_locked(
+      files.read_only,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      Db.map_ledger_error,
+      fn(db) Packs.compile_pack_from_store(Ledger.store(db), auth, slug, q_hint, now) end
+    )
+    return case res
+      Ok(compiled): Ok(
+        Mcp.tool_ok(
+          id,
+          "Compiled pack '#{compiled.pack.slug}' (#{compiled.tokens_used}/#{compiled.token_budget} tok).\n\n#{compiled.markdown}",
+          Some(compiled.to_json)
+        )
+      )
+      Error(e): Ok(Mcp.tool_error(id, e.to_text))
+    end
+  end
+
   Ok(Mcp.tool_error(id, "unhandled tool '#{name}'"))
 end
 
-fn handle_resource_read(id: Mcp.RpcId, uri: Text, auth: AuthContext, rf: ReadFiles) : Result(
-  Api.Response,
-  AppError
-)
+fn handle_resource_read(
+  id: Mcp.RpcId,
+  uri: Text,
+  auth: AuthContext,
+  rf: ReadFiles,
+  clock: Clock
+) : Result(Api.Response, AppError)
   if not Policy.action_permitted?(auth, "read")
     return Ok(
       Mcp.json_rpc_error(id, Mcp.RpcError(code: -32003, message: "read not permitted", data: None))
     )
+  end
+
+  if uri == "vellum://index"
+    idx_res = Ledger.read_locked(
+      rf,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      Db.map_ledger_error,
+      fn(db) Packs.render_llms_txt_from_store(Ledger.store(db), auth) end
+    )
+    return case idx_res
+      Ok(md): Ok(
+        Mcp.resource_response(
+          id,
+          [Mcp.ResourceContent(uri: uri, mime_type: "text/markdown", text: md)]
+        )
+      )
+      Error(e): Ok(Mcp.json_rpc_error(id, Mcp.RpcError(code: -32004, message: e.to_text, data: None)))
+    end
+  end
+
+  case uri.drop_prefix("vellum://packs/")
+    Some(slug) if not slug.trim.empty?:
+      now = clock.now
+      pk_res = Ledger.read_locked(
+        rf,
+        Db.ledger_db_path,
+        Db.vellum_schema(),
+        Db.map_ledger_error,
+        fn(db) Packs.compile_pack_from_store(Ledger.store(db), auth, slug.trim, None, now) end
+      )
+      return case pk_res
+        Ok(compiled): Ok(
+          Mcp.resource_response(
+            id,
+            [Mcp.ResourceContent(uri: uri, mime_type: "text/markdown", text: compiled.markdown)]
+          )
+        )
+        Error(e): Ok(
+          Mcp.json_rpc_error(id, Mcp.RpcError(code: -32004, message: e.to_text, data: None))
+        )
+      end
+    Some(_) | None: Unit
   end
 
   if uri == "vellum://workspace/overview"
@@ -902,7 +1080,8 @@ fn handle_mcp(
   env: Env,
   net: Network
 ) : Result(Api.Response, AppError)
-  case Mcp.dispatch(req, vellum_server_info(), vellum_tools(), vellum_resources())
+  resources = vellum_resources_for(auth, files.read_only)
+  case Mcp.dispatch(req, vellum_server_info(), vellum_tools(), resources)
     Mcp.Respond(res): Ok(res)
     Mcp.CallTool(id: rpc_id, name: tool_name, arguments: args): handle_tool_call(
       rpc_id,
@@ -915,6 +1094,12 @@ fn handle_mcp(
       env,
       net
     )
-    Mcp.ReadResource(id: rpc_id, uri: uri): handle_resource_read(rpc_id, uri, auth, files.read_only)
+    Mcp.ReadResource(id: rpc_id, uri: uri): handle_resource_read(
+      rpc_id,
+      uri,
+      auth,
+      files.read_only,
+      clock
+    )
   end
 end

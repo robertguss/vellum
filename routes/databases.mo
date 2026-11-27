@@ -350,7 +350,8 @@ fn create_database(
       t4 = try Table.put(t3, Db.db_views_table(), default_view.id, default_view).map_error(
         Db.map_table_error
       )
-      Ok((t4, (def, host_page, default_view)))
+      t5 = try Db.tx_refresh_db_summary(t4, def, now)
+      Ok((t5, (def, host_page, default_view)))
     end
   )
 
@@ -604,7 +605,8 @@ fn update_database_schema(
         None: Unit
       end
       t2 = try Db.tx_clean_removed_db_properties(t1, old_def, next_def)
-      Ok((t2, next_def))
+      t3 = try Db.tx_refresh_db_summary(t2, next_def, now)
+      Ok((t3, next_def))
     end
   )
   schema_ev = Json.Object({

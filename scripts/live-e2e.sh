@@ -140,8 +140,27 @@ const server = http.createServer((req, res) => {
         return;
       }
       if (lastBody.stream !== true) {
-        res.writeHead(400);
-        res.end("expected stream:true");
+        const isBrief = (lastBody.messages || []).some((m) =>
+          String(m.content || "").includes("Living Brief")
+        );
+        const replyText = isBrief
+          ? "- Live incident brief synthesized from permitted workspace summaries."
+          : "Concise workspace semantic summary generated for progressive disclosure.";
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            id: "chatcmpl-mock",
+            object: "chat.completion",
+            model: lastBody.model || "gpt-4o-mini",
+            choices: [
+              {
+                index: 0,
+                message: { role: "assistant", content: replyText },
+                finish_reason: "stop",
+              },
+            ],
+          })
+        );
         return;
       }
       res.writeHead(200, {
@@ -681,6 +700,66 @@ assert.equal(blkCtxRes.json.block.id, firstBlkId);
 assert.equal(blkCtxRes.json.page.id, pageId);
 console.log("✓ Blueprints + Metadata + Embedded DB Markdown Sync + Live Metric Pill + Block Context verified");
 
+// 6d. Phase 2.1: Living Summaries + Grant-Filtered /llms.txt + Context Pack CRUD & Compilation
+const sumsRes = await apiJson("/api/summaries");
+assert.equal(sumsRes.res.status, 200, sumsRes.text);
+assert.ok(
+  sumsRes.json.summaries.some((s) => s.entity_id === pageId && s.entity_kind === "page"),
+  "Page LivingSummary present"
+);
+assert.ok(
+  sumsRes.json.summaries.some((s) => s.entity_id === dbId && s.entity_kind === "database"),
+  "Database LivingSummary present"
+);
+
+const cookieHdr6d = jar.headerFor(BASE);
+const llmsRes = await fetch(`${BASE}/llms.txt`, {
+  headers: cookieHdr6d ? { Cookie: cookieHdr6d } : {},
+});
+assert.equal(llmsRes.status, 200);
+assert.ok((llmsRes.headers.get("content-type") || "").startsWith("text/markdown"));
+const llmsText = await llmsRes.text();
+assert.ok(llmsText.includes("# Vellum Workspace Index (/llms.txt)"));
+assert.ok(llmsText.includes(dbId));
+
+const createPackRes = await apiJson("/api/packs", {
+  method: "POST",
+  body: JSON.stringify({
+    slug: "ops-brief",
+    name: "Ops Brief",
+    description: "Live E2E runbook and incident cost bundle",
+    collection_ids: [colId],
+    pinned_page_ids: [pageId],
+    database_ids: [dbId],
+    query_hint: null,
+    fresh_only: false,
+    include_full_blocks: true,
+    token_budget: 2400,
+  }),
+});
+assert.equal(createPackRes.res.status, 201, createPackRes.text);
+assert.equal(createPackRes.json.slug, "ops-brief");
+
+const compileJsonRes = await apiJson("/api/packs/ops-brief");
+assert.equal(compileJsonRes.res.status, 200, compileJsonRes.text);
+assert.ok(compileJsonRes.json.tokens_used <= 2400, "Respects token_budget <= 2400");
+assert.ok(compileJsonRes.json.included_items.length >= 1, "Has included items");
+
+const compileMdRes = await fetch(`${BASE}/api/packs/ops-brief/markdown`, {
+  headers: cookieHdr6d ? { Cookie: cookieHdr6d } : {},
+});
+assert.equal(compileMdRes.status, 200);
+assert.ok((compileMdRes.headers.get("content-type") || "").startsWith("text/markdown"));
+const tokensHdr = Number(compileMdRes.headers.get("x-vellum-tokens-used") || "99999");
+assert.ok(Number.isFinite(tokensHdr) && tokensHdr <= 2400, "X-Vellum-Tokens-Used <= 2400");
+const compileMdText = await compileMdRes.text();
+assert.ok(compileMdText.includes("# Context Pack:"));
+
+const packsInertiaRes = await apiJson("/packs");
+assert.equal(packsInertiaRes.res.status, 200, packsInertiaRes.text);
+assert.ok(packsInertiaRes.json.packs.some((p) => p.slug === "ops-brief"));
+console.log("✓ Context Studio + Living Summaries + /llms.txt + Context Pack compiler verified");
+
 // 7. Mint Agent Token + live /mcp tool workflow + Modb.World Proposal Accept
 const mintRes = await apiJson("/api/admin/agents", {
   method: "POST",
@@ -716,6 +795,37 @@ assert.ok(initR.result?.serverInfo?.name === "vellum-mcp");
 
 const onboardR = await mcpCall(2, "tools/call", { name: "vellum.onboard", arguments: {} });
 assert.equal(onboardR.result?.isError, false);
+
+// MCP Progressive Disclosure resources & pack tools
+const mcpResListR = await mcpCall(201, "resources/list", {});
+const mcpResUris = (mcpResListR.result?.resources || []).map((r) => r.uri);
+assert.ok(mcpResUris.includes("vellum://index"), "MCP advertises vellum://index");
+assert.ok(mcpResUris.includes("vellum://packs/ops-brief"), "MCP advertises vellum://packs/ops-brief");
+
+const mcpIdxReadR = await mcpCall(202, "resources/read", { uri: "vellum://index" });
+assert.ok(
+  (mcpIdxReadR.result?.contents?.[0]?.text || "").includes("vellum://packs/ops-brief"),
+  "vellum://index includes ops-brief"
+);
+
+const mcpPackReadR = await mcpCall(203, "resources/read", { uri: "vellum://packs/ops-brief" });
+assert.ok(
+  (mcpPackReadR.result?.contents?.[0]?.text || "").includes("# Context Pack:"),
+  "vellum://packs/ops-brief compiles to Markdown"
+);
+
+const mcpListSumsR = await mcpCall(204, "tools/call", {
+  name: "vellum.list_summaries",
+  arguments: {},
+});
+assert.equal(mcpListSumsR.result?.isError, false);
+
+const mcpReadPackToolR = await mcpCall(205, "tools/call", {
+  name: "vellum.read_pack",
+  arguments: { slug: "ops-brief" },
+});
+assert.equal(mcpReadPackToolR.result?.isError, false);
+assert.ok(mcpReadPackToolR.result?.structuredContent?.tokens_used <= 2400);
 
 const openPropR = await mcpCall(3, "tools/call", {
   name: "vellum.proposal_open",
@@ -763,6 +873,69 @@ const finalPage = await apiJson(`/api/pages/${pageId}`);
 assert.equal(finalPage.res.status, 200);
 assert.ok(finalPage.json.anchored_markdown.includes("quorum status"));
 console.log("✓ Live /mcp agent proposal -> Modb.World diff -> human accept verified");
+
+// Phase 2.1 Living AI Brief block + proposals-only refresh + human accept
+const briefInsertRes = await apiJson(`/api/pages/${pageId}/blocks`, {
+  method: "PATCH",
+  body: JSON.stringify({
+    ops: [
+      {
+        insert_block_after: {
+          after_block_id: firstBlkId,
+          parent_block_id: null,
+          kind: {
+            ai_brief: {
+              prompt: "Live incident brief",
+              source_scope: colId,
+              refreshed_at: null,
+            },
+          },
+          markdown: "Initial E2E brief placeholder",
+        },
+      },
+    ],
+    expected_versions: {},
+    reason: "insert live e2e ai_brief card",
+  }),
+});
+assert.equal(briefInsertRes.res.status, 200, briefInsertRes.text);
+const briefBlk = briefInsertRes.json.blocks.find(
+  (b) => typeof b.kind === "object" && b.kind && "ai_brief" in b.kind
+);
+assert.ok(briefBlk?.id, "Created ai_brief block");
+
+const briefRefreshRes = await apiJson("/api/ai/brief/refresh", {
+  method: "POST",
+  body: JSON.stringify({
+    page_id: pageId,
+    block_id: briefBlk.id,
+    deterministic_fallback: true,
+  }),
+});
+assert.equal(briefRefreshRes.res.status, 201, briefRefreshRes.text);
+const briefPropId = briefRefreshRes.json.proposal?.id;
+assert.ok(briefPropId && briefPropId.startsWith("prop_"), "Brief refresh opened proposal");
+
+// Proposals-only invariant: live page must still have placeholder until accepted
+const beforeBriefAccept = await apiJson(`/api/pages/${pageId}`);
+assert.ok(beforeBriefAccept.json.anchored_markdown.includes("Initial E2E brief placeholder"));
+
+const acceptBriefRes = await apiJson(`/api/proposals/${briefPropId}/accept`, {
+  method: "POST",
+  body: JSON.stringify({ reason: "Human approved AI brief refresh" }),
+});
+assert.equal(acceptBriefRes.res.status, 200, acceptBriefRes.text);
+
+const afterBriefAccept = await apiJson(`/api/pages/${pageId}`);
+assert.ok(afterBriefAccept.json.anchored_markdown.includes(":::ai-brief"));
+assert.ok(afterBriefAccept.json.anchored_markdown.includes("Live incident brief"));
+assert.ok(
+  afterBriefAccept.json.anchored_markdown.includes(
+    "synthesized from permitted workspace summaries"
+  )
+);
+assert.ok(!afterBriefAccept.json.anchored_markdown.includes("Initial E2E brief placeholder"));
+console.log("✓ MCP vellum://index + vellum://packs + Living AI Brief refresh-into-proposal verified");
 
 // 8. True Streaming SSE multi-client fanout + MCP live event + Last-Event-ID replay
 async function openLiveSse(path, lastEventId = null) {

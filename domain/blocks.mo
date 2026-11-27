@@ -198,6 +198,27 @@ fn render_block_body(blk: Block) : Text
         Some(v) if not v.trim.empty?: "<!-- db_embed:#{did}|#{v.trim} -->"
         Some(_) | None: "<!-- db_embed:#{did} -->"
       end
+    AiBrief(prompt: p, source_scope: scope_opt, refreshed_at: ref_opt):
+      clean_p = p.replace("\n", " ").trim
+      var tags = []
+      case scope_opt
+        Some(sc) if not sc.trim.empty?: tags = tags.append("scope=#{sc.trim}")
+        Some(_) | None: Unit
+      end
+      case ref_opt
+        Some(rf) if not rf.trim.empty?: tags = tags.append("refreshed=#{rf.trim}")
+        Some(_) | None: Unit
+      end
+      head = if tags.empty?
+        ":::ai-brief #{clean_p}"
+      else
+        ":::ai-brief [#{tags.join(" ")}] #{clean_p}"
+      end
+      if blk.markdown.empty?
+        "#{head}\n:::"
+      else
+        "#{head}\n#{blk.markdown}\n:::"
+      end
   end
 end
 
@@ -406,6 +427,38 @@ fn strip_quote_prefix(line: Text) : Text
   end
 end
 
+fn parse_ai_brief_header(line: Text) : Option((Text, Option(Text), Option(Text)))
+  rest_opt = line.drop_prefix(":::ai-brief")
+  rest = (try rest_opt).trim
+  return None if rest.empty?
+  if rest.starts_with?("[")
+    close_parts = (rest.drop_prefix("[") or "").split("]")
+    if close_parts.size >= 2
+      tag_str = close_parts.first or ""
+      prompt = close_parts.drop(1).join("]").trim
+      return None if prompt.empty?
+      var scope_opt = None
+      var refreshed_opt = None
+      for tok in tag_str.split(" ")
+        t = tok.trim
+        if t.starts_with?("scope=")
+          sv = (t.drop_prefix("scope=") or "").trim
+          if not sv.empty?
+            scope_opt = Some(sv)
+          end
+        else if t.starts_with?("refreshed=")
+          rv = (t.drop_prefix("refreshed=") or "").trim
+          if not rv.empty?
+            refreshed_opt = Some(rv)
+          end
+        end
+      end
+      return Some((prompt, scope_opt, refreshed_opt))
+    end
+  end
+  Some((rest, None, None))
+end
+
 ## Parses Markdown (with optional `<!-- blk:<id> -->` anchors) into ordered canonical `Block`s.
 fn parse_markdown_blocks(page_id: Text, markdown: Text, prov: Provenance, id_prefix: Text) : List(
   Block
@@ -439,6 +492,37 @@ fn parse_markdown_blocks(page_id: Text, markdown: Text, prov: Provenance, id_pre
     blk_id = pending_id or "#{id_prefix}_#{zero_pad4(synth_idx)}"
     pending_id = None
     rank = "i#{zero_pad4(synth_idx)}"
+
+    if trimmed.starts_with?(":::ai-brief")
+      case parse_ai_brief_header(trimmed)
+        Some((prompt, scope_opt, ref_opt)):
+          var brief_lines = []
+          i += 1
+          while i < n
+            bl = lines.get(i) or ""
+            if bl.trim == ":::"
+              i += 1
+              break
+            end
+            brief_lines = brief_lines.append(bl)
+            i += 1
+          end
+          blocks = blocks.append(
+            Block(
+              id: blk_id,
+              page_id: page_id,
+              parent_block_id: None,
+              rank: rank,
+              kind: AiBrief(prompt: prompt, source_scope: scope_opt, refreshed_at: ref_opt),
+              markdown: brief_lines.join("\n"),
+              provenance: prov,
+              version: 1
+            )
+          )
+          continue
+        None: Unit
+      end
+    end
 
     if line.starts_with?("```")
       lang = (line.drop_prefix("```") or "").trim
@@ -577,7 +661,7 @@ fn blocks_plain_text(blocks: List(Block)) : Text
       ) | Quote | Callout(tone: _, icon: _) | CodeBlock(language: _) | PageLink(target_page_id: _) | DatabaseViewEmbed(
         database_id: _,
         view_id: _
-      ): b.markdown
+      ) | AiBrief(prompt: _, source_scope: _, refreshed_at: _): b.markdown
       Divider: ""
       Image(attachment_id: _, caption: cap): cap
       FileEmbed(attachment_id: _, filename: fname): fname
@@ -896,4 +980,44 @@ test "database view embed round-trip and metric ref extraction"
   m1 = refs.get(1) or m0
   assert m0.raw_token == "{{metric:db_01.p_cost:sum}}"
   assert m1.agg == "count"
+end
+
+test "ai-brief living card markdown round-trip"
+  now = Time.parse("2026-11-27T10:00:00Z") or stop "now"
+  prov = Provenance(
+    author_id: "usr_ada",
+    author_kind: HumanAuthor,
+    grant_id: None,
+    proposal_id: None,
+    reason: None,
+    citations: [],
+    updated_at: now
+  )
+  md = "<!-- blk:blk_brief1 -->\n:::ai-brief Summarize open security risks\nCurrent critical items are mitigation-ready.\n:::\n\n<!-- blk:blk_brief2 -->\n:::ai-brief [scope=col_eng refreshed=2026-11-27T09:00:00Z] Weekly SLA pulse\n- P99 latency: 14ms\n:::"
+  blks = parse_markdown_blocks("pg_b", md, prov, "blk")
+  assert blks.size == 2
+  b0 = blks.get(0) or Block(
+    id: "",
+    page_id: "",
+    parent_block_id: None,
+    rank: "",
+    kind: Paragraph,
+    markdown: "",
+    provenance: prov,
+    version: 0
+  )
+  b1 = blks.get(1) or b0
+  assert b0.kind == AiBrief(
+    prompt: "Summarize open security risks",
+    source_scope: None,
+    refreshed_at: None
+  )
+  assert b0.markdown == "Current critical items are mitigation-ready."
+  assert b1.kind == AiBrief(
+    prompt: "Weekly SLA pulse",
+    source_scope: Some("col_eng"),
+    refreshed_at: Some("2026-11-27T09:00:00Z")
+  )
+  assert b1.markdown == "- P99 latency: 14ms"
+  assert to_anchored_markdown(blks) == md
 end

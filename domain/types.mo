@@ -177,6 +177,7 @@ enum BlockKind
   FileEmbed(attachment_id: Text, filename: Text)
   PageLink(target_page_id: Text)
   DatabaseViewEmbed(database_id: Text, view_id: Option(Text))
+  AiBrief(prompt: Text, source_scope: Option(Text), refreshed_at: Option(Text))
 end
 
 ## Ordered, stable-ID content unit belonging to a `Page`.

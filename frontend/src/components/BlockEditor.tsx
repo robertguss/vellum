@@ -20,6 +20,7 @@ import {
   Lightbulb,
   Lock,
   Plus,
+  RefreshCw,
   Save,
   ShieldAlert,
   Sparkles,
@@ -78,6 +79,7 @@ function blockKindOptionValue(kind: BlockKind): string {
   if (typeof kind === "object" && "code_block" in kind) return "code_block";
   if (typeof kind === "object" && "task_item" in kind) return "task_item";
   if (typeof kind === "object" && "database_view_embed" in kind) return "database_view_embed";
+  if (typeof kind === "object" && "ai_brief" in kind) return "ai_brief";
   return "paragraph";
 }
 
@@ -376,6 +378,35 @@ function RenderedBlockBody({
     );
   }
 
+  if (typeof kind === "object" && "ai_brief" in kind) {
+    const brief = kind.ai_brief;
+    return (
+      <div className="rounded-xl border border-violet-200 bg-violet-50/60 p-4 space-y-2.5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2 text-xs font-semibold text-violet-950">
+            <Sparkles className="h-3.5 w-3.5 text-violet-700" />
+            <span>{brief.prompt}</span>
+          </div>
+          <div className="flex items-center gap-2 text-[11px]">
+            {brief.source_scope && (
+              <span className="rounded-md bg-white border border-violet-200 px-2 py-0.5 font-mono text-violet-700">
+                scope: {brief.source_scope}
+              </span>
+            )}
+            <span className="font-mono text-violet-700/80">
+              {brief.refreshed_at ? `Refreshed ${brief.refreshed_at}` : "Never refreshed"}
+            </span>
+          </div>
+        </div>
+        <div className="text-sm leading-relaxed text-stone-800 whitespace-pre-wrap">
+          {markdown.trim()
+            ? renderInlineMarkdown(markdown, resolvedMetrics, onInspectBlock)
+            : "No synthesized brief content yet."}
+        </div>
+      </div>
+    );
+  }
+
   if (typeof kind === "object" && "heading" in kind) {
     const lvl = Math.min(3, Math.max(1, kind.heading.level));
     const cls =
@@ -643,7 +674,9 @@ export default function BlockEditor({
 
   // Sets (Slash) Command Palette
   const [showSetsMenu, setShowSetsMenu] = useState(false);
-  const [setsMode, setSetsMode] = useState<"main" | "db_embed" | "metric_pill">("main");
+  const [setsMode, setSetsMode] = useState<"main" | "db_embed" | "metric_pill" | "ai_brief">(
+    "main"
+  );
   const [insertAfterId, setInsertAfterId] = useState<string | null>(null);
 
   const [embedDbId, setEmbedDbId] = useState<string>(databases[0]?.id ?? "");
@@ -653,6 +686,10 @@ export default function BlockEditor({
   const [metricDbId, setMetricDbId] = useState<string>(databases[0]?.id ?? "");
   const [metricPropId, setMetricPropId] = useState<string>("");
   const [metricAgg, setMetricAgg] = useState<string>("sum");
+
+  const [briefPrompt, setBriefPrompt] = useState("");
+  const [briefScope, setBriefScope] = useState("");
+  const [refreshingBlockId, setRefreshingBlockId] = useState<string | null>(null);
 
   // Quick Add new block bar
   const [newMarkdown, setNewMarkdown] = useState("");
@@ -895,6 +932,36 @@ export default function BlockEditor({
     }
   }
 
+  async function handleRefreshAiBrief(b: Block) {
+    setRefreshingBlockId(b.id);
+    setError(null);
+    setStatusMsg(null);
+    try {
+      const res = await apiFetch<{
+        proposal: ProposalMeta;
+        draft_markdown: string;
+        block_id: string;
+        model: string;
+      }>("/api/ai/brief/refresh", {
+        method: "POST",
+        body: JSON.stringify({
+          page_id: page.id,
+          block_id: b.id,
+          deterministic_fallback: true,
+        }),
+      });
+      setCreatedProposal(res.proposal);
+      setStatusMsg(
+        `Staged Living Brief refresh in Proposal ${res.proposal.id} (${res.model})`
+      );
+      onProposalCreated?.(res.proposal);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to refresh AI Brief");
+    } finally {
+      setRefreshingBlockId(null);
+    }
+  }
+
   const selectedMetricDb = databases.find((d) => d.id === metricDbId);
 
   return (
@@ -943,7 +1010,9 @@ export default function BlockEditor({
                 ? "Insert Content Set"
                 : setsMode === "db_embed"
                   ? "Embed Live Database View"
-                  : "Insert Live Metric Pill"}
+                  : setsMode === "ai_brief"
+                    ? "Insert Living AI Brief Card"
+                    : "Insert Live Metric Pill"}
             </div>
             <button
               type="button"
@@ -1030,6 +1099,17 @@ export default function BlockEditor({
                   Live Metric Pill
                 </div>
                 <div className="text-[11px] text-emerald-700">Decimal DB aggregation</div>
+              </button>
+              <button
+                type="button"
+                onClick={() => setSetsMode("ai_brief")}
+                className="rounded-lg border border-violet-200 bg-violet-50/70 px-3 py-2 text-left hover:bg-violet-100/70"
+              >
+                <div className="flex items-center gap-1 font-semibold text-violet-900">
+                  <Sparkles className="h-3.5 w-3.5" />
+                  Living AI Brief
+                </div>
+                <div className="text-[11px] text-violet-700">Auto summary brief card</div>
               </button>
             </div>
           )}
@@ -1143,6 +1223,52 @@ export default function BlockEditor({
               )}
             </div>
           )}
+
+          {setsMode === "ai_brief" && (
+            <div className="space-y-3 text-xs">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                <input
+                  type="text"
+                  value={briefPrompt}
+                  onChange={(e) => setBriefPrompt(e.target.value)}
+                  placeholder="Brief goal (e.g. Summarize Q4 operational status)"
+                  className="sm:col-span-2 rounded-lg border border-stone-200 bg-white px-3 py-1.5 outline-none focus:border-violet-500"
+                />
+                <input
+                  type="text"
+                  value={briefScope}
+                  onChange={(e) => setBriefScope(e.target.value)}
+                  placeholder="Scope collection ID (blank = current)"
+                  className="rounded-lg border border-stone-200 bg-white px-3 py-1.5 font-mono outline-none focus:border-violet-500"
+                />
+              </div>
+              <div className="flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  disabled={!briefPrompt.trim()}
+                  onClick={() => {
+                    const p = briefPrompt.trim();
+                    const s = briefScope.trim() || null;
+                    setBriefPrompt("");
+                    setBriefScope("");
+                    void handleInsertSetKind(
+                      {
+                        ai_brief: {
+                          prompt: p,
+                          source_scope: s,
+                          refreshed_at: null,
+                        },
+                      },
+                      "_Click Refresh into Proposal to synthesize from permitted workspace summaries._"
+                    );
+                  }}
+                  className="rounded-lg bg-violet-700 px-3.5 py-1.5 font-medium text-white hover:bg-violet-800 disabled:opacity-50"
+                >
+                  Insert Living Brief Card
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -1165,6 +1291,7 @@ export default function BlockEditor({
           const isActive = activeBlockId === b.id;
           const isHighlighted = highlightedId === b.id;
           const isEmbed = typeof b.kind === "object" && "database_view_embed" in b.kind;
+          const isAiBrief = typeof b.kind === "object" && "ai_brief" in b.kind;
 
           return (
             <div
@@ -1254,6 +1381,27 @@ export default function BlockEditor({
                         <DbIcon className="h-3 w-3" />
                         Embedded Database View
                       </span>
+                    ) : isAiBrief ? (
+                      <div className="flex items-center gap-2">
+                        <span className="inline-flex items-center gap-1 rounded-md bg-violet-50 border border-violet-200 px-2 py-0.5 text-[11px] font-medium text-violet-800">
+                          <Sparkles className="h-3 w-3" />
+                          Living AI Brief
+                        </span>
+                        <button
+                          type="button"
+                          disabled={refreshingBlockId === b.id}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void handleRefreshAiBrief(b);
+                          }}
+                          className="inline-flex items-center gap-1 rounded-md border border-violet-200 bg-white px-2.5 py-0.5 text-[11px] font-medium text-violet-800 hover:bg-violet-50 disabled:opacity-50"
+                        >
+                          <RefreshCw
+                            className={`h-3 w-3 ${refreshingBlockId === b.id ? "animate-spin" : ""}`}
+                          />
+                          {refreshingBlockId === b.id ? "Refreshing..." : "Refresh into Proposal"}
+                        </button>
+                      </div>
                     ) : (
                       <select
                         value={blockKindOptionValue(draft.kind)}
@@ -1338,7 +1486,7 @@ export default function BlockEditor({
                     </div>
                   </div>
 
-                  {isEmbed ? (
+                  {(isEmbed || (isAiBrief && !rawMode)) ? (
                     <RenderedBlockBody
                       block={b}
                       saving={saving}
