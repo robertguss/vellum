@@ -185,7 +185,7 @@ fn build_page_summary(
   page: Page,
   blocks: List(Block),
   bp_opt: Option(BlueprintDef),
-  meta_opt: Option(PageBlueprintMeta),
+  _meta_opt: Option(PageBlueprintMeta),
   prev_opt: Option(LivingSummary),
   now: Time
 ) : LivingSummary
@@ -223,7 +223,7 @@ fn build_page_summary(
   end
 
   plain = Blocks.blocks_plain_text(sorted)
-  wc = count_words(plain)
+  wc = if plain.byte_count <= 16384: count_words(plain) else: (plain.byte_count + 5) / 6
   bp_slug = bp_opt.map(fn(b) b.slug end)
 
   var summary_parts = ["#{page.title} (#{wc}w, #{sorted.size} blocks)"]
@@ -245,9 +245,7 @@ fn build_page_summary(
     "#{base_str} — #{sec_preview}"
   end
 
-  anchored = Blocks.to_anchored_markdown(sorted)
-  full_doc = to_yaml_frontmatter(page, bp_opt, meta_opt, anchored)
-  est = estimate_tokens(full_doc)
+  est = estimate_tokens(plain) + 32 + (sorted.size * 6)
 
   (sem_sum, sem_ver) = case prev_opt
     Some(prev): (prev.semantic_summary, prev.semantic_source_version)

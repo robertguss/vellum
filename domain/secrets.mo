@@ -114,10 +114,39 @@ fn find_pem_end(chars: List(Char), start: Int) : Option(Int)
   None
 end
 
+## Fast native substring pre-check avoiding per-character work when no secret prefix can match.
+fn maybe_has_secret?(text: Text) : Bool
+  for p in [
+    "-----BEGIN ",
+    "vlm_ag_",
+    "whsec_",
+    "github_pat_",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "sk-",
+    "sk_live_",
+    "sk_test_",
+    "rk_live_",
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "xoxr-",
+    "AKIA",
+    "ASIA",
+    "AIDA"
+  ]
+    return true if text.contains?(p)
+  end
+  false
+end
+
 ## Scans `text` for exposed credentials (API keys, cloud/VCS tokens, Vellum agent/webhook secrets,
 ## and PEM private keys), deduplicated in deterministic appearance order.
 fn scan_text(text: Text) : List(SecretFinding)
-  if text.empty?
+  if text.empty? or not maybe_has_secret?(text)
     return []
   end
   chars = text.chars

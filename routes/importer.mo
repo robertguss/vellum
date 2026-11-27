@@ -70,47 +70,12 @@ fn import_notion(
 
   now = clock.now
   prov = make_provenance(auth, now)
-
-  var title_to_id = {}
-  var pre_pages = []
-  for imp in input.pages
-    title = NotionImport.notion_page_title(imp)
-    pid = "pg_#{Id.ulid(rng, clock)}"
-    bpref = "blk_#{Id.ulid(rng, clock)}"
-    title_to_id = title_to_id.set(title, pid)
-    title_to_id = title_to_id.set(NotionImport.strip_notion_id_suffix(imp.path), pid)
-    pre_pages = pre_pages.append((pid, bpref, title, imp.markdown))
-  end
-
-  var prepared_pages = []
-  for (pid, bpref, title, raw_md) in pre_pages
-    rewritten = NotionImport.rewrite_notion_links(raw_md, title_to_id)
-    blks = Blocks.parse_markdown_blocks(pid, rewritten, prov, bpref)
-    pg = Page(
-      id: pid,
-      collection_id: input.collection_id,
-      parent_page_id: None,
-      title: title,
-      icon: None,
-      cover_attachment_id: None,
-      kind: Document,
-      sort_order: pid,
-      database_id: None,
-      freshness_ttl_days: None,
-      verified_at: Some(now),
-      verified_by: Some(auth.principal.id),
-      created_by: auth.principal.id,
-      created_at: now,
-      updated_at: now,
-      archived_at: None,
-      version: 1
-    )
-    prepared_pages = prepared_pages.append((pg, blks))
-  end
+  (canonical_dbs, skipped_dup_dbs) = NotionImport.select_canonical_csvs(input.databases)
 
   var prepared_dbs = []
+  var db_title_to_id = {}
   var total_rows = 0
-  for db_imp in input.databases
+  for db_imp in canonical_dbs
     db_title = NotionImport.strip_notion_id_suffix(db_imp.title)
     if db_title.empty?
       return Error(BadInput(reason: "imported CSV database title must not be empty"))
@@ -123,6 +88,12 @@ fn import_notion(
     db_id = "db_#{Id.ulid(rng, clock)}"
     host_page_id = "pg_#{Id.ulid(rng, clock)}"
     view_id = "vw_#{Id.ulid(rng, clock)}"
+    db_title_to_id = db_title_to_id.set(db_title, db_id)
+    db_title_to_id = db_title_to_id.set(db_imp.title, db_id)
+    case NotionImport.extract_notion_id(db_imp.title)
+      Some(nid): db_title_to_id = db_title_to_id.set(nid, db_id)
+      None: Unit
+    end
     def = DatabaseDef(
       id: db_id,
       collection_id: input.collection_id,
@@ -204,6 +175,58 @@ fn import_notion(
       total_rows += 1
     end
     prepared_dbs = prepared_dbs.append((def, host_page, default_view, rows_and_pages))
+  end
+
+  parent_idx_map = NotionImport.infer_page_parent_indices(input.pages)
+  var id_by_idx = {}
+  var title_to_id = {}
+  var pre_pages = []
+  for (idx, imp) in input.pages.enumerate
+    title = NotionImport.notion_page_title(imp)
+    pid = "pg_#{Id.ulid(rng, clock)}"
+    bpref = "blk_#{Id.ulid(rng, clock)}"
+    id_by_idx = id_by_idx.set(idx, pid)
+    title_to_id = title_to_id.set(title, pid)
+    title_to_id = title_to_id.set(NotionImport.strip_notion_id_suffix(imp.path), pid)
+    case NotionImport.extract_notion_id(imp.path)
+      Some(nid): title_to_id = title_to_id.set(nid, pid)
+      None: Unit
+    end
+    pre_pages = pre_pages.append((idx, pid, bpref, title, imp.markdown))
+  end
+
+  var prepared_pages = []
+  var nested_page_count = 0
+  for (idx, pid, bpref, title, raw_md) in pre_pages
+    parent_pid = case parent_idx_map.get(idx)
+      Some(pidx): id_by_idx.get(pidx)
+      None: None
+    end
+    if parent_pid != None
+      nested_page_count += 1
+    end
+    rewritten = NotionImport.rewrite_notion_links_and_embeds(raw_md, title_to_id, db_title_to_id)
+    blks = Blocks.parse_markdown_blocks(pid, rewritten, prov, bpref)
+    pg = Page(
+      id: pid,
+      collection_id: input.collection_id,
+      parent_page_id: parent_pid,
+      title: title,
+      icon: None,
+      cover_attachment_id: None,
+      kind: Document,
+      sort_order: pid,
+      database_id: None,
+      freshness_ttl_days: None,
+      verified_at: Some(now),
+      verified_by: Some(auth.principal.id),
+      created_by: auth.principal.id,
+      created_at: now,
+      updated_at: now,
+      archived_at: None,
+      version: 1
+    )
+    prepared_pages = prepared_pages.append((pg, blks))
   end
 
   meta = Ledger.WriteMeta(
@@ -353,7 +376,9 @@ fn import_notion(
         "imported_pages": Json.Array(prepared_pages.map(fn(x) x.0.to_json end)),
         "imported_databases": Json.Array(prepared_dbs.map(fn(x) x.0.to_json end)),
         "page_count": Json.int(prepared_pages.size),
+        "nested_page_count": Json.int(nested_page_count),
         "database_count": Json.int(prepared_dbs.size),
+        "skipped_duplicate_databases": Json.int(skipped_dup_dbs),
         "row_count": Json.int(total_rows),
         "trust_tier": Json.String("untrusted")
       })

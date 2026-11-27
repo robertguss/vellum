@@ -5,9 +5,13 @@ expose NotionPageImport(..),
 NotionCsvImport(..),
 ParsedCsvTable(..),
 InferredDbImport(..),
+extract_notion_id,
 strip_notion_id_suffix,
 notion_page_title,
+infer_page_parent_indices,
+select_canonical_csvs,
 rewrite_notion_links,
+rewrite_notion_links_and_embeds,
 parse_csv,
 infer_database_from_csv
 use Date
@@ -42,18 +46,16 @@ fn hex_char?(ch: Char) : Bool
   ch.ascii_digit? or (ch.code >= 97 and ch.code <= 102) or (ch.code >= 65 and ch.code <= 70)
 end
 
-## Strips folder paths, `.md`/`.csv` extensions, `%20` escapes, and Notion's trailing 32-hex UUID suffix.
-fn strip_notion_id_suffix(raw: Text) : Text
-  examples
-    strip_notion_id_suffix("Engineering Runbook 9a1b2c3d4e5f67890123456789abcdef.md") ==
-      "Engineering Runbook"
-    strip_notion_id_suffix("docs/Team%20Handbook%200123456789abcdef0123456789abcdef.md") ==
-      "Team Handbook"
-    strip_notion_id_suffix("Plain Title.md") == "Plain Title"
-  end
+fn strip_url_fragment(raw: Text) : Text
+  raw.split("#").first or raw
+end
 
-  base = (raw.trim.split("/").last or raw).replace("%20", " ")
-  no_ext = if base.ends_with?(".md")
+fn strip_notion_ext(base: Text) : Text
+  if base.ends_with?("_all.csv")
+    base.drop_suffix("_all.csv") or base
+  else if base.ends_with?("_all.CSV")
+    base.drop_suffix("_all.CSV") or base
+  else if base.ends_with?(".md")
     base.drop_suffix(".md") or base
   else if base.ends_with?(".MD")
     base.drop_suffix(".MD") or base
@@ -64,7 +66,42 @@ fn strip_notion_id_suffix(raw: Text) : Text
   else
     base
   end
-  trimmed = no_ext.trim
+end
+
+## Extracts a lowercase 32-hex trailing Notion ID from a filename, path, or link href.
+fn extract_notion_id(raw: Text) : Option(Text)
+  clean = strip_url_fragment(raw.trim).replace("\\", "/").replace("%20", " ")
+  base = clean.split("/").last or clean
+  trimmed = strip_notion_ext(base).trim
+  chars = trimmed.chars
+  if chars.size == 32 and chars.all?(hex_char?)
+    return Some(trimmed.ascii_lowercase)
+  end
+  if chars.size > 33
+    sep_idx = chars.size - 33
+    if chars.get(sep_idx) == Some(' ')
+      tail = chars.drop(sep_idx + 1)
+      if tail.size == 32 and tail.all?(hex_char?)
+        return Some(Text.from_chars(tail).ascii_lowercase)
+      end
+    end
+  end
+  None
+end
+
+## Strips folder paths, `.md`/`_all.csv`/`.csv` extensions, `%20` escapes, and Notion's trailing 32-hex UUID suffix.
+fn strip_notion_id_suffix(raw: Text) : Text
+  examples
+    strip_notion_id_suffix("Engineering Runbook 9a1b2c3d4e5f67890123456789abcdef.md") ==
+      "Engineering Runbook"
+    strip_notion_id_suffix("docs/Team%20Handbook%200123456789abcdef0123456789abcdef.md") ==
+      "Team Handbook"
+    strip_notion_id_suffix("Plain Title.md") == "Plain Title"
+  end
+
+  clean = strip_url_fragment(raw.trim).replace("\\", "/").replace("%20", " ")
+  base = clean.split("/").last or clean
+  trimmed = strip_notion_ext(base).trim
   chars = trimmed.chars
   if chars.size > 33
     sep_idx = chars.size - 33
@@ -88,6 +125,102 @@ fn notion_page_title(imp: NotionPageImport) : Text
   end
 end
 
+fn split_rel_segments(raw_path: Text) : List(Text)
+  var p = strip_url_fragment(raw_path.trim).replace("\\", "/").replace("%20", " ")
+  while p.starts_with?("./")
+    p = p.drop_prefix("./") or p
+  end
+  while p.starts_with?("/")
+    p = p.drop_prefix("/") or p
+  end
+  p.split("/").map(fn(s) s.trim end).filter(fn(s) not s.empty? end)
+end
+
+fn page_creates_cycle?(cand: Int, target: Int, raw_map: Map(Int, Int), limit: Int) : Bool
+  var cur = Some(cand)
+  var hops = 0
+  while hops < limit
+    x = case cur
+      Some(v): v
+      None: return false
+    end
+    return true if x == target
+    cur = raw_map.get(x)
+    hops += 1
+  end
+  true
+end
+
+## Infers child-to-parent index mappings across arbitrary Notion folder nesting depth (acyclic).
+fn infer_page_parent_indices(pages: List(NotionPageImport)) : Map(Int, Int)
+  var by_stem = {}
+  var by_id = {}
+  var by_base = {}
+  var segs_list = []
+
+  for (idx, imp) in pages.enumerate
+    segs = split_rel_segments(imp.path)
+    segs_list = segs_list.append(segs)
+    if not segs.empty?
+      last_seg = strip_notion_ext(segs.last or "").trim
+      stem = segs.take(segs.size - 1).append(last_seg).join("/").ascii_lowercase
+      if not stem.empty? and by_stem.get(stem) == None
+        by_stem = by_stem.set(stem, idx)
+      end
+      base_low = last_seg.ascii_lowercase
+      if not base_low.empty? and by_base.get(base_low) == None
+        by_base = by_base.set(base_low, idx)
+      end
+      case extract_notion_id(imp.path)
+        Some(nid):
+          if by_id.get(nid) == None
+            by_id = by_id.set(nid, idx)
+          end
+        None: Unit
+      end
+    end
+  end
+
+  var raw_parents = {}
+  for (idx, segs) in segs_list.enumerate
+    if segs.size > 1
+      var depth = segs.size - 1
+      while depth >= 1
+        ancestor_segs = segs.take(depth)
+        anc_stem = ancestor_segs.join("/").ascii_lowercase
+        anc_last = ancestor_segs.last or ""
+        cand_opt = case by_stem.get(anc_stem)
+          Some(c): Some(c)
+          None:
+            case extract_notion_id(anc_last)
+              Some(nid):
+                case by_id.get(nid)
+                  Some(c2): Some(c2)
+                  None: by_base.get(anc_last.ascii_lowercase)
+                end
+              None: by_base.get(anc_last.ascii_lowercase)
+            end
+        end
+        case cand_opt
+          Some(c) if c != idx:
+            raw_parents = raw_parents.set(idx, c)
+            break
+          Some(_) | None: depth -= 1
+        end
+      end
+    end
+  end
+
+  var out = {}
+  limit = pages.size + 4
+  for (child_idx, parent_idx) in raw_parents.entries
+    if not page_creates_cycle?(parent_idx, child_idx, raw_parents, limit)
+      out = out.set(child_idx, parent_idx)
+    end
+  end
+  out
+end
+
 fn split_md_link(trimmed: Text) : Option((Text, Text))
   return None if not trimmed.starts_with?("[") or not trimmed.ends_with?(")")
   pieces = trimmed.split("](")
@@ -100,14 +233,46 @@ fn split_md_link(trimmed: Text) : Option((Text, Text))
   Some((label, href))
 end
 
-## Rewrites `[[Title]]` and `[Label](Title%20<32hex>.md)` lines matching `title_to_page_id`
-## into Vellum's canonical `[[<page_id>|<label>]]` syntax (`BlockKind.PageLink`).
-fn rewrite_notion_links(markdown: Text, title_to_page_id: Map(Text, Text)) : Text
-  var norm_map = {}
-  for (k, pid) in title_to_page_id.entries
-    norm_map = norm_map.set(k.trim.ascii_lowercase, pid)
-    norm_map = norm_map.set(strip_notion_id_suffix(k).ascii_lowercase, pid)
+fn index_lookup_targets(targets: Map(Text, Text)) : Map(Text, Text)
+  var norm = {}
+  for (k, tid) in targets.entries
+    k_low = k.trim.ascii_lowercase
+    if not k_low.empty?
+      norm = norm.set(k_low, tid)
+    end
+    stripped_low = strip_notion_id_suffix(k).ascii_lowercase
+    if not stripped_low.empty?
+      norm = norm.set(stripped_low, tid)
+    end
+    case extract_notion_id(k)
+      Some(nid): norm = norm.set(nid, tid)
+      None: Unit
+    end
   end
+  norm
+end
+
+fn lookup_target_id(norm_map: Map(Text, Text), raw_target: Text) : Option(Text)
+  case extract_notion_id(raw_target)
+    Some(nid):
+      case norm_map.get(nid)
+        Some(tid): return Some(tid)
+        None: Unit
+      end
+    None: Unit
+  end
+  clean_low = strip_notion_id_suffix(raw_target).ascii_lowercase
+  norm_map.get(clean_low)
+end
+
+## Rewrites `[[Title]]`, `[Label](Target.md)`, and `[DB](DB.csv)` into Vellum `[[page_id|label]]` and `<!-- db_embed:db_id -->`.
+fn rewrite_notion_links_and_embeds(
+  markdown: Text,
+  title_to_page_id: Map(Text, Text),
+  title_to_db_id: Map(Text, Text)
+) : Text
+  page_map = index_lookup_targets(title_to_page_id)
+  db_map = index_lookup_targets(title_to_db_id)
 
   var out = []
   for raw_line in markdown.replace("\r\n", "\n").replace("\r", "\n").split("\n")
@@ -115,17 +280,32 @@ fn rewrite_notion_links(markdown: Text, title_to_page_id: Map(Text, Text)) : Tex
     replaced = if t.starts_with?("[[") and t.ends_with?("]]") and not t.contains?("|")
       inner = (t.drop_prefix("[[") or "").drop_suffix("]]") or ""
       clean_target = strip_notion_id_suffix(inner)
-      case norm_map.get(clean_target.ascii_lowercase)
+      case lookup_target_id(page_map, inner)
         Some(pid): "[[#{pid}|#{clean_target}]]"
         None: raw_line
       end
     else
       case split_md_link(t)
         Some((label, href)):
-          clean_target = strip_notion_id_suffix(href)
-          case norm_map.get(clean_target.ascii_lowercase)
-            Some(pid): "[[#{pid}|#{label}]]"
-            None: raw_line
+          href_clean = strip_url_fragment(href).trim.ascii_lowercase
+          if href_clean.ends_with?(".csv")
+            case lookup_target_id(db_map, href)
+              Some(did): "<!-- db_embed:#{did} -->"
+              None:
+                case lookup_target_id(page_map, href)
+                  Some(pid): "[[#{pid}|#{label}]]"
+                  None: raw_line
+                end
+            end
+          else
+            case lookup_target_id(page_map, href)
+              Some(pid): "[[#{pid}|#{label}]]"
+              None:
+                case lookup_target_id(db_map, href)
+                  Some(did): "<!-- db_embed:#{did} -->"
+                  None: raw_line
+                end
+            end
           end
         None: raw_line
       end
@@ -135,9 +315,16 @@ fn rewrite_notion_links(markdown: Text, title_to_page_id: Map(Text, Text)) : Tex
   out.join("\n")
 end
 
-## Parses RFC 4180 CSV supporting quoted cells, escaped `""` quotes, and newlines inside text.
+## Rewrites `[[Title]]` and `[Label](Title%20<32hex>.md)` lines matching `title_to_page_id`
+## into Vellum's canonical `[[<page_id>|<label>]]` syntax (`BlockKind.PageLink`).
+fn rewrite_notion_links(markdown: Text, title_to_page_id: Map(Text, Text)) : Text
+  rewrite_notion_links_and_embeds(markdown, title_to_page_id, {})
+end
+
+## Parses RFC 4180 CSV supporting optional UTF-8 BOM, quoted cells, escaped `""` quotes, and newlines inside text.
 fn parse_csv(csv_text: Text) : Result(ParsedCsvTable, Text)
-  clean = csv_text.replace("\r\n", "\n").replace("\r", "\n")
+  no_bom = csv_text.drop_prefix("\u{FEFF}") or csv_text
+  clean = no_bom.replace("\r\n", "\n").replace("\r", "\n")
   return Error("CSV input is empty") if clean.trim.empty?
 
   chars = clean.chars
@@ -263,6 +450,94 @@ fn color_at(idx: Int) : SelectOptionColor
   end
 end
 
+fn valid_email_str?(raw: Text) : Bool
+  t = raw.trim
+  return false if t.empty? or t.contains?(" ") or t.contains?("\t") or t.contains?("\n") or t.contains?(
+    "\r"
+  )
+  parts = t.split("@")
+  return false if parts.size != 2
+  local = parts.get(0) or ""
+  dom = parts.get(1) or ""
+  not local.empty? and dom.contains?(".") and not dom.starts_with?(".") and not dom.ends_with?(".")
+end
+
+fn is_done_status_label_csv?(label: Text) : Bool
+  low = label.trim.ascii_lowercase
+  low == "done" or low == "complete" or low == "completed" or low == "shipped" or low == "closed" or
+    low == "resolved" or low == "published" or low == "launched" or low == "approved" or
+    low == "archived"
+end
+
+fn is_all_csv?(title: Text) : Bool
+  low = strip_url_fragment(title.trim).replace("\\", "/").replace("%20", " ").ascii_lowercase
+  low.ends_with?("_all.csv") or low.ends_with?("_all")
+end
+
+fn canonical_csv_key(title: Text) : Text
+  case extract_notion_id(title)
+    Some(nid): "id:#{nid}"
+    None: "name:#{strip_notion_id_suffix(title).ascii_lowercase}"
+  end
+end
+
+fn csv_header_sig(csv_text: Text) : Option(Text)
+  case parse_csv(csv_text)
+    Error(_): None
+    Ok(tbl):
+      norm = tbl.headers.map(fn(h) h.trim.ascii_lowercase end).sort_by(fn(x) x end)
+      Some(norm.join("|"))
+  end
+end
+
+## Deduplicates `*_all.csv` over default `.csv` exports and filters duplicate `"Untitled"` linked-view CSVs.
+fn select_canonical_csvs(dbs: List(NotionCsvImport)) : (List(NotionCsvImport), Int)
+  var out1 = []
+  var slot_by_key = {}
+  for d in dbs
+    key = canonical_csv_key(d.title)
+    case slot_by_key.get(key)
+      None:
+        slot_by_key = slot_by_key.set(key, out1.size)
+        out1 = out1.append(d)
+      Some(slot):
+        prev = out1.get(slot) or d
+        if is_all_csv?(d.title) and not is_all_csv?(prev.title)
+          out1 = out1.take(slot).append(d).concat(out1.drop(slot + 1))
+        end
+    end
+  end
+
+  var seen_sigs = Set.empty
+  for d in out1
+    title_low = strip_notion_id_suffix(d.title).ascii_lowercase
+    if title_low != "untitled"
+      case csv_header_sig(d.csv_text)
+        Some(sig): seen_sigs = seen_sigs.add(sig)
+        None: Unit
+      end
+    end
+  end
+
+  var out2 = []
+  for d in out1
+    title_low = strip_notion_id_suffix(d.title).ascii_lowercase
+    if title_low != "untitled"
+      out2 = out2.append(d)
+    else
+      case csv_header_sig(d.csv_text)
+        Some(sig):
+          if not seen_sigs.has?(sig)
+            seen_sigs = seen_sigs.add(sig)
+            out2 = out2.append(d)
+          end
+        None: out2 = out2.append(d)
+      end
+    end
+  end
+  (out2, dbs.size - out2.size)
+end
+
 ## Infers typed Vellum `PropertyDef` columns and `CellValue` rows from a `ParsedCsvTable`.
 fn infer_database_from_csv(table: ParsedCsvTable) : Result(InferredDbImport, Text)
   if table.headers.empty?
@@ -295,6 +570,8 @@ fn infer_database_from_csv(table: ParsedCsvTable) : Result(InferredDbImport, Tex
       end
 
       var opt_map = {}
+      low_h = h.trim.ascii_lowercase
+      is_status_col? = low_h == "status" or low_h == "stage" or low_h == "state"
       kind = if vals.empty?
         RichText
       else if vals.all?(fn(v) parse_bool_str(v) != None end)
@@ -305,9 +582,12 @@ fn infer_database_from_csv(table: ParsedCsvTable) : Result(InferredDbImport, Tex
         Number(format: "plain")
       else if vals.all?(fn(v) v.starts_with?("https://") or v.starts_with?("http://") end)
         Url
+      else if vals.all?(valid_email_str?)
+        Email
       else
         distinct = vals.to_set.to_list
-        if distinct.size <= 12 and vals.size >= 2 and distinct.all?(fn(d) d.byte_count <= 40 end)
+        if distinct.size <= 12 and (vals.size >= 2 or is_status_col?) and
+          distinct.all?(fn(d) d.byte_count <= 40 end)
           var opts = []
           var used_oids = Set.empty
           for (o_idx, label) in distinct.enumerate
@@ -317,7 +597,12 @@ fn infer_database_from_csv(table: ParsedCsvTable) : Result(InferredDbImport, Tex
             opt_map = opt_map.set(label, oid)
             opts = opts.append(SelectOption(id: oid, label: label, color: color_at(o_idx)))
           end
-          Select(options: opts)
+          if is_status_col?
+            done_ids = opts.filter(fn(o) is_done_status_label_csv?(o.label) end).map(fn(o) o.id end)
+            Status(options: opts, done_option_ids: done_ids)
+          else
+            Select(options: opts)
+          end
         else
           RichText
         end

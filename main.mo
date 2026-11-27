@@ -43,6 +43,7 @@ api
     get "/pages/:id/history" Collab.page_replay_history
     get "/pages/:id/time-travel" Collab.page_time_travel
     post "/pages" Workspace.create_page
+    patch "/pages/:id" Workspace.update_page
     patch "/pages/:id/blocks" Workspace.patch_blocks
     post "/pages/:id/verify" Workspace.verify_page
     post "/pages/:id/comments" Workspace.create_comment
