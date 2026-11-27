@@ -101,11 +101,14 @@ proposal_comments_table,
 map_feeds_error,
 ai_col_feed_id,
 ensure_ai_col_feed_locked,
-sync_ai_col_feed_locked
+sync_ai_col_feed_locked,
+rlm_view_catalog
 use Domain.Blocks
 use Domain.Blueprints{BlueprintDef, PageBlueprintMeta}
 use Domain.FeedBridge
 use Domain.Packs{ContextPack, LivingSummary}
+use Domain.Rlm
+use Domain.TaintBridge
 use Domain.Collab{
   DecimalDelta,
   ProposalComment,
@@ -166,6 +169,7 @@ use Modb.Ledger
 use Modb.Replay
 use Modb.Table
 use Modb.Vec
+use Modb.Views
 use Modb.World
 
 sessions_db_path = "sessions.modb"
@@ -2550,6 +2554,254 @@ fn replay_catalog() : Replay.ReplayCatalog
   Replay.with_action(Replay.catalog(), "propose", tx_apply_world_patch)
 end
 
+fn format_cell_for_rlm(val: CellValue) : Text
+  case val
+    Empty: ""
+    TextVal(s) | UrlVal(s): s.trim
+    NumberVal(d): d.to_text
+    DateVal(start: st, end_date: ed_opt):
+      case ed_opt
+        Some(ed): "#{st.to_iso}..#{ed.to_iso}"
+        None: st.to_iso
+      end
+    SelectVal(option_id: oid): oid
+    MultiSelectVal(option_ids: oids): oids.join(",")
+    BoolVal(b): if b: "true" else: "false"
+    PrincipalVal(pids): pids.join(",")
+    RelationVal(row_ids: rids): rids.join(",")
+  end
+end
+
+fn format_db_row_cells_summary(def: DatabaseDef, row: DbRow) : Text
+  var parts = []
+  for p in def.properties
+    case row.cells.get(p.id)
+      Some(cval):
+        txt = format_cell_for_rlm(cval)
+        if not txt.trim.empty?
+          parts = parts.append("#{p.name}: #{txt}")
+        end
+      None: Unit
+    end
+  end
+  parts.join(" | ")
+end
+
+fn rlm_collection_views(cat: Views.ViewCatalog, cid: Text) : Views.ViewCatalog
+  target_cid = cid
+  col_v = Views.ViewDef(
+    name: "collection:#{target_cid}",
+    description: "Authorized collection metadata descriptor for #{target_cid}",
+    source_buckets: [collections_table().bucket],
+    fields: [
+      Views.ViewField(name: "id", field_type: "text", description: "Collection ID"),
+      Views.ViewField(name: "slug", field_type: "text", description: "Collection slug"),
+      Views.ViewField(name: "name", field_type: "text", description: "Collection name")
+    ],
+    narrows: Some("workspace:*"),
+    load: fn(store)
+      case try Table.get(store, collections_table(), target_cid).map_error(fn(e) e.to_text end)
+        Some(c) if c.archived_at == None: Ok([
+          {
+            "id": Json.String(c.id),
+            "slug": Json.String(c.slug),
+            "name": Json.String(c.name)
+          }
+        ])
+        Some(_) | None: Ok([])
+      end
+    end
+  )
+
+  sum_v = Views.ViewDef(
+    name: "rlm_summaries:#{target_cid}",
+    description: "Narrowed Living Summaries (pages + databases) inside collection #{target_cid}",
+    source_buckets: [summaries_table().bucket, pages_table().bucket],
+    fields: [
+      Views.ViewField(name: "id", field_type: "text", description: "Summary ID"),
+      Views.ViewField(name: "entity_kind", field_type: "text", description: "'page' or 'database'"),
+      Views.ViewField(name: "entity_id", field_type: "text", description: "Page or Database ID"),
+      Views.ViewField(name: "collection_id", field_type: "text", description: "Collection ID"),
+      Views.ViewField(name: "title", field_type: "text", description: "Title"),
+      Views.ViewField(name: "structural_summary", field_type: "text", description: "Structural summary"),
+      Views.ViewField(name: "semantic_summary", field_type: "text", description: "Optional semantic summary"),
+      Views.ViewField(name: "headings_text", field_type: "text", description: "Joined headings or property names"),
+      Views.ViewField(name: "word_count", field_type: "int", description: "Word count"),
+      Views.ViewField(name: "open_tasks", field_type: "int", description: "Open checklist count"),
+      Views.ViewField(name: "row_count", field_type: "int", description: "Row count for DBs"),
+      Views.ViewField(name: "estimated_tokens", field_type: "int", description: "Estimated full-read tokens")
+    ],
+    narrows: Some("collection:#{target_cid}"),
+    load: fn(store)
+      page_pairs = try Table.lookup(store, pages_table(), pages_by_collection(), target_cid)
+        .map_error(fn(e) e.to_text end)
+      var active_pids = Set.empty
+      for (_pid, pg) in page_pairs
+        if pg.archived_at == None
+          active_pids = active_pids.add(pg.id)
+        end
+      end
+      db_pairs = try Table.lookup(store, databases_table(), databases_by_collection(), target_cid)
+        .map_error(fn(e) e.to_text end)
+      var active_db_ids = Set.empty
+      for (_did, db_def) in db_pairs
+        active_db_ids = active_db_ids.add(db_def.id)
+      end
+      sum_pairs = try Table.lookup(store, summaries_table(), summaries_by_collection(), target_cid)
+        .map_error(fn(e) e.to_text end)
+      var out = []
+      for (_sid, s) in sum_pairs
+        keep? = if s.entity_kind == "page"
+          active_pids.has?(s.entity_id)
+        else if s.entity_kind == "database"
+          active_db_ids.has?(s.entity_id)
+        else
+          false
+        end
+        if keep?
+          out = out.append({
+            "id": Json.String(s.id),
+            "entity_kind": Json.String(s.entity_kind),
+            "entity_id": Json.String(s.entity_id),
+            "collection_id": Json.String(s.collection_id),
+            "title": Json.String(s.title),
+            "structural_summary": Json.String(s.structural_summary),
+            "semantic_summary": Json.String(s.semantic_summary or ""),
+            "headings_text": Json.String(s.headings.join(" | ")),
+            "word_count": Json.int(s.word_count),
+            "open_tasks": Json.int(s.open_tasks),
+            "row_count": Json.int(s.row_count),
+            "estimated_tokens": Json.int(s.estimated_tokens)
+          })
+        end
+      end
+      Ok(out)
+    end
+  )
+
+  blk_v = Views.ViewDef(
+    name: "rlm_blocks:#{target_cid}",
+    description: "Narrowed block-level slices inside collection #{target_cid}",
+    source_buckets: [pages_table().bucket, blocks_table().bucket],
+    fields: [
+      Views.ViewField(name: "block_id", field_type: "text", description: "Stable block ID"),
+      Views.ViewField(name: "page_id", field_type: "text", description: "Owning page ID"),
+      Views.ViewField(name: "page_title", field_type: "text", description: "Owning page title"),
+      Views.ViewField(name: "collection_id", field_type: "text", description: "Collection ID"),
+      Views.ViewField(name: "rank", field_type: "text", description: "Fractional block rank"),
+      Views.ViewField(name: "kind_tag", field_type: "text", description: "Normalized block kind tag"),
+      Views.ViewField(name: "heading_level", field_type: "int", description: "Heading level 1-3 or 0"),
+      Views.ViewField(name: "markdown", field_type: "text", description: "Block Markdown body"),
+      Views.ViewField(name: "version", field_type: "int", description: "Block optimistic version")
+    ],
+    narrows: Some("collection:#{target_cid}"),
+    load: fn(store)
+      page_pairs = try Table.lookup(store, pages_table(), pages_by_collection(), target_cid)
+        .map_error(fn(e) e.to_text end)
+      active_pages = page_pairs.filter(fn(p) p.1.archived_at == None end).map(fn(p) p.1 end)
+        .sort_by(fn(p) p.id end)
+      var out = []
+      for pg in active_pages
+        blks = try load_page_blocks(store, pg.id).map_error(fn(e) e.to_text end)
+        for b in blks
+          h_lvl = case b.kind
+            Heading(level: l): l
+            Paragraph | BulletListItem | OrderedListItem(start: _) | TaskItem(checked: _) | Quote | Callout(
+              tone: _,
+              icon: _
+            ) | CodeBlock(language: _) | Divider | Image(attachment_id: _, caption: _) | FileEmbed(
+              attachment_id: _,
+              filename: _
+            ) | PageLink(target_page_id: _) | DatabaseViewEmbed(database_id: _, view_id: _) | AiBrief(
+              prompt: _,
+              source_scope: _,
+              refreshed_at: _
+            ): 0
+          end
+          out = out.append({
+            "block_id": Json.String(b.id),
+            "page_id": Json.String(pg.id),
+            "page_title": Json.String(pg.title),
+            "collection_id": Json.String(pg.collection_id),
+            "rank": Json.String(b.rank),
+            "kind_tag": Json.String(Rlm.block_kind_tag(b.kind)),
+            "heading_level": Json.int(h_lvl),
+            "markdown": Json.String(b.markdown),
+            "version": Json.int(b.version)
+          })
+        end
+      end
+      Ok(out)
+    end
+  )
+
+  row_v = Views.ViewDef(
+    name: "rlm_db_rows:#{target_cid}",
+    description: "Narrowed relational database row slices inside collection #{target_cid}",
+    source_buckets: [databases_table().bucket, db_rows_table().bucket],
+    fields: [
+      Views.ViewField(name: "row_id", field_type: "text", description: "Database row ID"),
+      Views.ViewField(name: "database_id", field_type: "text", description: "Database ID"),
+      Views.ViewField(name: "database_title", field_type: "text", description: "Database title"),
+      Views.ViewField(name: "page_id", field_type: "text", description: "Backing row page ID"),
+      Views.ViewField(name: "collection_id", field_type: "text", description: "Collection ID"),
+      Views.ViewField(name: "title", field_type: "text", description: "Row title"),
+      Views.ViewField(name: "cells_summary", field_type: "text", description: "Formatted property cells"),
+      Views.ViewField(name: "version", field_type: "int", description: "Row optimistic version")
+    ],
+    narrows: Some("collection:#{target_cid}"),
+    load: fn(store)
+      db_pairs = try Table.lookup(store, databases_table(), databases_by_collection(), target_cid)
+        .map_error(fn(e) e.to_text end)
+      dbs = db_pairs.map(fn(p) p.1 end).sort_by(fn(d) d.id end)
+      var out = []
+      for def in dbs
+        row_pairs = try Table.lookup(store, db_rows_table(), db_rows_by_database(), def.id)
+          .map_error(fn(e) e.to_text end)
+        rows = row_pairs.filter(fn(p) p.1.archived_at == None end).map(fn(p) p.1 end).sort_by(
+          fn(r) r.id end
+        )
+        for r in rows
+          out = out.append({
+            "row_id": Json.String(r.id),
+            "database_id": Json.String(def.id),
+            "database_title": Json.String(def.title),
+            "page_id": Json.String(r.page_id),
+            "collection_id": Json.String(def.collection_id),
+            "title": Json.String(DatabaseModel.extract_row_title(def, r.cells)),
+            "cells_summary": Json.String(format_db_row_cells_summary(def, r)),
+            "version": Json.int(r.version)
+          })
+        end
+      end
+      Ok(out)
+    end
+  )
+
+  Views.with_view(
+    Views.with_view(
+      Views.with_view(Views.with_view(cat, col_v), sum_v),
+      blk_v
+    ),
+    row_v
+  )
+end
+
+## Builds the sandboxed `Modb.Views.ViewCatalog` for Tier 1 RLM Deep Research across `collection_ids`,
+## chaining grant narrowing (`rlm_*:<cid> -> collection:<cid> -> workspace:*`) so scoped agents fail closed.
+fn rlm_view_catalog(collection_ids: List(Text)) : Views.ViewCatalog
+  var cat = Views.catalog()
+  var seen = Set.empty
+  for raw_cid in collection_ids
+    cid = raw_cid.trim
+    if not cid.empty? and not seen.has?(cid)
+      seen = seen.add(cid)
+      cat = rlm_collection_views(cat, cid)
+    end
+  end
+  cat
+end
+
 test "Db schema, JIT OIDC human provisioning, page/block FTS indexing, and agent minting"
   files = Files.in_memory({})
   rng = SecureRandom.seeded(100)
@@ -3859,4 +4111,275 @@ test "AiDerived Modb.Feeds O(diff) staleness detection, World PutAiCellMeta land
     end
   )
   assert chk == Ok((Some(true), 9))
+end
+
+test "RLM Tier 1 Modb.Views catalog enforces grant ViewDenied isolation, TaintSession tracking, and ReadLimits budget"
+  files = Files.in_memory({})
+  rng = SecureRandom.seeded(919)
+  schema = vellum_schema()
+  t0 = Time.parse("2026-12-01T12:00:00Z") or stop "t0"
+  meta = Ledger.WriteMeta(principal: "@ada", action: "test.rlm_views", reason: "seed rlm views", at: t0)
+  (_raw, pref, thash) = Policy.mint_agent_token_raw(rng)
+  prov = Provenance(
+    author_id: "usr_ada",
+    author_kind: HumanAuthor,
+    grant_id: None,
+    proposal_id: None,
+    reason: Some("seed rlm"),
+    citations: [],
+    updated_at: t0
+  )
+
+  col_sec = Collection(
+    id: "col_sec",
+    workspace_id: default_workspace_id,
+    slug: "secret-ops",
+    name: "Secret Ops",
+    description: "Restricted",
+    icon: None,
+    write_policy: DirectWithAudit,
+    freshness_ttl_days: None,
+    sort_order: "z",
+    archived_at: None
+  )
+  pg_pub = Page(
+    id: "pg_pub",
+    collection_id: default_collection_id,
+    parent_page_id: None,
+    title: "Gateway Runbook",
+    icon: None,
+    cover_attachment_id: None,
+    kind: Document,
+    sort_order: "a",
+    database_id: None,
+    freshness_ttl_days: None,
+    verified_at: Some(t0),
+    verified_by: Some("usr_ada"),
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+  b1 = Block(
+    id: "blk_r1",
+    page_id: pg_pub.id,
+    parent_block_id: None,
+    rank: "a",
+    kind: Heading(level: 2),
+    markdown: "Rollback Procedure",
+    provenance: prov,
+    version: 1
+  )
+  b2 = Block(
+    id: "blk_r2",
+    page_id: pg_pub.id,
+    parent_block_id: None,
+    rank: "b",
+    kind: CodeBlock(language: "bash"),
+    markdown: "vellum rollback --quorum",
+    provenance: prov,
+    version: 1
+  )
+  pg_sec = Page(
+    id: "pg_sec",
+    collection_id: col_sec.id,
+    parent_page_id: None,
+    title: "Vault Custody",
+    icon: None,
+    cover_attachment_id: None,
+    kind: Document,
+    sort_order: "a",
+    database_id: None,
+    freshness_ttl_days: None,
+    verified_at: None,
+    verified_by: None,
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+  b_sec = Block(
+    id: "blk_sec",
+    page_id: pg_sec.id,
+    parent_block_id: None,
+    rank: "a",
+    kind: Paragraph,
+    markdown: "Top secret vault master phrase.",
+    provenance: prov,
+    version: 1
+  )
+
+  seed = Ledger.transact_locked(
+    files,
+    ledger_db_path,
+    schema,
+    meta,
+    "seed rlm views test",
+    Json.Null,
+    map_ledger_error,
+    fn(tx)
+      (t1, owner) = try tx_upsert_human_principal(
+        tx,
+        "ada@acme.io",
+        "Ada",
+        None,
+        "usr_ada",
+        "gr_ada",
+        t0
+      )
+      t2 = try Table.put(t1, collections_table(), col_sec.id, col_sec).map_error(map_table_error)
+      t3 = try tx_save_page_and_blocks(t2, pg_pub, [b1, b2])
+      t4 = try tx_save_page_and_blocks(t3, pg_sec, [b_sec])
+      (t5, _ag, gr, _tok) = try tx_mint_agent(
+        t4,
+        owner.id,
+        "@rlm_scoped",
+        "RLM Scoped",
+        Some("gpt-4o-mini"),
+        "rlm",
+        ["read"],
+        Some([default_collection_id]),
+        20,
+        t0 + 7.days,
+        "agt_rlm",
+        "gr_rlm",
+        "tok_rlm",
+        pref,
+        thash,
+        t0
+      )
+      Ok((t5, gr.id))
+    end
+  )
+  ag_gid = case seed
+    Ok(g): g
+    Error(_): stop "seed failed"
+  end
+
+  cat = rlm_view_catalog([default_collection_id, col_sec.id])
+  limits = Views.ReadLimits(max_rows_scanned: 50, max_ops: 2000, max_result_rows: 50)
+
+  # 1. Scoped agent succeeds on authorized collection via TaintBridge
+  sess_ag = case TaintBridge.ensure_taint_session_locked(
+    files,
+    ledger_db_path,
+    schema,
+    "rlm:ag_test",
+    "agt_rlm",
+    Some(ag_gid),
+    t0
+  )
+    Ok(s): s
+    Error(_): stop "sess_ag failed"
+  end
+  assert not sess_ag.untrusted_tainted
+
+  ok_sum = case TaintBridge.run_tainted_read_program_locked(
+    files,
+    ledger_db_path,
+    schema,
+    cat,
+    sess_ag.id,
+    Views.ReadProgram(
+      view: "rlm_summaries:#{default_collection_id}",
+      where_clause: None,
+      select: None,
+      group_by: None,
+      aggregates: None,
+      order_by: None,
+      limit: Some(20)
+    ),
+    false,
+    limits,
+    t0
+  )
+    Ok(r): r
+    Error(_): stop "ok_sum failed"
+  end
+  assert ok_sum.governed.result.result_count == 1
+  assert not ok_sum.governed.result.answer_hash.trim.empty?
+
+  # 2. Scoped agent fails closed (Forbidden / ViewDenied) on restricted collection
+  denied = TaintBridge.run_tainted_read_program_locked(
+    files,
+    ledger_db_path,
+    schema,
+    cat,
+    sess_ag.id,
+    Views.ReadProgram(
+      view: "rlm_blocks:#{col_sec.id}",
+      where_clause: None,
+      select: None,
+      group_by: None,
+      aggregates: None,
+      order_by: None,
+      limit: Some(20)
+    ),
+    false,
+    limits,
+    t0
+  )
+  assert denied is Error(Forbidden(reason: _))
+
+  # 3. Workspace-wide human session (None, is_admin=true) reads col_sec cleanly
+  sess_hum = case TaintBridge.ensure_taint_session_locked(
+    files,
+    ledger_db_path,
+    schema,
+    "rlm:hum_test",
+    "usr_ada",
+    None,
+    t0
+  )
+    Ok(s): s
+    Error(_): stop "sess_hum failed"
+  end
+  ok_hum = case TaintBridge.run_tainted_read_program_locked(
+    files,
+    ledger_db_path,
+    schema,
+    cat,
+    sess_hum.id,
+    Views.ReadProgram(
+      view: "rlm_summaries:#{col_sec.id}",
+      where_clause: None,
+      select: None,
+      group_by: None,
+      aggregates: None,
+      order_by: None,
+      limit: Some(20)
+    ),
+    true,
+    limits,
+    t0
+  )
+    Ok(r): r
+    Error(_): stop "ok_hum failed"
+  end
+  assert ok_hum.governed.result.result_count == 1
+
+  # 4. Tight ReadLimits enforces WorkBudgetExceeded -> BadInput
+  tight_limits = Views.ReadLimits(max_rows_scanned: 1, max_ops: 200, max_result_rows: 10)
+  over = TaintBridge.run_tainted_read_program_locked(
+    files,
+    ledger_db_path,
+    schema,
+    cat,
+    sess_hum.id,
+    Views.ReadProgram(
+      view: "rlm_blocks:#{default_collection_id}",
+      where_clause: None,
+      select: None,
+      group_by: None,
+      aggregates: None,
+      order_by: None,
+      limit: Some(20)
+    ),
+    true,
+    tight_limits,
+    t0
+  )
+  assert over is Error(BadInput(reason: _))
 end

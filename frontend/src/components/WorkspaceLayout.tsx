@@ -2,8 +2,11 @@ import { Head, Link, router, usePage } from "@inertiajs/react";
 import {
   Bot,
   BookOpen,
+  ChevronDown,
   ChevronRight,
+  Cpu,
   Database as DbIcon,
+  Filter,
   FolderPlus,
   GitPullRequest,
   Home,
@@ -11,6 +14,8 @@ import {
   LogOut,
   Search,
   Settings,
+  ShieldAlert,
+  ShieldCheck,
   Sparkles,
   X,
 } from "lucide-react";
@@ -23,6 +28,10 @@ import type {
   Collection,
   CollectionWritePolicy,
   DatabaseDef,
+  DeepResearchResponse,
+  RlmDbSlice,
+  RlmTaintSummary,
+  RlmTraceStep,
   SearchMode,
   SearchResponse,
   SearchResultItem,
@@ -75,8 +84,9 @@ export default function WorkspaceLayout({
   const [searchResults, setSearchResults] = useState<SearchResultItem[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
 
-  // Ask Workspace AI SSE drawer
+  // Ask Workspace AI SSE drawer (Fast RAG vs Deep Research RLM Tier 1)
   const [aiOpen, setAiOpen] = useState(false);
+  const [aiMode, setAiMode] = useState<"fast" | "deep">("fast");
   const [aiQuestion, setAiQuestion] = useState("");
   const [aiScoped, setAiScoped] = useState(false);
   const [aiAnswer, setAiAnswer] = useState("");
@@ -84,6 +94,21 @@ export default function WorkspaceLayout({
   const [aiCitations, setAiCitations] = useState<AiCitation[]>([]);
   const [aiError, setAiError] = useState<string | null>(null);
   const [aiStreaming, setAiStreaming] = useState(false);
+  const [rlmBlockKinds, setRlmBlockKinds] = useState<string[]>([]);
+  const [rlmHeadingContains, setRlmHeadingContains] = useState("");
+  const [rlmMaxSubcalls, setRlmMaxSubcalls] = useState<number>(3);
+  const [rlmIncludeDbs, setRlmIncludeDbs] = useState(true);
+  const [rlmTelemetry, setRlmTelemetry] = useState<{
+    tier: string;
+    rowsScanned: number;
+    opsUsed: number;
+    subcallsUsed: number;
+    maxSubcalls: number;
+    taint: RlmTaintSummary;
+  } | null>(null);
+  const [rlmTrace, setRlmTrace] = useState<RlmTraceStep[]>([]);
+  const [rlmTraceOpen, setRlmTraceOpen] = useState(false);
+  const [rlmDbSlices, setRlmDbSlices] = useState<RlmDbSlice[]>([]);
   const aiAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
@@ -147,6 +172,12 @@ export default function WorkspaceLayout({
     return () => window.clearTimeout(timer);
   }, [searchOpen, searchQuery, searchMode]);
 
+  function toggleRlmBlockKind(kind: string) {
+    setRlmBlockKinds((prev) =>
+      prev.includes(kind) ? prev.filter((k) => k !== kind) : [...prev, kind]
+    );
+  }
+
   async function handleAskAi(e: React.FormEvent) {
     e.preventDefault();
     const q = aiQuestion.trim();
@@ -159,20 +190,51 @@ export default function WorkspaceLayout({
     setAiModel("");
     setAiCitations([]);
     setAiError(null);
+    setRlmTelemetry(null);
+    setRlmTrace([]);
+    setRlmDbSlices([]);
     try {
-      await streamAskWorkspace(
-        {
-          question: q,
-          collection_id: aiScoped ? currentCollectionId : null,
-          max_sources: 5,
-        },
-        {
-          onCitation: (c) => setAiCitations((prev) => [...prev, c]),
-          onToken: (delta) => setAiAnswer((prev) => prev + delta),
-          onDone: (model) => setAiModel(model),
-        },
-        controller.signal
-      );
+      if (aiMode === "deep") {
+        const res = await apiFetch<DeepResearchResponse>("/api/ai/deep-research", {
+          method: "POST",
+          signal: controller.signal,
+          body: JSON.stringify({
+            question: q,
+            collection_id: aiScoped ? currentCollectionId : null,
+            block_kinds: rlmBlockKinds.length > 0 ? rlmBlockKinds : null,
+            heading_contains: rlmHeadingContains.trim() ? rlmHeadingContains.trim() : null,
+            include_databases: rlmIncludeDbs,
+            max_subcalls: rlmMaxSubcalls,
+          }),
+        });
+        setAiAnswer(res.answer);
+        setAiModel(res.model);
+        setAiCitations(res.citations ?? []);
+        setRlmDbSlices(res.db_slices ?? []);
+        setRlmTrace(res.trace ?? []);
+        setRlmTelemetry({
+          tier: res.tier,
+          rowsScanned: res.rows_scanned,
+          opsUsed: res.ops_used,
+          subcallsUsed: res.subcalls_used,
+          maxSubcalls: res.max_subcalls,
+          taint: res.taint,
+        });
+      } else {
+        await streamAskWorkspace(
+          {
+            question: q,
+            collection_id: aiScoped ? currentCollectionId : null,
+            max_sources: 5,
+          },
+          {
+            onCitation: (c) => setAiCitations((prev) => [...prev, c]),
+            onToken: (delta) => setAiAnswer((prev) => prev + delta),
+            onDone: (model) => setAiModel(model),
+          },
+          controller.signal
+        );
+      }
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") {
         return;
@@ -575,19 +637,49 @@ export default function WorkspaceLayout({
 
       {/* Ask Workspace AI Drawer */}
       {aiOpen && (
-        <div className="fixed inset-y-0 right-0 z-50 w-full max-w-md border-l border-stone-200 bg-white shadow-2xl flex flex-col">
-          <div className="flex items-center justify-between border-b border-stone-200 px-5 py-4">
+        <div className="fixed inset-y-0 right-0 z-50 w-full max-w-lg border-l border-stone-200 bg-white shadow-2xl flex flex-col">
+          <div className="flex items-center justify-between border-b border-stone-200 px-5 py-3.5 gap-2">
             <div className="flex items-center gap-2 font-semibold text-sm text-stone-900">
-              <Bot className="h-4 w-4 text-teal-700" />
-              Ask Workspace (Grant-Filtered RAG)
+              {aiMode === "deep" ? (
+                <Cpu className="h-4 w-4 text-indigo-700" />
+              ) : (
+                <Bot className="h-4 w-4 text-teal-700" />
+              )}
+              Ask Workspace
             </div>
-            <button
-              type="button"
-              onClick={closeAiDrawer}
-              className="text-stone-400 hover:text-stone-700"
-            >
-              <X className="h-4 w-4" />
-            </button>
+            <div className="flex items-center gap-2">
+              <div className="inline-flex rounded-lg border border-stone-200 bg-stone-50 p-0.5 text-[11px] font-medium">
+                <button
+                  type="button"
+                  onClick={() => setAiMode("fast")}
+                  className={`rounded-md px-2 py-1 transition ${
+                    aiMode === "fast"
+                      ? "bg-white text-stone-900 shadow-xs"
+                      : "text-stone-500 hover:text-stone-800"
+                  }`}
+                >
+                  Fast Ask (RAG)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAiMode("deep")}
+                  className={`rounded-md px-2 py-1 transition ${
+                    aiMode === "deep"
+                      ? "bg-indigo-700 text-white shadow-xs"
+                      : "text-stone-500 hover:text-stone-800"
+                  }`}
+                >
+                  Deep Research (RLM)
+                </button>
+              </div>
+              <button
+                type="button"
+                onClick={closeAiDrawer}
+                className="text-stone-400 hover:text-stone-700"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
           </div>
           <div className="flex-1 overflow-y-auto p-5 space-y-4">
             <form onSubmit={handleAskAi} className="space-y-3">
@@ -595,9 +687,81 @@ export default function WorkspaceLayout({
                 rows={3}
                 value={aiQuestion}
                 onChange={(e) => setAiQuestion(e.target.value)}
-                placeholder="Ask a question answered strictly from pages you can access..."
+                placeholder={
+                  aiMode === "deep"
+                    ? "Run inspectable RLM Tier 1 ReadProgram slicing across summaries, blocks & DBs..."
+                    : "Ask a question answered strictly from pages you can access..."
+                }
                 className="w-full rounded-xl border border-stone-200 p-3 text-sm focus:border-teal-600 outline-none"
               />
+
+              {aiMode === "deep" && (
+                <div className="rounded-xl border border-stone-200 bg-stone-50/70 p-3 space-y-2.5">
+                  <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-stone-500">
+                    <Filter className="h-3 w-3" />
+                    ReadProgram Slice Filters
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {(
+                      [
+                        ["paragraph", "Paragraph"],
+                        ["heading", "Heading"],
+                        ["code_block", "Code Block"],
+                        ["task_item", "Checklist"],
+                        ["callout", "Callout"],
+                        ["quote", "Quote"],
+                      ] as const
+                    ).map(([tag, label]) => {
+                      const active = rlmBlockKinds.includes(tag);
+                      return (
+                        <button
+                          key={tag}
+                          type="button"
+                          onClick={() => toggleRlmBlockKind(tag)}
+                          className={`rounded-md border px-2 py-0.5 text-[11px] font-medium transition ${
+                            active
+                              ? "border-indigo-600 bg-indigo-50 text-indigo-800"
+                              : "border-stone-200 bg-white text-stone-600 hover:bg-stone-100"
+                          }`}
+                        >
+                          {label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <input
+                      type="text"
+                      value={rlmHeadingContains}
+                      onChange={(e) => setRlmHeadingContains(e.target.value)}
+                      placeholder="Heading filter (e.g. Rollback)"
+                      className="rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 text-xs outline-none focus:border-indigo-600"
+                    />
+                    <div className="flex items-center gap-2">
+                      <label className="text-[11px] text-stone-500 shrink-0">Sub-calls</label>
+                      <select
+                        value={rlmMaxSubcalls}
+                        onChange={(e) => setRlmMaxSubcalls(Number.parseInt(e.target.value, 10))}
+                        className="w-full rounded-lg border border-stone-200 bg-white px-2 py-1.5 text-xs"
+                      >
+                        <option value={0}>0 (Single-pass)</option>
+                        <option value={2}>Max 2</option>
+                        <option value={3}>Max 3</option>
+                        <option value={5}>Max 5</option>
+                      </select>
+                    </div>
+                  </div>
+                  <label className="flex items-center gap-2 text-xs text-stone-600">
+                    <input
+                      type="checkbox"
+                      checked={rlmIncludeDbs}
+                      onChange={(e) => setRlmIncludeDbs(e.target.checked)}
+                    />
+                    Inspect matching relational database rows (`rlm_db_rows`)
+                  </label>
+                </div>
+              )}
+
               <div className="flex items-center justify-between gap-2">
                 {currentCollectionId ? (
                   <label className="flex items-center gap-2 text-xs text-stone-600">
@@ -624,9 +788,19 @@ export default function WorkspaceLayout({
                   <button
                     type="submit"
                     disabled={aiStreaming || !aiQuestion.trim()}
-                    className="rounded-lg bg-teal-700 px-3.5 py-1.5 text-xs font-medium text-white disabled:opacity-50 hover:bg-teal-800 transition"
+                    className={`rounded-lg px-3.5 py-1.5 text-xs font-medium text-white disabled:opacity-50 transition ${
+                      aiMode === "deep"
+                        ? "bg-indigo-700 hover:bg-indigo-800"
+                        : "bg-teal-700 hover:bg-teal-800"
+                    }`}
                   >
-                    {aiStreaming ? "Streaming..." : "Ask"}
+                    {aiStreaming
+                      ? aiMode === "deep"
+                        ? "Researching..."
+                        : "Streaming..."
+                      : aiMode === "deep"
+                        ? "Deep Research"
+                        : "Ask"}
                   </button>
                 </div>
               </div>
@@ -638,8 +812,42 @@ export default function WorkspaceLayout({
               </div>
             )}
 
-            {(aiAnswer || aiCitations.length > 0) && (
+            {(aiAnswer || aiCitations.length > 0 || rlmTelemetry || rlmDbSlices.length > 0) && (
               <div className="space-y-4 pt-2 border-t border-stone-100">
+                {rlmTelemetry && (
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="rounded-full border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-[10px] font-medium text-indigo-800">
+                      {rlmTelemetry.tier === "tier1_read_program"
+                        ? "Tier 1 ReadProgram"
+                        : rlmTelemetry.tier}
+                    </span>
+                    <span className="rounded-full border border-stone-200 bg-stone-50 px-2 py-0.5 font-mono text-[10px] text-stone-600">
+                      {rlmTelemetry.rowsScanned} rows
+                    </span>
+                    <span className="rounded-full border border-stone-200 bg-stone-50 px-2 py-0.5 font-mono text-[10px] text-stone-600">
+                      {rlmTelemetry.opsUsed} ops
+                    </span>
+                    <span className="rounded-full border border-stone-200 bg-stone-50 px-2 py-0.5 font-mono text-[10px] text-stone-600">
+                      {rlmTelemetry.subcallsUsed}/{rlmTelemetry.maxSubcalls} sub-calls
+                    </span>
+                    <span
+                      className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium ${
+                        rlmTelemetry.taint.untrusted_tainted
+                          ? "border-amber-300 bg-amber-50 text-amber-800"
+                          : "border-emerald-200 bg-emerald-50 text-emerald-800"
+                      }`}
+                    >
+                      {rlmTelemetry.taint.untrusted_tainted ? (
+                        <ShieldAlert className="h-3 w-3" />
+                      ) : (
+                        <ShieldCheck className="h-3 w-3" />
+                      )}
+                      {rlmTelemetry.taint.untrusted_tainted ? "Tainted" : "Clean"} ·{" "}
+                      {rlmTelemetry.taint.max_sensitivity_read}
+                    </span>
+                  </div>
+                )}
+
                 {aiAnswer && (
                   <div className="rounded-xl bg-stone-50 border border-stone-200 p-4 text-sm leading-relaxed text-stone-800 whitespace-pre-wrap">
                     {aiAnswer}
@@ -650,6 +858,66 @@ export default function WorkspaceLayout({
                     )}
                   </div>
                 )}
+
+                {rlmTrace.length > 0 && (
+                  <div className="rounded-xl border border-stone-200 bg-white overflow-hidden">
+                    <button
+                      type="button"
+                      onClick={() => setRlmTraceOpen((prev) => !prev)}
+                      className="w-full flex items-center justify-between px-3 py-2 text-xs font-semibold text-stone-700 hover:bg-stone-50 transition"
+                    >
+                      <span>Inspectable Query Trace ({rlmTrace.length} steps)</span>
+                      <ChevronDown
+                        className={`h-3.5 w-3.5 transition-transform ${
+                          rlmTraceOpen ? "rotate-180" : ""
+                        }`}
+                      />
+                    </button>
+                    {rlmTraceOpen && (
+                      <div className="divide-y divide-stone-100 border-t border-stone-100">
+                        {rlmTrace.map((st) => (
+                          <div key={st.step} className="px-3 py-2 text-[11px] space-y-0.5">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-mono font-semibold text-stone-800">
+                                {st.step}. {st.op} · {st.target}
+                              </span>
+                              {st.answer_hash && (
+                                <span className="font-mono text-[10px] text-stone-400">
+                                  #{st.answer_hash.slice(0, 8)}
+                                </span>
+                              )}
+                            </div>
+                            <div className="text-stone-500">{st.detail}</div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {rlmDbSlices.length > 0 && (
+                  <div className="space-y-2">
+                    <div className="text-xs font-semibold uppercase tracking-wider text-stone-500">
+                      Database Slices ({rlmDbSlices.length})
+                    </div>
+                    {rlmDbSlices.map((d) => (
+                      <Link
+                        key={`${d.database_id}-${d.row_id}`}
+                        href={`/d/${d.database_id}`}
+                        onClick={() => setAiOpen(false)}
+                        className="block rounded-lg border border-stone-200 p-2.5 hover:bg-stone-50 transition"
+                      >
+                        <div className="text-xs font-medium text-indigo-700">
+                          [DB: {d.database_title} #{d.row_id}] · {d.title}
+                        </div>
+                        <div className="text-xs text-stone-500 mt-1 line-clamp-2">
+                          {d.cells_summary}
+                        </div>
+                      </Link>
+                    ))}
+                  </div>
+                )}
+
                 {aiCitations.length > 0 && (
                   <div className="space-y-2">
                     <div className="text-xs font-semibold uppercase tracking-wider text-stone-500">
@@ -662,9 +930,21 @@ export default function WorkspaceLayout({
                         onClick={() => setAiOpen(false)}
                         className="block rounded-lg border border-stone-200 p-2.5 hover:bg-stone-50 transition"
                       >
-                        <div className="text-xs font-medium text-blue-700">
-                          [{c.title} §{c.block_id}]
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-xs font-medium text-blue-700 truncate">
+                            [{c.title} §{c.block_id}]
+                          </span>
+                          {c.kind_tag && (
+                            <span className="shrink-0 rounded bg-stone-100 px-1.5 py-0.5 font-mono text-[10px] text-stone-600">
+                              {c.kind_tag}
+                            </span>
+                          )}
                         </div>
+                        {c.heading_path && (
+                          <div className="text-[11px] text-stone-400 mt-0.5 truncate">
+                            § {c.heading_path}
+                          </div>
+                        )}
                         <div className="text-xs text-stone-500 mt-1 line-clamp-2">
                           {c.excerpt}
                         </div>

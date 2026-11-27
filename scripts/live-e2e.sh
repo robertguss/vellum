@@ -146,11 +146,19 @@ const server = http.createServer((req, res) => {
         const isSteer = allText.includes(
           "revising a speculative Vellum proposal block in-place"
         );
+        const isRlmSub = allText.includes("Vellum RLM Deep Research sub-agent");
+        const isRlmSynth = allText.includes("Vellum RLM Deep Research synthesizer");
         const isAiColumn = allText.includes("AI-compiled database column");
         const isBrief = allText.includes("Living Brief");
         let replyText =
           "Concise workspace semantic summary generated for progressive disclosure.";
-        if (isSteer) {
+        if (isRlmSub) {
+          replyText =
+            "Sub-agent verified Rollback Procedure block slice in Live RLM Runbook.";
+        } else if (isRlmSynth) {
+          replyText =
+            "Verified rollback command and quorum check from RLM Tier 1 ReadProgram block slices.";
+        } else if (isSteer) {
           replyText =
             "Steered incident runbook paragraph revised in-place inside Modb.World branch.";
         } else if (isAiColumn) {
@@ -1644,6 +1652,91 @@ assert.ok(semAskText.includes(pageId), "Semantic Ask Workspace cites permitted L
 assert.ok(!semAskText.includes(secretPageId), "Semantic Ask Workspace NEVER cites Executive Secret Vault");
 assert.ok(!semAskText.includes("zxqvault"), "Semantic Ask Workspace NEVER leaks secret page text");
 console.log("✓ Live Modb.Vec neural outbox indexing, Hybrid RRF /api/search + /mcp, and Semantic Ask RAG verified");
+
+// 11. Live RLM Tier 1 Deep Research (POST /api/ai/deep-research + /mcp vellum.rlm_query)
+const rlmPgRes = await apiJson("/api/pages", {
+  method: "POST",
+  body: JSON.stringify({
+    collection_id: colId,
+    parent_page_id: null,
+    title: "Live RLM Rollback Playbook",
+    markdown:
+      "## Rollback Procedure\n\n```bash\nkubectl rollout undo deploy/gateway\n```\n\n```bash\nvellum quorum-verify --strict\n```\n\n## Observability\n\n```bash\nprometheus --version\n```",
+    icon: null,
+    freshness_ttl_days: null,
+    reason: "seed live rlm playbook",
+  }),
+});
+assert.equal(rlmPgRes.res.status, 201, rlmPgRes.text);
+const rlmPgId = rlmPgRes.json.page.id;
+const rlmBlocks = rlmPgRes.json.blocks ?? [];
+assert.equal(rlmBlocks.length, 5);
+const obsBlkId = rlmBlocks[4].id;
+
+const deepRes = await apiJson("/api/ai/deep-research", {
+  method: "POST",
+  body: JSON.stringify({
+    question: "How do we run Rollback Procedure on gateway deploy?",
+    collection_id: colId,
+    block_kinds: ["code_block"],
+    heading_contains: "Rollback",
+    include_databases: true,
+    max_subcalls: 2,
+  }),
+});
+assert.equal(deepRes.res.status, 200, deepRes.text);
+assert.equal(deepRes.json.tier, "tier1_read_program");
+assert.ok(deepRes.json.rows_scanned >= 5, "RLM scanned summaries + blocks + DB rows");
+assert.ok(deepRes.json.trace.length >= 3, "RLM recorded ReadProgram, sub-LLM, and synthesize steps");
+assert.equal(deepRes.json.taint?.untrusted_tainted, false);
+assert.ok(
+  (deepRes.json.citations ?? []).some((c) => c.page_id === rlmPgId),
+  "RLM citations include Live RLM Rollback Playbook"
+);
+assert.ok(
+  !(deepRes.json.citations ?? []).some((c) => c.block_id === obsBlkId),
+  "RLM heading_contains filter excluded Observability section"
+);
+
+const budgetRes = await apiJson("/api/ai/deep-research", {
+  method: "POST",
+  body: JSON.stringify({
+    question: "Rollback Procedure",
+    collection_id: colId,
+    max_rows_scanned: 1,
+    max_subcalls: 0,
+  }),
+});
+assert.equal(budgetRes.res.status, 422, "Tight ReadLimits enforces 422 WorkBudgetExceeded");
+
+const mcpRlmOk = await mcpCall(12, "tools/call", {
+  name: "vellum.rlm_query",
+  arguments: {
+    question: "Rollback Procedure gateway",
+    heading_contains: "Rollback",
+    block_kinds: ["code_block"],
+    max_subcalls: 0,
+  },
+});
+assert.equal(mcpRlmOk.result?.isError, false, JSON.stringify(mcpRlmOk));
+const mcpRlmSc = mcpRlmOk.result?.structuredContent;
+assert.equal(mcpRlmSc?.tier, "tier1_read_program");
+assert.ok(!JSON.stringify(mcpRlmOk).includes("zxqvault"), "MCP RLM never leaks restricted collection");
+
+const mcpRlmDenied = await mcpCall(13, "tools/call", {
+  name: "vellum.rlm_query",
+  arguments: {
+    question: "Executive Secret Vault",
+    collection_id: secretColId,
+    max_subcalls: 0,
+  },
+});
+assert.equal(
+  mcpRlmDenied.result?.isError,
+  true,
+  "Scoped agent vellum.rlm_query fails closed on restricted collection"
+);
+console.log("✓ Live RLM Tier 1 Deep Research (/api/ai/deep-research + /mcp vellum.rlm_query) verified");
 EOF
 
 echo "All Live Vellum E2E checks against mo serve + Dex + VersityGW S3 passed."

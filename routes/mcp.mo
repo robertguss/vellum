@@ -245,6 +245,29 @@ fn vellum_tools() : List(Mcp.ToolDef)
         ["slug"]
       ),
       read_only?: true
+    ),
+    Mcp.ToolDef(
+      name: "vellum.rlm_query",
+      description: "RLM Tier 1 Deep Research via sandboxed Modb.Views ReadProgram, section/block-kind slicing, and bounded sub-calls with inspectable trace.",
+      input_schema: Mcp.object_schema(
+        {
+          "question": str_prop("Research question to answer across accessible collections"),
+          "collection_id": str_prop("Optional collection filter (grant-verified by Modb.Views)"),
+          "block_kinds": Json.Object({
+            "type": Json.String("array"),
+            "items": Json.Object({"type": Json.String("string")})
+          }),
+          "heading_contains": str_prop("Optional heading substring to isolate matching page sections"),
+          "include_databases": Json.Object({"type": Json.String("boolean")}),
+          "max_pages": Json.Object({"type": Json.String("integer")}),
+          "max_blocks_per_page": Json.Object({"type": Json.String("integer")}),
+          "max_subcalls": Json.Object({"type": Json.String("integer")}),
+          "max_rows_scanned": Json.Object({"type": Json.String("integer")}),
+          "session_id": str_prop("Optional Modb.Taint session suffix")
+        },
+        ["question"]
+      ),
+      read_only?: true
     )
   ]
 end
@@ -1105,6 +1128,63 @@ fn handle_mcp_proposal_comments(
   end
 end
 
+fn handle_mcp_rlm_query(
+  id: Mcp.RpcId,
+  args: Json,
+  auth: AuthContext,
+  files: Files,
+  clock: Clock,
+  env: Env,
+  net: Network
+) : Result(Api.Response, AppError)
+  question = case args.text_at("question")
+    Some(q) if not q.trim.empty?: q.trim
+    Some(_) | None: return Ok(Mcp.tool_error(id, "non-empty 'question' is required"))
+  end
+  col_opt = case args.text_at("collection_id")
+    Some(c) if not c.trim.empty?: Some(c.trim)
+    Some(_) | None: None
+  end
+  heading_opt = case args.text_at("heading_contains")
+    Some(h) if not h.trim.empty?: Some(h.trim)
+    Some(_) | None: None
+  end
+  kinds_opt = case args.get("block_kinds")
+    None | Some(Json.Null): None
+    Some(kj):
+      case Json.decode_strict[List(Text)](kj.to_text.bytes)
+        Ok(xs): Some(xs)
+        Error(e): return Ok(Mcp.tool_error(id, "invalid block_kinds: #{e.to_text}"))
+      end
+  end
+  inc_dbs_opt = args.bool_at("include_databases")
+  max_pages_opt = args.int_at("max_pages")
+  max_b_opt = args.int_at("max_blocks_per_page")
+  max_sub_opt = args.int_at("max_subcalls")
+  max_rows_opt = args.int_at("max_rows_scanned")
+  sess_opt = case args.text_at("session_id")
+    Some(s) if not s.trim.empty?: Some(s.trim)
+    Some(_) | None: None
+  end
+
+  inp = Ai.DeepResearchInput(
+    question: question,
+    collection_id: col_opt,
+    block_kinds: kinds_opt,
+    heading_contains: heading_opt,
+    include_databases: inc_dbs_opt,
+    max_pages: max_pages_opt,
+    max_blocks_per_page: max_b_opt,
+    max_subcalls: max_sub_opt,
+    max_rows_scanned: max_rows_opt,
+    session_id: sess_opt
+  )
+  case Ai.execute_rlm_tier1(auth, inp, files, clock, env, net)
+    Ok(out): Ok(Mcp.tool_ok(id, out.answer, Some(Ai.deep_research_outcome_to_json(out))))
+    Error(e): Ok(Mcp.tool_error(id, e.to_text))
+  end
+end
+
 fn handle_tool_call(
   id: Mcp.RpcId,
   name: Text,
@@ -1775,6 +1855,10 @@ fn handle_tool_call(
       )
       Error(e): Ok(Mcp.tool_error(id, e.to_text))
     end
+  end
+
+  if name == "vellum.rlm_query"
+    return handle_mcp_rlm_query(id, args, auth, files, clock, env, net)
   end
 
   Ok(Mcp.tool_error(id, "unhandled tool '#{name}'"))
