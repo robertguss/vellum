@@ -9,7 +9,9 @@ parse_markdown_blocks,
 blocks_plain_text,
 extract_metric_refs,
 blocks_metric_refs,
-apply_block_ops
+apply_block_ops,
+reconcile_blocks_from_markdown,
+diff_blocks_to_ops
 use Domain.Types{AuthorKind, Block, BlockKind, BlockOp, Citation, Provenance}
 
 alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
@@ -1020,4 +1022,314 @@ test "ai-brief living card markdown round-trip"
   )
   assert b1.markdown == "- P99 latency: 14ms"
   assert to_anchored_markdown(blks) == md
+end
+
+fn sync_zero_pad4(n: Int) : Text
+  s = n.to_text
+  if s.byte_count >= 4: s else: "#{"0".repeat(4 - s.byte_count)}#{s}"
+end
+
+## Reconciles body Markdown back into canonical blocks, preserving existing `blk_...` IDs, ranks,
+## and unmodified block versions/provenance while minting IDs (`blk_<prefix>_0001`) for new blocks.
+fn reconcile_blocks_from_markdown(
+  page_id: Text,
+  existing_blocks: List(Block),
+  body_markdown: Text,
+  prov: Provenance,
+  id_prefix: Text
+) : List(Block)
+  parsed = parse_markdown_blocks(page_id, body_markdown, prov, "tmp_#{id_prefix}")
+  return [] if parsed.empty?
+
+  sorted_old = sort_blocks(existing_blocks)
+  var old_by_id = {}
+  var old_idx_by_id = {}
+  for (oi, ob) in sorted_old.enumerate
+    old_by_id = old_by_id.set(ob.id, ob)
+    old_idx_by_id = old_idx_by_id.set(ob.id, oi)
+  end
+
+  var seen_ids = {}
+  var staged = []
+  var in_order? = true
+  var last_old_idx = -1
+  var last_old_rank = None
+
+  for p in parsed
+    matched_opt = if seen_ids.get(p.id) == None
+      case old_by_id.get(p.id)
+        Some(ob):
+          seen_ids = seen_ids.set(ob.id, true)
+          idx = old_idx_by_id.get(ob.id) or 0
+          rank_ok = case last_old_rank
+            Some(pr): ob.rank > pr
+            None: true
+          end
+          if idx <= last_old_idx or not rank_ok
+            in_order? = false
+          else
+            last_old_idx = idx
+            last_old_rank = Some(ob.rank)
+          end
+          Some(ob)
+        None: None
+      end
+    else
+      None
+    end
+    staged = staged.append((matched_opt, p.kind, p.markdown))
+  end
+
+  if in_order?
+    var out = []
+    var prev_rank = None
+    var fresh_idx = 0
+    var i = 0
+    n = staged.size
+    while i < n
+      entry = staged.get(i) or (None, Paragraph, "")
+      case entry.0
+        Some(ob):
+          updated = if ob.kind == entry.1 and ob.markdown == entry.2
+            ob
+          else
+            Block(
+              id: ob.id,
+              page_id: page_id,
+              parent_block_id: ob.parent_block_id,
+              rank: ob.rank,
+              kind: entry.1,
+              markdown: entry.2,
+              provenance: prov,
+              version: ob.version + 1
+            )
+          end
+          prev_rank = Some(ob.rank)
+          out = out.append(updated)
+          i += 1
+        None:
+          var j = i + 1
+          var next_rank = None
+          while j < n
+            nxt = staged.get(j) or (None, Paragraph, "")
+            case nxt.0
+              Some(ob2):
+                next_rank = Some(ob2.rank)
+                break
+              None: j += 1
+            end
+          end
+          var k = i
+          var cur_left = prev_rank
+          while k < j
+            new_e = staged.get(k) or (None, Paragraph, "")
+            fresh_idx += 1
+            fid = "blk_#{id_prefix}_#{sync_zero_pad4(fresh_idx)}"
+            r = rank_between(cur_left, next_rank)
+            cur_left = Some(r)
+            out = out.append(
+              Block(
+                id: fid,
+                page_id: page_id,
+                parent_block_id: None,
+                rank: r,
+                kind: new_e.1,
+                markdown: new_e.2,
+                provenance: prov,
+                version: 1
+              )
+            )
+            k += 1
+          end
+          prev_rank = cur_left
+          i = j
+      end
+    end
+    out
+  else
+    var out = []
+    var fresh_idx = 0
+    for (pos0, entry) in staged.enumerate
+      new_rank = "i#{sync_zero_pad4(pos0 + 1)}"
+      case entry.0
+        Some(ob):
+          if ob.kind == entry.1 and ob.markdown == entry.2 and ob.rank == new_rank
+            out = out.append(ob)
+          else
+            out = out.append(
+              Block(
+                id: ob.id,
+                page_id: page_id,
+                parent_block_id: ob.parent_block_id,
+                rank: new_rank,
+                kind: entry.1,
+                markdown: entry.2,
+                provenance: prov,
+                version: ob.version + 1
+              )
+            )
+          end
+        None:
+          fresh_idx += 1
+          fid = "blk_#{id_prefix}_#{sync_zero_pad4(fresh_idx)}"
+          out = out.append(
+            Block(
+              id: fid,
+              page_id: page_id,
+              parent_block_id: None,
+              rank: new_rank,
+              kind: entry.1,
+              markdown: entry.2,
+              provenance: prov,
+              version: 1
+            )
+          )
+      end
+    end
+    out
+  end
+end
+
+## Computes minimal ordered surgical `(BlockOp list, new_ids)` transforming `existing` into `incoming`.
+fn diff_blocks_to_ops(existing: List(Block), incoming: List(Block)) : (List(BlockOp), List(Text))
+  sorted_old = sort_blocks(existing)
+  sorted_new = sort_blocks(incoming)
+  var old_by_id = {}
+  for ob in sorted_old
+    old_by_id = old_by_id.set(ob.id, ob)
+  end
+  new_id_set = sorted_new.map(fn(b) b.id end).to_set
+
+  var ops = []
+  var new_ids = []
+  var sim = []
+
+  # 1. Deletes for blocks absent in incoming
+  for ob in sorted_old
+    if new_id_set.has?(ob.id)
+      sim = sim.append(ob)
+    else
+      ops = ops.append(DeleteBlock(block_id: ob.id, expected_version: ob.version))
+    end
+  end
+
+  # 2. Replaces for surviving blocks with changed kind or markdown
+  for nb in sorted_new
+    case old_by_id.get(nb.id)
+      Some(ob):
+        if ob.kind != nb.kind or ob.markdown != nb.markdown
+          ops = ops.append(
+            ReplaceBlock(
+              block_id: ob.id,
+              expected_version: ob.version,
+              kind: Some(nb.kind),
+              markdown: nb.markdown
+            )
+          )
+        end
+      None: Unit
+    end
+  end
+
+  # 3. Inserts and MoveBlocks simulating exact post-op position in `sim`
+  var prev_id_opt = None
+  for nb in sorted_new
+    expected_pos = case prev_id_opt
+      None: 0
+      Some(pid): (find_block_idx(sim, pid) or -1) + 1
+    end
+    case old_by_id.get(nb.id)
+      None:
+        ops = ops.append(
+          InsertBlockAfter(
+            after_block_id: prev_id_opt,
+            parent_block_id: nb.parent_block_id,
+            kind: nb.kind,
+            markdown: nb.markdown
+          )
+        )
+        new_ids = new_ids.append(nb.id)
+        sim = sim.take(expected_pos).append(nb).concat(sim.drop(expected_pos))
+      Some(ob):
+        cur_pos = find_block_idx(sim, ob.id) or -1
+        if cur_pos != expected_pos or ob.parent_block_id != nb.parent_block_id
+          ops = ops.append(
+            MoveBlock(
+              block_id: ob.id,
+              new_parent_id: nb.parent_block_id,
+              after_block_id: prev_id_opt
+            )
+          )
+          without = sim.remove_at(cur_pos) or sim
+          ins_pos = case prev_id_opt
+            None: 0
+            Some(pid): (find_block_idx(without, pid) or -1) + 1
+          end
+          sim = without.take(ins_pos).append(ob).concat(without.drop(ins_pos))
+        end
+    end
+    prev_id_opt = Some(nb.id)
+  end
+
+  (ops, new_ids)
+end
+
+test "diff_blocks_to_ops round-trips edits, inserts, deletes, reorders, and no-ops via apply_block_ops"
+  t0 = Time.parse("2026-12-05T10:00:00Z") or stop "t0"
+  prov = Provenance(
+    author_id: "usr_ada",
+    author_kind: HumanAuthor,
+    grant_id: None,
+    proposal_id: None,
+    reason: Some("sync diff"),
+    citations: [],
+    updated_at: t0
+  )
+  b1 = Block(
+    id: "blk_1",
+    page_id: "pg_d",
+    parent_block_id: None,
+    rank: "i0001",
+    kind: Heading(level: 2),
+    markdown: "Intro",
+    provenance: prov,
+    version: 1
+  )
+  b2 = Block(
+    id: "blk_2",
+    page_id: "pg_d",
+    parent_block_id: None,
+    rank: "i0002",
+    kind: Paragraph,
+    markdown: "Original paragraph.",
+    provenance: prov,
+    version: 1
+  )
+  b3 = Block(
+    id: "blk_3",
+    page_id: "pg_d",
+    parent_block_id: None,
+    rank: "i0003",
+    kind: Paragraph,
+    markdown: "To be deleted.",
+    provenance: prov,
+    version: 1
+  )
+  existing = [b1, b2, b3]
+
+  (noop_ops, noop_ids) = diff_blocks_to_ops(existing, existing)
+  assert noop_ops.empty?
+  assert noop_ids.empty?
+
+  # Swap b2 before b1, edit b2, delete b3, insert new block between b2 and b1
+  local_md = "<!-- blk:blk_2 -->\nEdited paragraph.\n\nInserted paragraph.\n\n<!-- blk:blk_1 -->\n## Intro"
+  incoming = reconcile_blocks_from_markdown("pg_d", existing, local_md, prov, "sync1")
+  assert incoming.size == 3
+  (ops, new_ids) = diff_blocks_to_ops(existing, incoming)
+  assert not ops.empty?
+  applied = case apply_block_ops(existing, ops, "pg_d", prov, new_ids)
+    Ok(xs): xs
+    Error(_): stop "apply_block_ops"
+  end
+  assert applied.map(fn(b) (b.id, b.markdown) end) == incoming.map(fn(b) (b.id, b.markdown) end)
 end

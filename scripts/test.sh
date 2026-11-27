@@ -38,6 +38,7 @@ mo check domain/feed-bridge.mo
 mo check domain/taint-bridge.mo
 mo check domain/rlm.mo
 mo check domain/packs.mo
+mo check domain/sync.mo
 mo check domain/collab.mo
 mo check domain/notion-import.mo
 mo check db.mo
@@ -49,6 +50,8 @@ mo check routes/mcp.mo
 mo check routes/importer.mo
 mo check routes/ai.mo
 mo check routes/packs.mo
+mo check routes/sync.mo
+mo check sync.mo
 mo check main.mo
 
 mo test domain/blocks.mo
@@ -56,9 +59,11 @@ mo test domain/policy.mo
 mo test domain/database-model.mo
 mo test domain/blueprints.mo
 mo test domain/packs.mo
+mo test domain/sync.mo
 mo test domain/rlm.mo
 mo test domain/collab.mo
 mo test domain/notion-import.mo
+mo test sync.mo
 mo test db.mo
 mo test main.mo
 
