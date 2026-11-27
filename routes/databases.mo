@@ -237,6 +237,106 @@ fn validate_view_def(def: DatabaseDef, v: DbViewDef) : Option(Text)
           return Some("CalendarView references unknown card property '#{pid}'")
         end
       end
+    GalleryView(cover_prop_id: cp_opt, card_prop_ids: cpids, card_size: sz):
+      case cp_opt
+        Some(cp) if not cp.trim.empty?:
+          cprop = case find_prop(def, cp)
+            Some(p): p
+            None: return Some("GalleryView cover_prop_id '#{cp}' not found")
+          end
+          case cprop.kind
+            Url | RichText | Title: Unit
+            Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
+              options: _
+            ) | Checkbox | Person | Relation(target_db_id: _, inverse_prop_id: _) | Rollup(
+              relation_prop_id: _,
+              target_prop_id: _,
+              agg: _
+            ) | AiDerived(
+              prompt: _,
+              source_prop_ids: _,
+              include_row_body: _,
+              output_kind: _,
+              mode: _,
+              daily_call_cap: _
+            ): return Some("GalleryView cover_prop_id '#{cp}' must be Url, RichText, or Title")
+          end
+        Some(_) | None: Unit
+      end
+      if sz != "" and sz != "sm" and sz != "md" and sz != "lg"
+        return Some("GalleryView card_size must be 'sm', 'md', or 'lg'")
+      end
+      for pid in cpids
+        if find_prop(def, pid) == None
+          return Some("GalleryView references unknown card property '#{pid}'")
+        end
+      end
+    TimelineView(start_date_prop_id: sp_id, end_date_prop_id: ep_opt, card_prop_ids: cpids):
+      sp_prop = case find_prop(def, sp_id)
+        Some(p): p
+        None: return Some("TimelineView start_date_prop_id '#{sp_id}' not found")
+      end
+      case sp_prop.kind
+        DateProp(include_time: _) | AiDerived(
+          prompt: _,
+          source_prop_ids: _,
+          include_row_body: _,
+          output_kind: AiDate,
+          mode: _,
+          daily_call_cap: _
+        ): Unit
+        Title | RichText | Number(format: _) | Select(options: _) | MultiSelect(options: _) | Checkbox | Person | Url | Relation(
+          target_db_id: _,
+          inverse_prop_id: _
+        ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
+          prompt: _,
+          source_prop_ids: _,
+          include_row_body: _,
+          output_kind: _,
+          mode: _,
+          daily_call_cap: _
+        ): return Some(
+          "TimelineView start_date_prop_id '#{sp_id}' must be a DateProp or AI Date column"
+        )
+      end
+      case ep_opt
+        Some(ep) if not ep.trim.empty?:
+          ep_prop = case find_prop(def, ep)
+            Some(p): p
+            None: return Some("TimelineView end_date_prop_id '#{ep}' not found")
+          end
+          case ep_prop.kind
+            DateProp(include_time: _) | AiDerived(
+              prompt: _,
+              source_prop_ids: _,
+              include_row_body: _,
+              output_kind: AiDate,
+              mode: _,
+              daily_call_cap: _
+            ): Unit
+            Title | RichText | Number(format: _) | Select(options: _) | MultiSelect(
+              options: _
+            ) | Checkbox | Person | Url | Relation(
+              target_db_id: _,
+              inverse_prop_id: _
+            ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
+              prompt: _,
+              source_prop_ids: _,
+              include_row_body: _,
+              output_kind: _,
+              mode: _,
+              daily_call_cap: _
+            ): return Some(
+              "TimelineView end_date_prop_id '#{ep}' must be a DateProp or AI Date column"
+            )
+          end
+        Some(_) | None: Unit
+      end
+      for pid in cpids
+        if find_prop(def, pid) == None
+          return Some("TimelineView references unknown card property '#{pid}'")
+        end
+      end
   end
   for f in v.filters
     if find_prop(def, f.prop_id) == None
@@ -1169,6 +1269,9 @@ fn query_database(
             CalendarView(date_prop_id: dp_id, card_prop_ids: _):
               ranged = DatabaseModel.filter_calendar_range(sorted, dp_id, from_d, to_d)
               (ranged, None)
+            GalleryView(cover_prop_id: _, card_prop_ids: _, card_size: _): (sorted, None)
+            TimelineView(start_date_prop_id: sp_id, end_date_prop_id: ep_opt, card_prop_ids: _):
+              (DatabaseModel.filter_timeline_range(sorted, sp_id, ep_opt, from_d, to_d), None)
           end
         None: (sorted, None)
       end

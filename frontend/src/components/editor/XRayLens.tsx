@@ -1,9 +1,24 @@
-import { Activity, AlertTriangle, Bot, Calculator, GitPullRequest, Layers, Shield, User } from "lucide-react";
+import { Link } from "@inertiajs/react";
+import {
+  Activity,
+  AlertTriangle,
+  Bot,
+  Calculator,
+  GitPullRequest,
+  History,
+  Layers,
+  Shield,
+  User,
+} from "lucide-react";
+import { useEffect, useState } from "react";
+import { ApiError, apiFetch } from "../../lib/api";
 import type {
   AuditFeedItem,
   Block,
   GardenCitationDrift,
   Page,
+  PageHistoryResponse,
+  PageTimeTravelResponse,
   ResolvedMetric,
 } from "../../lib/types";
 import { formatNumberCell, formatSignedDecimal } from "../database/InlineCellEditor";
@@ -32,9 +47,153 @@ export default function XRayLens({
   onInspectBlock,
 }: XRayLensProps) {
   const metricEntries = Object.values(resolvedMetrics);
+  const [history, setHistory] = useState<PageHistoryResponse | null>(null);
+  const [historyErr, setHistoryErr] = useState<string | null>(null);
+  const [selectedStopIdx, setSelectedStopIdx] = useState<number>(-1);
+  const [ttPreview, setTtPreview] = useState<PageTimeTravelResponse | null>(null);
+  const [ttLoading, setTtLoading] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setHistoryErr(null);
+    apiFetch<PageHistoryResponse>(`/api/pages/${page.id}/history`)
+      .then((res) => {
+        if (cancelled) return;
+        setHistory(res);
+        setSelectedStopIdx(res.stops.length > 0 ? res.stops.length - 1 : -1);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setHistoryErr(err instanceof ApiError ? err.message : "Could not load page replay history");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [page.id, page.version]);
+
+  async function scrubToStop(idx: number) {
+    if (!history || idx < 0 || idx >= history.stops.length) return;
+    setSelectedStopIdx(idx);
+    const stop = history.stops[idx];
+    setTtLoading(true);
+    setHistoryErr(null);
+    try {
+      const res = await apiFetch<PageTimeTravelResponse>(
+        `/api/pages/${page.id}/time-travel?stop_before_seq=${stop.stop_before_seq}`
+      );
+      setTtPreview(res);
+    } catch (err) {
+      setHistoryErr(err instanceof ApiError ? err.message : "Time-travel simulation failed");
+    } finally {
+      setTtLoading(false);
+    }
+  }
 
   return (
     <div className="space-y-6">
+      {/* Modb.Replay Interactive Point-in-Time Scrubber */}
+      <section className="rounded-2xl border border-stone-200 bg-white p-5 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2 text-sm font-semibold text-stone-900">
+            <History className="h-4 w-4 text-amber-700" />
+            Modb.Replay Time-Travel Scrubber
+          </div>
+          {history?.can_scrub ? (
+            <span className="rounded-full bg-amber-50 border border-amber-200 px-2.5 py-0.5 text-[11px] font-medium text-amber-900">
+              {history.stops.length} checkpoint{history.stops.length === 1 ? "" : "s"} · Offline Read-Only CoW
+            </span>
+          ) : (
+            <Link
+              href="/admin"
+              className="text-[11px] font-medium text-blue-700 hover:underline"
+            >
+              Pin CoW Baseline in Admin →
+            </Link>
+          )}
+        </div>
+
+        {historyErr && <div className="text-xs text-red-700">{historyErr}</div>}
+
+        {history && !history.can_scrub && (
+          <p className="text-xs text-stone-500">
+            Pin a <code className="font-mono">Modb.Replay</code> CoW baseline in{" "}
+            <Link href="/admin" className="text-blue-700 hover:underline">
+              Admin → Selective Undo
+            </Link>{" "}
+            to scrub historical revisions of <span className="font-medium">{page.title}</span>.
+          </p>
+        )}
+
+        {history?.can_scrub && history.stops.length > 0 && (
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center gap-3">
+              <input
+                type="range"
+                min={0}
+                max={history.stops.length - 1}
+                value={selectedStopIdx >= 0 ? selectedStopIdx : history.stops.length - 1}
+                onChange={(e) => void scrubToStop(Number(e.target.value))}
+                className="flex-1 accent-amber-700 cursor-pointer"
+                aria-label="Time-travel checkpoint slider"
+              />
+              {ttLoading && (
+                <span className="text-[11px] text-amber-700 font-medium">Replaying...</span>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {history.stops.map((st, idx) => {
+                const active = selectedStopIdx === idx;
+                return (
+                  <button
+                    key={`${st.seq}-${idx}`}
+                    type="button"
+                    onClick={() => void scrubToStop(idx)}
+                    className={`rounded-lg border px-2.5 py-1 text-[11px] font-medium transition ${
+                      active
+                        ? "border-amber-700 bg-amber-700 text-white"
+                        : "border-stone-200 bg-stone-50 text-stone-700 hover:bg-stone-100"
+                    }`}
+                  >
+                    {st.label}
+                  </button>
+                );
+              })}
+            </div>
+            {selectedStopIdx >= 0 && history.stops[selectedStopIdx] && (
+              <div className="rounded-lg border border-stone-100 bg-stone-50 px-3 py-2 text-xs text-stone-600 flex flex-wrap items-center justify-between gap-2">
+                <span>
+                  <strong>{history.stops[selectedStopIdx].action}</strong> ·{" "}
+                  {history.stops[selectedStopIdx].reason}
+                </span>
+                <span className="font-mono text-[11px] text-stone-400">
+                  {history.stops[selectedStopIdx].at}
+                </span>
+              </div>
+            )}
+            {ttPreview && (
+              <div className="rounded-xl border border-amber-200 bg-amber-50/40 p-3.5 space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <div className="font-semibold text-amber-950">
+                    {ttPreview.existed_at_point
+                      ? `Historical Snapshot (stop_before_seq=${ttPreview.stop_before_seq})`
+                      : `Page did not exist at stop_before_seq=${ttPreview.stop_before_seq}`}
+                  </div>
+                  <span className="rounded-full bg-white border border-amber-200 px-2 py-0.5 font-mono text-[11px] text-amber-900">
+                    {ttPreview.ops_to_live_count} block diff{ttPreview.ops_to_live_count === 1 ? "" : "s"} vs Live
+                  </span>
+                </div>
+                {ttPreview.existed_at_point && (
+                  <pre className="rounded-lg bg-stone-950 text-stone-100 p-3 text-[11px] font-mono leading-relaxed whitespace-pre-wrap max-h-56 overflow-y-auto">
+                    {ttPreview.historical_markdown || "(empty document at this checkpoint)"}
+                  </pre>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+
       {citationDrifts.length > 0 && (
         <section className="rounded-2xl border border-amber-300 bg-amber-50/70 p-5 space-y-3">
           <div className="flex items-center justify-between gap-2">

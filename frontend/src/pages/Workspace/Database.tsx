@@ -2,11 +2,13 @@ import { Link, router } from "@inertiajs/react";
 import {
   Bot,
   Calendar as CalIcon,
+  CalendarRange,
   Check,
   Columns,
   Copy,
   GitBranch,
   Layers,
+  LayoutGrid,
   Pencil,
   Play,
   Plus,
@@ -90,6 +92,8 @@ function encodeInputToCell(prop: PropertyDef, raw: string): CellValue {
 function viewKindIcon(kind: DbViewKind) {
   if ("board_view" in kind) return <Columns className="h-3.5 w-3.5" />;
   if ("calendar_view" in kind) return <CalIcon className="h-3.5 w-3.5" />;
+  if ("gallery_view" in kind) return <LayoutGrid className="h-3.5 w-3.5" />;
+  if ("timeline_view" in kind) return <CalendarRange className="h-3.5 w-3.5" />;
   return <Table2 className="h-3.5 w-3.5" />;
 }
 
@@ -117,12 +121,16 @@ export default function DatabaseView({
   const [activeScenario, setActiveScenario] = useState<ProposalMeta | null>(null);
   const [scenarioData, setScenarioData] = useState<ScenarioQueryResponse | null>(null);
 
-  const [mode, setMode] = useState<"table" | "board" | "calendar">(() => {
-    const firstKind = initialViews[0]?.kind;
-    if (firstKind && "board_view" in firstKind) return "board";
-    if (firstKind && "calendar_view" in firstKind) return "calendar";
-    return "table";
-  });
+  const [mode, setMode] = useState<"table" | "board" | "calendar" | "gallery" | "timeline">(
+    () => {
+      const firstKind = initialViews[0]?.kind;
+      if (firstKind && "board_view" in firstKind) return "board";
+      if (firstKind && "calendar_view" in firstKind) return "calendar";
+      if (firstKind && "gallery_view" in firstKind) return "gallery";
+      if (firstKind && "timeline_view" in firstKind) return "timeline";
+      return "table";
+    }
+  );
   const [filterProp, setFilterProp] = useState<string>("");
   const [filterOp, setFilterOp] = useState<FilterOp>("eq");
   const [filterVal, setFilterVal] = useState<string>("");
@@ -139,9 +147,14 @@ export default function DatabaseView({
   const [renameViewName, setRenameViewName] = useState("");
   const [newViewOpen, setNewViewOpen] = useState(false);
   const [newViewName, setNewViewName] = useState("");
-  const [newViewType, setNewViewType] = useState<"table" | "board" | "calendar">("table");
+  const [newViewType, setNewViewType] = useState<
+    "table" | "board" | "calendar" | "gallery" | "timeline"
+  >("table");
   const [newViewGroupBy, setNewViewGroupBy] = useState("");
   const [newViewDateProp, setNewViewDateProp] = useState("");
+  const [newViewCoverProp, setNewViewCoverProp] = useState("");
+  const [newViewCardSize, setNewViewCardSize] = useState<"sm" | "md" | "lg">("md");
+  const [newViewEndDateProp, setNewViewEndDateProp] = useState("");
 
   // Drawers & Modals
   const [schemaDrawerOpen, setSchemaDrawerOpen] = useState(false);
@@ -293,6 +306,54 @@ export default function DatabaseView({
     return dateProps[0] ?? null;
   }, [activeDb.properties, activeView, dateProps]);
 
+  const coverProps = useMemo(
+    () =>
+      activeDb.properties.filter(
+        (p) => p.kind === "url" || p.kind === "rich_text" || p.kind === "title"
+      ),
+    [activeDb.properties]
+  );
+
+  const galleryCoverProp = useMemo(() => {
+    if (activeView && "gallery_view" in activeView.kind) {
+      const cid = activeView.kind.gallery_view.cover_prop_id;
+      if (cid) {
+        const found = activeDb.properties.find((p) => p.id === cid);
+        if (found) return found;
+      }
+      return null;
+    }
+    return activeDb.properties.find((p) => p.kind === "url") ?? null;
+  }, [activeDb.properties, activeView]);
+
+  const galleryCardSize = useMemo(() => {
+    if (activeView && "gallery_view" in activeView.kind) {
+      const sz = activeView.kind.gallery_view.card_size;
+      if (sz === "sm" || sz === "lg" || sz === "md") return sz;
+    }
+    return "md" as const;
+  }, [activeView]);
+
+  const timelineStartProp = useMemo(() => {
+    if (activeView && "timeline_view" in activeView.kind) {
+      const sp = activeView.kind.timeline_view.start_date_prop_id;
+      const found = activeDb.properties.find((p) => p.id === sp);
+      if (found) return found;
+    }
+    return dateProps[0] ?? null;
+  }, [activeDb.properties, activeView, dateProps]);
+
+  const timelineEndProp = useMemo(() => {
+    if (activeView && "timeline_view" in activeView.kind) {
+      const ep = activeView.kind.timeline_view.end_date_prop_id;
+      if (ep) {
+        const found = activeDb.properties.find((p) => p.id === ep);
+        if (found) return found;
+      }
+    }
+    return dateProps[1] ?? null;
+  }, [activeDb.properties, activeView, dateProps]);
+
   const firstSelectProp = useMemo(
     () =>
       activeDb.properties.find((p) => typeof p.kind === "object" && "select" in p.kind) ?? null,
@@ -404,6 +465,8 @@ export default function DatabaseView({
     setActiveViewId(v.id);
     if ("board_view" in v.kind) setMode("board");
     else if ("calendar_view" in v.kind) setMode("calendar");
+    else if ("gallery_view" in v.kind) setMode("gallery");
+    else if ("timeline_view" in v.kind) setMode("timeline");
     else setMode("table");
 
     const f0 = v.filters[0];
@@ -627,12 +690,31 @@ export default function DatabaseView({
                 card_prop_ids: activeDb.properties.slice(0, 2).map((p) => p.id),
               },
             }
-          : {
-              table_view: {
-                visible_prop_ids: activeDb.properties.map((p) => p.id),
-                column_widths: {},
-              },
-            };
+          : mode === "gallery"
+            ? {
+                gallery_view: {
+                  cover_prop_id: galleryCoverProp?.id ?? null,
+                  card_prop_ids: activeDb.properties.slice(0, 4).map((p) => p.id),
+                  card_size: galleryCardSize,
+                },
+              }
+            : mode === "timeline" && timelineStartProp
+              ? {
+                  timeline_view: {
+                    start_date_prop_id: timelineStartProp.id,
+                    end_date_prop_id:
+                      timelineEndProp && timelineEndProp.id !== timelineStartProp.id
+                        ? timelineEndProp.id
+                        : null,
+                    card_prop_ids: activeDb.properties.slice(0, 3).map((p) => p.id),
+                  },
+                }
+              : {
+                  table_view: {
+                    visible_prop_ids: activeDb.properties.map((p) => p.id),
+                    column_widths: {},
+                  },
+                };
 
     if (activeView) {
       setBusy(true);
@@ -847,6 +929,54 @@ export default function DatabaseView({
     return Array.from(byDate.entries()).sort((a, b) => a[0].localeCompare(b[0]));
   }, [rows, dateProp]);
 
+  const timelineData = useMemo(() => {
+    if (!timelineStartProp) {
+      return { scheduled: [] as Array<{ er: EnrichedRow; startIso: string; endIso: string; leftPct: number; widthPct: number }>, unscheduled: rows, ticks: [] as string[] };
+    }
+    const items: Array<{ er: EnrichedRow; startIso: string; endIso: string; startMs: number; endMs: number }> = [];
+    const unscheduled: EnrichedRow[] = [];
+    for (const er of rows) {
+      const sc = getEffectiveCell(er, timelineStartProp.id);
+      if (!sc || typeof sc !== "object" || !("date_val" in sc)) {
+        unscheduled.push(er);
+        continue;
+      }
+      const startIso = sc.date_val.start;
+      const ec = timelineEndProp ? getEffectiveCell(er, timelineEndProp.id) : null;
+      const explicitEnd =
+        ec && typeof ec === "object" && "date_val" in ec
+          ? ec.date_val.end_date ?? ec.date_val.start
+          : null;
+      const endIso = explicitEnd ?? sc.date_val.end_date ?? startIso;
+      const startMs = Date.parse(startIso);
+      const rawEndMs = Date.parse(endIso);
+      if (!Number.isFinite(startMs)) {
+        unscheduled.push(er);
+        continue;
+      }
+      const endMs = Number.isFinite(rawEndMs) && rawEndMs >= startMs ? rawEndMs : startMs;
+      items.push({ er, startIso, endIso, startMs, endMs });
+    }
+    if (items.length === 0) {
+      return { scheduled: [], unscheduled, ticks: [] as string[] };
+    }
+    const DAY = 86400000;
+    const minMs = Math.min(...items.map((it) => it.startMs));
+    const maxMs = Math.max(...items.map((it) => it.endMs));
+    const spanMs = Math.max(DAY, maxMs - minMs + DAY);
+    const fmt = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+    const ticks = [0, 0.33, 0.66, 1].map((frac) => fmt(minMs + Math.round((spanMs - DAY) * frac)));
+    const scheduled = items
+      .sort((a, b) => a.startMs - b.startMs)
+      .map((it) => {
+        const leftPct = Math.max(0, Math.min(96, ((it.startMs - minMs) / spanMs) * 100));
+        const rawW = ((it.endMs - it.startMs + DAY) / spanMs) * 100;
+        const widthPct = Math.max(4, Math.min(100 - leftPct, rawW));
+        return { er: it.er, startIso: it.startIso, endIso: it.endIso, leftPct, widthPct };
+      });
+    return { scheduled, unscheduled, ticks };
+  }, [rows, timelineStartProp, timelineEndProp]);
+
   const runQueryRef = useRef(runQuery);
   runQueryRef.current = runQuery;
   const activeScenarioRef = useRef(activeScenario);
@@ -1039,6 +1169,26 @@ export default function DatabaseView({
                   <CalIcon className="h-3.5 w-3.5" />
                   Calendar
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setMode("gallery")}
+                  className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1 font-medium ${
+                    mode === "gallery" ? "bg-white text-stone-900 shadow-2xs" : "text-stone-500"
+                  }`}
+                >
+                  <LayoutGrid className="h-3.5 w-3.5" />
+                  Gallery
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMode("timeline")}
+                  className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1 font-medium ${
+                    mode === "timeline" ? "bg-white text-stone-900 shadow-2xs" : "text-stone-500"
+                  }`}
+                >
+                  <CalendarRange className="h-3.5 w-3.5" />
+                  Timeline
+                </button>
               </div>
             </div>
           </div>
@@ -1104,6 +1254,9 @@ export default function DatabaseView({
                   setNewViewName("");
                   setNewViewGroupBy(groupableProps[0]?.id ?? "");
                   setNewViewDateProp(dateProps[0]?.id ?? "");
+                  setNewViewEndDateProp(dateProps[1]?.id ?? "");
+                  setNewViewCoverProp(coverProps[0]?.id ?? "");
+                  setNewViewCardSize("md");
                   setNewViewOpen((prev) => !prev);
                 }}
                 className="inline-flex items-center gap-1 rounded-lg border border-dashed border-stone-300 px-2.5 py-1.5 text-xs font-medium text-stone-500 hover:border-stone-400 hover:text-stone-800"
@@ -1172,12 +1325,18 @@ export default function DatabaseView({
               />
               <select
                 value={newViewType}
-                onChange={(e) => setNewViewType(e.target.value as "table" | "board" | "calendar")}
+                onChange={(e) =>
+                  setNewViewType(
+                    e.target.value as "table" | "board" | "calendar" | "gallery" | "timeline"
+                  )
+                }
                 className="rounded-md border border-stone-200 bg-white px-2.5 py-1.5"
               >
                 <option value="table">Table View</option>
                 <option value="board">Kanban Board</option>
                 <option value="calendar">Calendar View</option>
+                <option value="gallery">Gallery View</option>
+                <option value="timeline">Timeline View</option>
               </select>
               {newViewType === "board" && (
                 <select
@@ -1193,13 +1352,15 @@ export default function DatabaseView({
                   ))}
                 </select>
               )}
-              {newViewType === "calendar" && (
+              {(newViewType === "calendar" || newViewType === "timeline") && (
                 <select
                   value={newViewDateProp}
                   onChange={(e) => setNewViewDateProp(e.target.value)}
                   className="rounded-md border border-stone-200 bg-white px-2.5 py-1.5"
                 >
-                  <option value="">Date column...</option>
+                  <option value="">
+                    {newViewType === "timeline" ? "Start date column..." : "Date column..."}
+                  </option>
                   {dateProps.map((dp) => (
                     <option key={dp.id} value={dp.id}>
                       {dp.name}
@@ -1207,13 +1368,52 @@ export default function DatabaseView({
                   ))}
                 </select>
               )}
+              {newViewType === "timeline" && (
+                <select
+                  value={newViewEndDateProp}
+                  onChange={(e) => setNewViewEndDateProp(e.target.value)}
+                  className="rounded-md border border-stone-200 bg-white px-2.5 py-1.5"
+                >
+                  <option value="">Optional end date column...</option>
+                  {dateProps.map((dp) => (
+                    <option key={dp.id} value={dp.id}>
+                      End: {dp.name}
+                    </option>
+                  ))}
+                </select>
+              )}
+              {newViewType === "gallery" && (
+                <>
+                  <select
+                    value={newViewCoverProp}
+                    onChange={(e) => setNewViewCoverProp(e.target.value)}
+                    className="rounded-md border border-stone-200 bg-white px-2.5 py-1.5"
+                  >
+                    <option value="">No cover column</option>
+                    {coverProps.map((cp) => (
+                      <option key={cp.id} value={cp.id}>
+                        Cover: {cp.name}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    value={newViewCardSize}
+                    onChange={(e) => setNewViewCardSize(e.target.value as "sm" | "md" | "lg")}
+                    className="rounded-md border border-stone-200 bg-white px-2.5 py-1.5"
+                  >
+                    <option value="sm">Small cards</option>
+                    <option value="md">Medium cards</option>
+                    <option value="lg">Large cards</option>
+                  </select>
+                </>
+              )}
               <button
                 type="button"
                 disabled={
                   busy ||
                   !newViewName.trim() ||
                   (newViewType === "board" && !newViewGroupBy) ||
-                  (newViewType === "calendar" && !newViewDateProp)
+                  ((newViewType === "calendar" || newViewType === "timeline") && !newViewDateProp)
                 }
                 onClick={() => {
                   const kind: DbViewKind =
@@ -1232,12 +1432,31 @@ export default function DatabaseView({
                               card_prop_ids: activeDb.properties.slice(0, 2).map((p) => p.id),
                             },
                           }
-                        : {
-                            table_view: {
-                              visible_prop_ids: activeDb.properties.map((p) => p.id),
-                              column_widths: {},
-                            },
-                          };
+                        : newViewType === "gallery"
+                          ? {
+                              gallery_view: {
+                                cover_prop_id: newViewCoverProp || null,
+                                card_prop_ids: activeDb.properties.slice(0, 4).map((p) => p.id),
+                                card_size: newViewCardSize,
+                              },
+                            }
+                          : newViewType === "timeline"
+                            ? {
+                                timeline_view: {
+                                  start_date_prop_id: newViewDateProp,
+                                  end_date_prop_id:
+                                    newViewEndDateProp && newViewEndDateProp !== newViewDateProp
+                                      ? newViewEndDateProp
+                                      : null,
+                                  card_prop_ids: activeDb.properties.slice(0, 3).map((p) => p.id),
+                                },
+                              }
+                            : {
+                                table_view: {
+                                  visible_prop_ids: activeDb.properties.map((p) => p.id),
+                                  column_widths: {},
+                                },
+                              };
                   void handleCreateView(newViewName, kind);
                 }}
                 className="rounded-lg bg-stone-900 px-3 py-1.5 font-medium text-white hover:bg-stone-800 disabled:opacity-50"
@@ -1736,6 +1955,224 @@ export default function DatabaseView({
                   </div>
                 </div>
               ))}
+          </div>
+        )}
+
+        {/* GALLERY VIEW */}
+        {mode === "gallery" && (
+          <div
+            className={`grid grid-cols-1 gap-4 ${
+              galleryCardSize === "sm"
+                ? "sm:grid-cols-2 lg:grid-cols-4"
+                : galleryCardSize === "lg"
+                  ? "sm:grid-cols-1 lg:grid-cols-2"
+                  : "sm:grid-cols-2 lg:grid-cols-3"
+            }`}
+          >
+            {rows.length === 0 && (
+              <div className="col-span-full rounded-xl border border-stone-200 bg-white p-6 text-center text-sm text-stone-400">
+                No rows match this Gallery view.
+              </div>
+            )}
+            {rows.map((er) => {
+              const title = getRowTitle(er, activeDb.properties);
+              const coverCell = galleryCoverProp ? getEffectiveCell(er, galleryCoverProp.id) : null;
+              const coverVal =
+                coverCell && typeof coverCell === "object"
+                  ? "url_val" in coverCell
+                    ? coverCell.url_val
+                    : "text_val" in coverCell
+                      ? coverCell.text_val
+                      : null
+                  : null;
+              const isImg =
+                coverVal &&
+                (coverVal.startsWith("http://") ||
+                  coverVal.startsWith("https://") ||
+                  coverVal.startsWith("/api/attachments/"));
+              const rowChange = scenarioData?.row_changes[er.row.id];
+              const cardProps = activeDb.properties.filter(
+                (p) => p.kind !== "title" && p.id !== galleryCoverProp?.id
+              );
+              return (
+                <div
+                  key={er.row.id}
+                  className="rounded-2xl border border-stone-200 bg-white overflow-hidden shadow-2xs flex flex-col"
+                >
+                  {isImg ? (
+                    <img
+                      src={coverVal}
+                      alt={title}
+                      className={`w-full object-cover bg-stone-100 ${
+                        galleryCardSize === "lg" ? "h-44" : galleryCardSize === "sm" ? "h-24" : "h-32"
+                      }`}
+                    />
+                  ) : (
+                    <div className="h-3 bg-gradient-to-r from-teal-500/70 via-blue-500/70 to-indigo-500/70" />
+                  )}
+                  <div className="p-4 space-y-2.5 flex-1">
+                    <div className="flex items-start justify-between gap-2">
+                      <Link
+                        href={`/p/${er.row.page_id}`}
+                        className="text-sm font-semibold text-stone-900 hover:text-blue-700 hover:underline truncate"
+                      >
+                        {title}
+                      </Link>
+                      {rowChange && (
+                        <span
+                          className={`rounded-full px-1.5 py-0.5 text-[9px] font-semibold uppercase ${
+                            rowChange === "added"
+                              ? "bg-emerald-100 text-emerald-800"
+                              : "bg-amber-100 text-amber-800"
+                          }`}
+                        >
+                          {rowChange}
+                        </span>
+                      )}
+                    </div>
+                    {coverVal && !isImg && (
+                      <div className="text-xs text-stone-500 truncate">{coverVal}</div>
+                    )}
+                    <div className="space-y-1.5 pt-1 border-t border-stone-100 text-xs">
+                      {cardProps.slice(0, 4).map((cp) => (
+                        <div key={cp.id} className="flex items-center justify-between gap-2">
+                          <span className="text-[11px] text-stone-400 shrink-0">{cp.name}</span>
+                          <div className="min-w-0">
+                            <InlineCellEditor
+                              er={er}
+                              prop={cp}
+                              database={activeDb}
+                              databases={databases}
+                              principals={principals}
+                              relationTargets={relationTargets}
+                              disabled={busy}
+                              onCommit={(val) => handleUpdateRowCell(er, cp.id, val)}
+                            />
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* TIMELINE VIEW */}
+        {mode === "timeline" && (
+          <div className="space-y-4">
+            {!timelineStartProp ? (
+              <div className="rounded-xl border border-stone-200 bg-white p-6 text-sm text-stone-500">
+                Add a Date property in Columns to render items on a Timeline.
+              </div>
+            ) : (
+              <div className="rounded-2xl border border-stone-200 bg-white overflow-hidden">
+                {/* Date Axis Header */}
+                {timelineData.ticks.length > 0 && (
+                  <div className="grid grid-cols-12 border-b border-stone-200 bg-stone-50 px-4 py-2 text-[11px] font-mono text-stone-500">
+                    <div className="col-span-4 font-sans font-semibold text-stone-700">
+                      Item ({timelineData.scheduled.length} scheduled)
+                    </div>
+                    <div className="col-span-8 flex items-center justify-between">
+                      {timelineData.ticks.map((tk, idx) => (
+                        <span key={`${tk}-${idx}`}>{tk}</span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <div className="divide-y divide-stone-100">
+                  {timelineData.scheduled.length === 0 && (
+                    <div className="p-6 text-center text-xs text-stone-400">
+                      No scheduled rows with valid {timelineStartProp.name} dates yet.
+                    </div>
+                  )}
+                  {timelineData.scheduled.map(({ er, startIso, endIso, leftPct, widthPct }) => {
+                    const rowChange = scenarioData?.row_changes[er.row.id];
+                    return (
+                      <div
+                        key={er.row.id}
+                        className="grid grid-cols-12 items-center px-4 py-2.5 gap-3 text-xs hover:bg-stone-50/70"
+                      >
+                        <div className="col-span-4 flex items-center justify-between gap-2 min-w-0">
+                          <Link
+                            href={`/p/${er.row.page_id}`}
+                            className="font-medium text-stone-900 hover:text-blue-700 hover:underline truncate"
+                          >
+                            {getRowTitle(er, activeDb.properties)}
+                          </Link>
+                          <div className="shrink-0">
+                            <InlineCellEditor
+                              er={er}
+                              prop={timelineStartProp}
+                              database={activeDb}
+                              databases={databases}
+                              principals={principals}
+                              relationTargets={relationTargets}
+                              disabled={busy}
+                              onCommit={(val) => handleUpdateRowCell(er, timelineStartProp.id, val)}
+                            />
+                          </div>
+                        </div>
+                        <div className="col-span-8 relative h-7 rounded-md bg-stone-100/80 overflow-hidden">
+                          <div
+                            style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
+                            className={`absolute top-1 bottom-1 rounded-md px-2 flex items-center justify-between text-[10px] font-mono text-white truncate shadow-2xs ${
+                              rowChange === "added"
+                                ? "bg-emerald-600"
+                                : rowChange === "modified"
+                                  ? "bg-amber-600"
+                                  : "bg-blue-600"
+                            }`}
+                            title={`${startIso} → ${endIso}`}
+                          >
+                            <span className="truncate">
+                              {startIso}
+                              {endIso !== startIso ? ` → ${endIso}` : ""}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {timelineData.unscheduled.length > 0 && (
+                  <div className="border-t border-stone-200 bg-stone-50/50 p-4 space-y-2">
+                    <div className="text-[11px] font-semibold text-stone-600">
+                      Unscheduled ({timelineData.unscheduled.length}) — click to assign{" "}
+                      {timelineStartProp.name}
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {timelineData.unscheduled.map((er) => (
+                        <div
+                          key={er.row.id}
+                          className="rounded-lg border border-stone-200 bg-white px-3 py-1.5 flex items-center gap-2 text-xs"
+                        >
+                          <Link
+                            href={`/p/${er.row.page_id}`}
+                            className="font-medium text-stone-800 hover:underline"
+                          >
+                            {getRowTitle(er, activeDb.properties)}
+                          </Link>
+                          <InlineCellEditor
+                            er={er}
+                            prop={timelineStartProp}
+                            database={activeDb}
+                            databases={databases}
+                            principals={principals}
+                            relationTargets={relationTargets}
+                            disabled={busy}
+                            onCommit={(val) => handleUpdateRowCell(er, timelineStartProp.id, val)}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
 

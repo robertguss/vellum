@@ -1,5 +1,14 @@
 import { Link } from "@inertiajs/react";
-import { ArrowUpRight, Database as DbIcon, Kanban, Plus, RefreshCw, Table as TableIcon } from "lucide-react";
+import {
+  ArrowUpRight,
+  CalendarRange,
+  Database as DbIcon,
+  Kanban,
+  LayoutGrid,
+  Plus,
+  RefreshCw,
+  Table as TableIcon,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ApiError, apiFetch } from "../lib/api";
 import type {
@@ -58,7 +67,7 @@ export default function EmbeddedDatabase({
   );
   const [scenarioData, setScenarioData] = useState<ScenarioQueryResponse | null>(null);
   const [selectedViewId, setSelectedViewId] = useState<string | null>(viewId);
-  const [mode, setMode] = useState<"table" | "board">("table");
+  const [mode, setMode] = useState<"table" | "board" | "gallery" | "timeline">("table");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [newRowTitle, setNewRowTitle] = useState("");
@@ -87,8 +96,11 @@ export default function EmbeddedDatabase({
       }
 
       const activeView = show.views.find((v) => v.id === effectiveViewId);
-      if (activeView && typeof activeView.kind === "object" && "board_view" in activeView.kind) {
-        setMode("board");
+      if (activeView && typeof activeView.kind === "object") {
+        if ("board_view" in activeView.kind) setMode("board");
+        else if ("gallery_view" in activeView.kind) setMode("gallery");
+        else if ("timeline_view" in activeView.kind) setMode("timeline");
+        else setMode("table");
       }
 
       if (activeScenarioId) {
@@ -322,6 +334,30 @@ export default function EmbeddedDatabase({
                 Board
               </button>
             )}
+            <button
+              type="button"
+              onClick={() => setMode("gallery")}
+              className={`inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium ${
+                mode === "gallery"
+                  ? "bg-stone-900 text-white"
+                  : "text-stone-500 hover:text-stone-800"
+              }`}
+            >
+              <LayoutGrid className="h-3 w-3" />
+              Gallery
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode("timeline")}
+              className={`inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium ${
+                mode === "timeline"
+                  ? "bg-stone-900 text-white"
+                  : "text-stone-500 hover:text-stone-800"
+              }`}
+            >
+              <CalendarRange className="h-3 w-3" />
+              Timeline
+            </button>
           </div>
           <button
             type="button"
@@ -436,6 +472,101 @@ export default function EmbeddedDatabase({
               })}
             </tbody>
           </table>
+        </div>
+      ) : mode === "gallery" ? (
+        <div className="p-3 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 bg-stone-50/40">
+          {rows.length === 0 && (
+            <div className="col-span-full py-4 text-center text-xs text-stone-400">
+              No rows match this gallery view.
+            </div>
+          )}
+          {rows.map((er) => {
+            const title = getRowTitle(er, database.properties);
+            const activeView = views.find((v) => v.id === selectedViewId);
+            const coverPropId =
+              activeView && typeof activeView.kind === "object" && "gallery_view" in activeView.kind
+                ? activeView.kind.gallery_view.cover_prop_id
+                : database.properties.find((p) => p.kind === "url")?.id ?? null;
+            const coverCell = coverPropId ? getEffectiveCell(er, coverPropId) : null;
+            const coverVal =
+              coverCell && typeof coverCell === "object"
+                ? "url_val" in coverCell
+                  ? coverCell.url_val
+                  : "text_val" in coverCell
+                    ? coverCell.text_val
+                    : null
+                : null;
+            const isImg =
+              coverVal &&
+              (coverVal.startsWith("http://") ||
+                coverVal.startsWith("https://") ||
+                coverVal.startsWith("/api/attachments/"));
+            return (
+              <div
+                key={er.row.id}
+                onClick={() => onInspectRow?.(database.id, er.row.id, er.row.page_id)}
+                className="cursor-pointer rounded-xl border border-stone-200 bg-white overflow-hidden hover:border-stone-400 transition"
+              >
+                {isImg ? (
+                  <img src={coverVal} alt={title} className="h-24 w-full object-cover bg-stone-100" />
+                ) : (
+                  <div className="h-2 bg-gradient-to-r from-teal-500/70 via-blue-500/70 to-indigo-500/70" />
+                )}
+                <div className="p-2.5 space-y-1">
+                  <div className="text-xs font-semibold text-stone-900 truncate">{title}</div>
+                  {coverVal && !isImg && (
+                    <div className="text-[11px] text-stone-500 truncate">{coverVal}</div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : mode === "timeline" ? (
+        <div className="p-3 space-y-1.5 bg-stone-50/30">
+          {(() => {
+            const activeView = views.find((v) => v.id === selectedViewId);
+            const datePropId =
+              activeView && typeof activeView.kind === "object" && "timeline_view" in activeView.kind
+                ? activeView.kind.timeline_view.start_date_prop_id
+                : database.properties.find(
+                    (p) => typeof p.kind === "object" && "date_prop" in p.kind
+                  )?.id ?? null;
+            if (!datePropId) {
+              return (
+                <div className="text-xs text-stone-400 py-2">
+                  Add a Date property to view embedded items on a Timeline.
+                </div>
+              );
+            }
+            return rows.map((er) => {
+              const title = getRowTitle(er, database.properties);
+              const dc = getEffectiveCell(er, datePropId);
+              const dLabel =
+                dc && typeof dc === "object" && "date_val" in dc
+                  ? dc.date_val.end_date
+                    ? `${dc.date_val.start} → ${dc.date_val.end_date}`
+                    : dc.date_val.start
+                  : "Unscheduled";
+              return (
+                <div
+                  key={er.row.id}
+                  className="flex items-center justify-between gap-2 rounded-lg border border-stone-200 bg-white px-3 py-1.5 text-xs"
+                >
+                  <button
+                    type="button"
+                    onClick={() => onInspectRow?.(database.id, er.row.id, er.row.page_id)}
+                    className="font-medium text-stone-900 hover:underline truncate"
+                  >
+                    {title}
+                  </button>
+                  <span className="shrink-0 rounded bg-blue-50 border border-blue-200 px-2 py-0.5 font-mono text-[10px] text-blue-800">
+                    {dLabel}
+                  </span>
+                </div>
+              );
+            });
+          })()}
         </div>
       ) : (
         <div className="p-3 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5 bg-stone-50/50">

@@ -32,9 +32,12 @@ create_proposal_comment,
 resolve_proposal_comment,
 reject_proposal_hunk,
 pin_replay_baseline,
+replay_status,
 simulate_replay,
 accept_replay,
 discard_replay,
+page_replay_history,
+page_time_travel,
 delegate_grant,
 list_webhooks,
 create_webhook,
@@ -1271,6 +1274,9 @@ fn query_db_scenario(
             CalendarView(date_prop_id: dp_id, card_prop_ids: _):
               ranged = DatabaseModel.filter_calendar_range(sorted, dp_id, from_d, to_d)
               (ranged, None)
+            GalleryView(cover_prop_id: _, card_prop_ids: _, card_size: _): (sorted, None)
+            TimelineView(start_date_prop_id: sp_id, end_date_prop_id: ep_opt, card_prop_ids: _):
+              (DatabaseModel.filter_timeline_range(sorted, sp_id, ep_opt, from_d, to_d), None)
           end
         None: (sorted, None)
       end
@@ -2179,6 +2185,112 @@ fn pin_replay_baseline(req: Api.Request, auth: AuthContext, files: Files, clock:
   Ok(json_ok(201, bl.to_json))
 end
 
+fn replay_call_targets_page?(args: Json, page_id: Text) : Bool
+  args.text_at("page_id") == Some(page_id) or
+    args.text_at("mutation.patch_page.page_id") == Some(page_id) or
+    args.text_at("mutation.create_db_row.page_id") == Some(page_id)
+end
+
+fn first_some_text(opts: List(Option(Text))) : Option(Text)
+  for o in opts
+    case o
+      Some(v): return Some(v)
+      None: Unit
+    end
+  end
+  None
+end
+
+fn replay_call_target_ids(args: Json) : (Option(Text), Option(Text))
+  pg = first_some_text([
+    args.text_at("page_id"),
+    args.text_at("mutation.patch_page.page_id"),
+    args.text_at("mutation.create_db_row.page_id")
+  ])
+  dbid = first_some_text([
+    args.text_at("database_id"),
+    args.text_at("mutation.update_db_row.database_id"),
+    args.text_at("mutation.create_db_row.database_id")
+  ])
+  (pg, dbid)
+end
+
+fn replay_proposal_summary_json(prop: Replay.ReplayProposal) : Json
+  Json.Object({
+    "id": Json.String(prop.id),
+    "description": Json.String(prop.description),
+    "filter": prop.filter.to_json,
+    "base_call_seq": Json.int(prop.base_call_seq),
+    "created_by": Json.String(prop.created_by),
+    "created_at": prop.created_at.to_json,
+    "status": prop.status.to_json,
+    "summary": prop.summary.to_json,
+    "outcomes": prop.outcomes.to_json,
+    "bucket_diffs": prop.bucket_diffs.to_json
+  })
+end
+
+## `GET /api/admin/replay/status` — Returns CoW baseline, recorded `Modb.Replay` call history,
+## and compact `ReplayProposal` summaries without giant snapshot blobs (`ReadFiles`-only).
+fn replay_status(auth: AuthContext, rf: ReadFiles) : Result(Api.Response, AppError)
+  role_ok = auth.principal.role == Owner or auth.principal.role == Admin
+  if not role_ok or not Policy.action_permitted?(auth, "manage_grants")
+    return Error(Forbidden(reason: "only Owner/Admin may inspect replay status"))
+  end
+  if not rf.exists?(Db.ledger_db_path)
+    return Ok(
+      json_ok(
+        200,
+        Json.Object({
+          "baseline": Json.Null,
+          "call_count": Json.int(0),
+          "calls": Json.Array([]),
+          "proposals": Json.Array([])
+        })
+      )
+    )
+  end
+  payload = try Ledger.read_locked(
+    rf,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      bl = try Replay.get_baseline(store).map_error(Db.map_replay_error)
+      cnt = try Replay.call_count(store).map_error(Db.map_replay_error)
+      calls = try Replay.list_calls_tail(store, 100).map_error(Db.map_replay_error)
+      props = try Replay.list_proposals(store).map_error(Db.map_replay_error)
+      calls_json = calls.map(fn(c)
+        (pg_opt, db_opt) = replay_call_target_ids(c.args)
+        Json.Object({
+          "seq": Json.int(c.seq),
+          "audit_seq": c.audit_seq.to_json,
+          "principal": Json.String(c.principal),
+          "grant_id": c.grant_id.to_json,
+          "world_id": c.world_id.to_json,
+          "action": Json.String(c.action),
+          "reason": Json.String(c.reason),
+          "at": c.at.to_json,
+          "page_id": pg_opt.to_json,
+          "database_id": db_opt.to_json,
+          "outcome": c.outcome.to_json
+        })
+      end)
+      props_json = props.reverse.take(25).map(replay_proposal_summary_json)
+      Ok(
+        Json.Object({
+          "baseline": bl.to_json,
+          "call_count": Json.int(cnt),
+          "calls": Json.Array(calls_json),
+          "proposals": Json.Array(props_json)
+        })
+      )
+    end
+  )
+  Ok(json_ok(200, payload))
+end
+
 ## `POST /api/admin/replay/simulate` — Runs offline selective rollback simulation via `Modb.Replay`.
 fn simulate_replay(
   req: Api.Request,
@@ -2213,12 +2325,162 @@ fn simulate_replay(
       201,
       Json.Object({
         "proposal_id": Json.String(prop.id),
+        "description": Json.String(prop.description),
+        "filter": prop.filter.to_json,
+        "base_call_seq": Json.int(prop.base_call_seq),
         "summary": prop.summary.to_json,
+        "outcomes": prop.outcomes.to_json,
         "bucket_diffs": prop.bucket_diffs.to_json,
         "status": prop.status.to_json
       })
     )
   )
+end
+
+## `GET /api/pages/:id/history` — Lists point-in-time `Modb.Replay` timeline stops for page `id`.
+fn page_replay_history(id: Text, auth: AuthContext, rf: ReadFiles) : Result(Api.Response, AppError)
+  if not Policy.action_permitted?(auth, "read")
+    return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'read'"))
+  end
+  if not rf.exists?(Db.ledger_db_path)
+    return Error(Missing(entity: "page", id: id))
+  end
+  payload = try Ledger.read_locked(
+    rf,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      page = case try Table.get(store, Db.pages_table(), id).map_error(Db.map_table_error)
+        Some(p) if p.archived_at == None: p
+        Some(_) | None: return Error(Missing(entity: "page", id: id))
+      end
+      try Policy.require_collection_access(auth, "read", page.collection_id)
+      bl_opt = try Replay.get_baseline(store).map_error(Db.map_replay_error)
+      calls = try Replay.list_calls(store).map_error(Db.map_replay_error)
+      page_calls = calls.filter(fn(c) replay_call_targets_page?(c.args, id) end)
+      var stops = []
+      case bl_opt
+        Some(bl):
+          stops = stops.append(
+            Json.Object({
+              "seq": Json.int(0),
+              "stop_before_seq": Json.int(1),
+              "label": Json.String("Pinned Baseline"),
+              "principal": Json.String("system"),
+              "action": Json.String("baseline"),
+              "reason": Json.String("CoW baseline snapshot"),
+              "world_id": Json.Null,
+              "grant_id": Json.Null,
+              "at": bl.pinned_at.to_json
+            })
+          )
+        None: Unit
+      end
+      for c in page_calls
+        stops = stops.append(
+          Json.Object({
+            "seq": Json.int(c.seq),
+            "stop_before_seq": Json.int(c.seq + 1),
+            "label": Json.String("Call ##{c.seq} · #{c.principal}"),
+            "principal": Json.String(c.principal),
+            "action": Json.String(c.action),
+            "reason": Json.String(c.reason),
+            "world_id": c.world_id.to_json,
+            "grant_id": c.grant_id.to_json,
+            "at": c.at.to_json
+          })
+        )
+      end
+      Ok(
+        Json.Object({
+          "page_id": Json.String(page.id),
+          "current_version": Json.int(page.version),
+          "baseline": bl_opt.to_json,
+          "can_scrub": Json.Boolean(bl_opt != None),
+          "total_replay_calls": Json.int(calls.size),
+          "stops": Json.Array(stops)
+        })
+      )
+    end
+  )
+  Ok(json_ok(200, payload))
+end
+
+## `GET /api/pages/:id/time-travel` — Runs offline `Modb.Replay.preview_replay` at `stop_before_seq`
+## and returns historical reconstructed blocks + diff count against live without mutating storage.
+fn page_time_travel(
+  req: Api.Request,
+  id: Text,
+  auth: AuthContext,
+  rf: ReadFiles,
+  clock: Clock
+) : Result(Api.Response, AppError)
+  if not Policy.action_permitted?(auth, "read")
+    return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'read'"))
+  end
+  if not rf.exists?(Db.ledger_db_path)
+    return Error(Missing(entity: "page", id: id))
+  end
+  now = clock.now
+  payload = try Ledger.read_locked(
+    rf,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      page = case try Table.get(store, Db.pages_table(), id).map_error(Db.map_table_error)
+        Some(p) if p.archived_at == None: p
+        Some(_) | None: return Error(Missing(entity: "page", id: id))
+      end
+      try Policy.require_collection_access(auth, "read", page.collection_id)
+      bl_opt = try Replay.get_baseline(store).map_error(Db.map_replay_error)
+      if bl_opt == None
+        return Error(
+          BadInput(
+            reason: "No Modb.Replay baseline pinned yet; pin a replay baseline in Admin -> Selective Undo."
+          )
+        )
+      end
+      total_calls = try Replay.call_count(store).map_error(Db.map_replay_error)
+      stop_before_seq = case req.query_param("stop_before_seq")
+        Some(s): try s.trim.to_int.or_fail(BadInput(reason: "stop_before_seq must be an integer"))
+        None: total_calls + 1
+      end
+      if stop_before_seq < 1
+        return Error(BadInput(reason: "stop_before_seq must be >= 1"))
+      end
+      prop = try Replay.preview_replay(
+        db,
+        Db.replay_catalog(),
+        Replay.StopBeforeSeq(seq: stop_before_seq),
+        "tt_#{id}_#{stop_before_seq}",
+        "Point-in-time preview for #{id}",
+        auth.principal.id,
+        now
+      ).map_error(Db.map_replay_error)
+      (hist_page_opt, hist_blocks) = try Db.reconstruct_page_from_replay_proposal(store, id, prop)
+      live_blocks = try Db.load_page_blocks(store, id)
+      (diff_ops, _) = Blocks.diff_blocks_to_ops(hist_blocks, live_blocks)
+      hist_md = Blocks.to_anchored_markdown(hist_blocks)
+      Ok(
+        Json.Object({
+          "page_id": Json.String(id),
+          "stop_before_seq": Json.int(stop_before_seq),
+          "existed_at_point": Json.Boolean(hist_page_opt != None),
+          "historical_page": hist_page_opt.to_json,
+          "historical_blocks": hist_blocks.to_json,
+          "historical_markdown": Json.String(hist_md),
+          "ops_to_live_count": Json.int(diff_ops.size),
+          "summary": prop.summary.to_json,
+          "outcomes": prop.outcomes.to_json
+        })
+      )
+    end
+  )
+  Ok(json_ok(200, payload))
 end
 
 ## `POST /api/admin/replay/:id/accept` — Applies a simulated `Modb.Replay` selective rollback proposal atomically.

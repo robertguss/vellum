@@ -1,17 +1,20 @@
 import { Link, router } from "@inertiajs/react";
 import {
+  ArrowUpRight,
   CheckCircle2,
   Clock,
   Eye,
   FileText,
   GitBranch,
   GitPullRequest,
+  Link2,
   MessageSquare,
   Paperclip,
   PenTool,
   RefreshCw,
   Save,
   Send,
+  Sparkles,
   Upload,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -32,6 +35,7 @@ import type {
   Comment,
   DatabaseDef,
   EditorLens,
+  ExplicitBacklink,
   GardenCitationDrift,
   Page,
   PageBlueprintMeta,
@@ -39,6 +43,7 @@ import type {
   ProposalMeta,
   RelationTargetOption,
   ResolvedMetric,
+  SemanticBacklink,
 } from "../../lib/types";
 
 interface PageProps {
@@ -61,6 +66,8 @@ interface PageProps {
   open_scenarios?: ProposalMeta[];
   page_audit?: AuditFeedItem[];
   citation_drifts?: GardenCitationDrift[];
+  explicit_backlinks?: ExplicitBacklink[];
+  semantic_backlinks?: SemanticBacklink[];
 }
 
 async function sha256Hex(file: File): Promise<string> {
@@ -109,6 +116,8 @@ export default function PageView({
   open_scenarios: initialScenarios = [],
   page_audit = [],
   citation_drifts = [],
+  explicit_backlinks = [],
+  semantic_backlinks = [],
 }: PageProps) {
   const [page, setPage] = useState<Page>(initialPage);
   const [stagingDriftId, setStagingDriftId] = useState<string | null>(null);
@@ -828,6 +837,83 @@ export default function PageView({
                 </div>
               ))}
             </div>
+          </section>
+        </div>
+
+        {/* Backlinks & Modb.Vec Semantic Connections */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <section className="rounded-2xl border border-stone-200 bg-white p-5 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 text-sm font-semibold text-stone-900">
+                <Link2 className="h-4 w-4 text-teal-700" />
+                Incoming Backlinks &amp; Citations ({explicit_backlinks.length})
+              </div>
+              <span className="text-[11px] font-mono text-stone-400">ACL-filtered</span>
+            </div>
+            {explicit_backlinks.length === 0 ? (
+              <p className="text-xs text-stone-400">
+                No other accessible pages link to or cite this page yet.
+              </p>
+            ) : (
+              <div className="space-y-2 max-h-60 overflow-y-auto">
+                {explicit_backlinks.map((bl) => (
+                  <Link
+                    key={`${bl.source_page_id}-${bl.block_id}`}
+                    href={`/p/${bl.source_page_id}#${bl.block_id}`}
+                    className="block rounded-lg border border-stone-100 bg-stone-50 p-3 hover:border-teal-300 transition"
+                  >
+                    <div className="flex items-center justify-between gap-2 text-xs">
+                      <span className="font-medium text-stone-900 flex items-center gap-1">
+                        {bl.source_title}
+                        <ArrowUpRight className="h-3 w-3 text-stone-400" />
+                      </span>
+                      <span className="rounded-full bg-teal-50 border border-teal-200 px-2 py-0.5 font-mono text-[10px] text-teal-800">
+                        {bl.kind}
+                      </span>
+                    </div>
+                    {bl.excerpt && (
+                      <p className="mt-1 text-xs text-stone-600 line-clamp-2">{bl.excerpt}</p>
+                    )}
+                  </Link>
+                ))}
+              </div>
+            )}
+          </section>
+
+          <section className="rounded-2xl border border-stone-200 bg-white p-5 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 text-sm font-semibold text-stone-900">
+                <Sparkles className="h-4 w-4 text-indigo-600" />
+                Semantic Backlinks ({semantic_backlinks.length})
+              </div>
+              <span className="text-[11px] font-mono text-stone-400">Modb.Vec</span>
+            </div>
+            {semantic_backlinks.length === 0 ? (
+              <p className="text-xs text-stone-400">
+                Add content to surface semantically related pages via{" "}
+                <code className="font-mono">Modb.Vec</code>.
+              </p>
+            ) : (
+              <div className="space-y-2 max-h-60 overflow-y-auto">
+                {semantic_backlinks.map((sb) => (
+                  <Link
+                    key={sb.page_id}
+                    href={`/p/${sb.page_id}`}
+                    className="block rounded-lg border border-stone-100 bg-stone-50 p-3 hover:border-indigo-300 transition"
+                  >
+                    <div className="flex items-center justify-between gap-2 text-xs">
+                      <span className="font-medium text-stone-900 truncate">{sb.title}</span>
+                      <span className="shrink-0 rounded-full bg-indigo-50 border border-indigo-200 px-2 py-0.5 font-mono text-[10px] text-indigo-800">
+                        {(sb.similarity * 100).toFixed(0)}% · {sb.vector_backend}
+                      </span>
+                    </div>
+                    {sb.summary && (
+                      <p className="mt-1 text-xs text-stone-600 line-clamp-2">{sb.summary}</p>
+                    )}
+                  </Link>
+                ))}
+              </div>
+            )}
           </section>
         </div>
       </div>

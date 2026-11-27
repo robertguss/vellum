@@ -469,6 +469,26 @@ assert.equal(pgRes.res.status, 201, pgRes.text);
 const pageId = pgRes.json.page.id;
 const blkId = pgRes.json.blocks[0].id;
 
+// Seed Kubernetes target page and pin CoW Modb.Replay baseline BEFORE any World proposals run
+const blTargetPg = await apiJson("/api/pages", {
+  method: "POST",
+  body: JSON.stringify({
+    collection_id: colId,
+    title: "Kubernetes Failover Standard",
+    markdown: "Standard procedure for multi-zone Kubernetes cluster failover and drain.",
+    reason: "seed backlink target",
+  }),
+});
+assert.equal(blTargetPg.res.status, 201, blTargetPg.text);
+const blTargetId = blTargetPg.json.page.id;
+const blTargetBlkId = blTargetPg.json.blocks[0].id;
+
+const pinBaselineRes = await apiJson("/api/admin/replay/baseline", {
+  method: "POST",
+  body: "{}",
+});
+assert.equal(pinBaselineRes.res.status, 201, pinBaselineRes.text);
+
 const searchRes = await apiJson("/api/search?q=quorum&limit=10");
 assert.equal(searchRes.res.status, 200, searchRes.text);
 assert.ok(
@@ -2077,6 +2097,251 @@ assert.ok(
   "Accepted PR bridge proposal lands cleanly on live page"
 );
 console.log("✓ Live Phase 3.2 Proposals-Only Knowledge Gardeners & Signed GitHub PR Bridge verified");
+
+// 14. Live Phase 3.3 Visual Modb.Replay (Status + Time-Travel + Simulate), DB Gallery/Timeline, & Backlinks
+const roadmapDbRes = await apiJson("/api/databases", {
+  method: "POST",
+  body: JSON.stringify({
+    collection_id: colId,
+    title: "Release Roadmap",
+    description: "Phase 3.3 Gallery & Timeline E2E",
+    properties: [
+      { id: "title", name: "Item", kind: "title", required: true, sort_order: "a" },
+      { id: "cover", name: "Cover", kind: "url", required: false, sort_order: "b" },
+      {
+        id: "start_at",
+        name: "Start",
+        kind: { date_prop: { include_time: false } },
+        required: false,
+        sort_order: "c",
+      },
+      {
+        id: "end_at",
+        name: "End",
+        kind: { date_prop: { include_time: false } },
+        required: false,
+        sort_order: "d",
+      },
+    ],
+  }),
+});
+assert.equal(roadmapDbRes.res.status, 201, roadmapDbRes.text);
+const rmDbId = roadmapDbRes.json.database.id;
+
+const rmGalleryRes = await apiJson(`/api/databases/${rmDbId}/views`, {
+  method: "POST",
+  body: JSON.stringify({
+    name: "Visual Gallery",
+    kind: { gallery_view: { cover_prop_id: "cover", card_prop_ids: ["start_at"], card_size: "md" } },
+    filters: [],
+    filter_match_all: true,
+    sorts: [],
+  }),
+});
+assert.equal(rmGalleryRes.res.status, 201, rmGalleryRes.text);
+const rmGalleryId = rmGalleryRes.json.id;
+
+const rmTimelineRes = await apiJson(`/api/databases/${rmDbId}/views`, {
+  method: "POST",
+  body: JSON.stringify({
+    name: "Release Timeline",
+    kind: { timeline_view: { start_date_prop_id: "start_at", end_date_prop_id: "end_at", card_prop_ids: ["cover"] } },
+    filters: [],
+    filter_match_all: true,
+    sorts: [],
+  }),
+});
+assert.equal(rmTimelineRes.res.status, 201, rmTimelineRes.text);
+const rmTimelineId = rmTimelineRes.json.id;
+
+const rEarlyRes = await apiJson(`/api/databases/${rmDbId}/rows`, {
+  method: "POST",
+  body: JSON.stringify({
+    cells: {
+      title: { text_val: "Early Launch" },
+      cover: { url_val: "https://example.com/early.png" },
+      start_at: { date_val: { start: "2026-12-01", end_date: null } },
+      end_at: { date_val: { start: "2026-12-08", end_date: null } },
+    },
+    reason: "seed early timeline row",
+  }),
+});
+assert.equal(rEarlyRes.res.status, 201, rEarlyRes.text);
+const rLateRes = await apiJson(`/api/databases/${rmDbId}/rows`, {
+  method: "POST",
+  body: JSON.stringify({
+    cells: {
+      title: { text_val: "Late Launch" },
+      start_at: { date_val: { start: "2026-12-18", end_date: null } },
+      end_at: { date_val: { start: "2026-12-28", end_date: null } },
+    },
+    reason: "seed late timeline row",
+  }),
+});
+assert.equal(rLateRes.res.status, 201, rLateRes.text);
+
+const galQueryRes = await apiJson(`/api/databases/${rmDbId}/query`, {
+  method: "POST",
+  body: JSON.stringify({ view_id: rmGalleryId, filters: [], filter_match_all: true, sorts: [] }),
+});
+assert.equal(galQueryRes.res.status, 200, galQueryRes.text);
+assert.equal(galQueryRes.json.rows.length, 2);
+
+const tlQueryRes = await apiJson(`/api/databases/${rmDbId}/query`, {
+  method: "POST",
+  body: JSON.stringify({
+    view_id: rmTimelineId,
+    filters: [],
+    filter_match_all: true,
+    sorts: [],
+    from_date: "2026-12-04",
+    to_date: "2026-12-10",
+  }),
+});
+assert.equal(tlQueryRes.res.status, 200, tlQueryRes.text);
+assert.equal(tlQueryRes.json.rows.length, 1);
+assert.equal(tlQueryRes.json.rows[0].row.id, rEarlyRes.json.row.id);
+
+// Backlinks & Semantic Connections (explicit PageLink + Modb.Vec semantic)
+const blSourcePg = await apiJson("/api/pages", {
+  method: "POST",
+  body: JSON.stringify({
+    collection_id: colId,
+    title: "Regional Incident Guide",
+    markdown: `See [[${blTargetId}]] before failing over traffic.`,
+    reason: "seed explicit backlink page",
+  }),
+});
+assert.equal(blSourcePg.res.status, 201, blSourcePg.text);
+
+const blSemPg = await apiJson("/api/pages", {
+  method: "POST",
+  body: JSON.stringify({
+    collection_id: colId,
+    title: "Kubernetes Cluster Failover Checklist",
+    markdown: "Checklist for multi-zone Kubernetes cluster failover and node drain.",
+    reason: "seed semantic backlink peer",
+  }),
+});
+assert.equal(blSemPg.res.status, 201, blSemPg.text);
+
+const blRes = await apiJson(`/api/pages/${blTargetId}/backlinks`);
+assert.equal(blRes.res.status, 200, blRes.text);
+assert.ok(
+  (blRes.json.explicit_backlinks ?? []).some((b) => b.source_page_id === blSourcePg.json.page.id),
+  "Explicit PageLink backlink detected"
+);
+assert.ok(
+  (blRes.json.semantic_backlinks ?? []).some((b) => b.page_id === blSemPg.json.page.id),
+  "Modb.Vec semantic backlink detected"
+);
+
+// Visual Modb.Replay: Status + History Scrubber + Read-Only Time-Travel + Simulate
+const rev1Prop = await apiJson("/api/proposals", {
+  method: "POST",
+  body: JSON.stringify({
+    page_id: blTargetId,
+    title: "Replay Stop 1",
+    reason: "Apply first Kubernetes revision",
+  }),
+});
+assert.equal(rev1Prop.res.status, 201, rev1Prop.text);
+const rev1Stage = await apiJson(`/api/proposals/${rev1Prop.json.id}/ops`, {
+  method: "POST",
+  body: JSON.stringify({
+    ops: [
+      {
+        replace_block: {
+          block_id: blTargetBlkId,
+          expected_version: 1,
+          kind: null,
+          markdown: "Revision 1 multi-zone Kubernetes drain step.",
+        },
+      },
+    ],
+    expected_versions: { [blTargetBlkId]: 1 },
+    reason: "stage rev 1",
+  }),
+});
+assert.equal(rev1Stage.res.status, 200, rev1Stage.text);
+const rev1Acc = await apiJson(`/api/proposals/${rev1Prop.json.id}/accept`, {
+  method: "POST",
+  body: JSON.stringify({ reason: "accept rev 1" }),
+});
+assert.equal(rev1Acc.res.status, 200, rev1Acc.text);
+
+const rev2Prop = await apiJson("/api/proposals", {
+  method: "POST",
+  body: JSON.stringify({
+    page_id: blTargetId,
+    title: "Replay Stop 2",
+    reason: "Apply second Kubernetes revision",
+  }),
+});
+assert.equal(rev2Prop.res.status, 201, rev2Prop.text);
+const rev2Stage = await apiJson(`/api/proposals/${rev2Prop.json.id}/ops`, {
+  method: "POST",
+  body: JSON.stringify({
+    ops: [
+      {
+        replace_block: {
+          block_id: blTargetBlkId,
+          expected_version: 2,
+          kind: null,
+          markdown: "Revision 2 multi-zone Kubernetes drain step.",
+        },
+      },
+    ],
+    expected_versions: { [blTargetBlkId]: 2 },
+    reason: "stage rev 2",
+  }),
+});
+assert.equal(rev2Stage.res.status, 200, rev2Stage.text);
+const rev2Acc = await apiJson(`/api/proposals/${rev2Prop.json.id}/accept`, {
+  method: "POST",
+  body: JSON.stringify({ reason: "accept rev 2" }),
+});
+assert.equal(rev2Acc.res.status, 200, rev2Acc.text);
+
+const rplStatus = await apiJson("/api/admin/replay/status");
+assert.equal(rplStatus.res.status, 200, rplStatus.text);
+assert.ok(rplStatus.json.baseline, "CoW baseline present in /api/admin/replay/status");
+assert.ok(rplStatus.json.call_count >= 2, "Replay call_count reflects accepted proposals");
+
+const pgHist = await apiJson(`/api/pages/${blTargetId}/history`);
+assert.equal(pgHist.res.status, 200, pgHist.text);
+assert.equal(pgHist.json.can_scrub, true);
+assert.ok(pgHist.json.stops.length >= 3, "Baseline + 2 revisions on scrubber");
+const nonBaseline = pgHist.json.stops.filter((s) => s.seq > 0);
+assert.ok(nonBaseline.length >= 2, "Found Rev 1 & Rev 2 replay stops in page history");
+const rev1Stop = nonBaseline[0];
+
+const ttRes = await apiJson(
+  `/api/pages/${blTargetId}/time-travel?stop_before_seq=${rev1Stop.stop_before_seq}`
+);
+assert.equal(ttRes.res.status, 200, ttRes.text);
+assert.equal(ttRes.json.existed_at_point, true);
+assert.ok(ttRes.json.historical_markdown.includes("Revision 1 multi-zone Kubernetes drain step."));
+assert.ok(!ttRes.json.historical_markdown.includes("Revision 2 multi-zone Kubernetes drain step."));
+assert.ok(ttRes.json.ops_to_live_count >= 1);
+
+const simRplRes = await apiJson("/api/admin/replay/simulate", {
+  method: "POST",
+  body: JSON.stringify({
+    filter_kind: "stop_before_seq",
+    target: null,
+    seq: rev1Stop.stop_before_seq,
+    description: "E2E visual simulation check",
+  }),
+});
+assert.equal(simRplRes.res.status, 201, simRplRes.text);
+assert.ok(Array.isArray(simRplRes.json.outcomes), "Simulate returns call-by-call outcomes");
+const discRplRes = await apiJson(`/api/admin/replay/${simRplRes.json.proposal_id}/discard`, {
+  method: "POST",
+  body: "{}",
+});
+assert.equal(discRplRes.res.status, 200, discRplRes.text);
+console.log("✓ Live Phase 3.3 Visual Modb.Replay, DB Gallery/Timeline, & Semantic Backlinks verified");
 EOF
 
 echo "All Live Vellum E2E checks against mo serve + Dex + VersityGW S3 passed."
