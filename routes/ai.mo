@@ -8,6 +8,7 @@ EmbedConfig(..),
 WorkspaceSearchOutcome(..),
 AskWorkspaceInput(..),
 DraftBlockInput(..),
+RefreshAiBriefInput(..),
 GardenStalePage(..),
 GardenBrokenLink(..),
 GardenReport(..),
@@ -17,9 +18,11 @@ build_llm_request,
 build_llm_request_with_stream,
 build_embedding_request,
 fetch_embedding,
+generate_semantic_summary,
 execute_workspace_search,
 ask_workspace,
 draft_blocks,
+refresh_ai_brief,
 run_garden,
 garden_job
 use Api
@@ -34,6 +37,7 @@ use Domain.Types{
   AuthorKind,
   BlockKind,
   BlockOp,
+  Citation,
   PrincipalKind,
   Provenance,
   SearchResultItem
@@ -47,6 +51,7 @@ use Modb.Table
 use Modb.Vec
 use Modb.World
 use Routes.Auth
+use Routes.Packs
 
 ## Runtime configuration for Vellum's built-in LLM client.
 struct AiConfig
@@ -835,7 +840,7 @@ fn scan_garden_report(store: Store, auth_opt: Option(AuthContext), now: Time) : 
           ) | FileEmbed(attachment_id: _, filename: _) | DatabaseViewEmbed(
             database_id: _,
             view_id: _
-          ): Unit
+          ) | AiBrief(prompt: _, source_scope: _, refreshed_at: _): Unit
         end
       end
     end
@@ -884,4 +889,258 @@ fn garden_job(_payload: Json, files: Files, clock: Clock) : Result(Unit, AppErro
     fn(db) scan_garden_report(Ledger.store(db), None, now) end
   )
   Ok(Unit)
+end
+
+## JSON payload for `POST /api/ai/brief/refresh`.
+struct RefreshAiBriefInput
+  page_id: Text
+  block_id: Text
+  deterministic_fallback: Option(Bool)
+end
+
+## Generates a crisp 1-sentence semantic summary for `title` + `body` via the configured LLM outside MoDB locks.
+fn generate_semantic_summary(cfg: AiConfig, title: Text, body: Text, net: Network) : Result(
+  Text,
+  AppError
+)
+  trimmed = body.trim
+  return Ok(title.trim) if trimmed.empty?
+  excerpt = if trimmed.byte_count > 2000
+    trimmed.bytes.slice(0, 2000).decode_utf8 or trimmed
+  else
+    trimmed
+  end
+  sys_prompt = "Summarize this Vellum workspace document in one concise factual sentence under 35 words. Return plain text only with no preamble."
+  usr_prompt = "Title: #{title}\n\nContent:\n#{excerpt}"
+  http_res = try Http.send(build_llm_request(cfg, sys_prompt, usr_prompt), net).map_error(fn(e)
+    ServerFailed(reason: "Semantic summary HTTP request failed: #{e.to_text}")
+  end)
+  if http_res.status < 200 or http_res.status >= 300
+    return Error(ServerFailed(reason: "LLM provider returned HTTP #{http_res.status}"))
+  end
+  raw = try extract_llm_text(cfg, http_res.body)
+  Ok(raw.replace("\n", " ").trim)
+end
+
+## `POST /api/ai/brief/refresh` — Refreshes an `AiBrief` card into a speculative `Modb.World` Change Proposal (never writes live).
+fn refresh_ai_brief(
+  req: Api.Request,
+  auth: AuthContext,
+  input: RefreshAiBriefInput,
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock,
+  env: Env,
+  net: Network
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  if auth.principal.suspended
+    return Error(Forbidden(reason: "principal '#{auth.principal.handle}' is suspended"))
+  end
+  if not files.read_only.exists?(Db.ledger_db_path)
+    return Error(Missing(entity: "page", id: input.page_id))
+  end
+
+  (pg, target_blk, brief_prompt, scope_opt, sum_lines, cits) = try Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      pg = case try Table.get(store, Db.pages_table(), input.page_id.trim).map_error(
+        Db.map_table_error
+      )
+        Some(p) if p.archived_at == None: p
+        Some(_) | None: return Error(Missing(entity: "page", id: input.page_id))
+      end
+      try Policy.require_collection_access(auth, "read", pg.collection_id)
+      try Policy.require_collection_access(auth, "propose", pg.collection_id)
+
+      blks = try Db.load_page_blocks(store, pg.id)
+      var found_blk = None
+      for b in blks
+        if b.id == input.block_id.trim
+          found_blk = Some(b)
+          break
+        end
+      end
+      tblk = try found_blk.or_fail(Missing(entity: "block", id: input.block_id))
+      (pr_txt, sc_opt) = case tblk.kind
+        AiBrief(prompt: pr, source_scope: sc, refreshed_at: _): (pr, sc)
+        Paragraph | Heading(level: _) | BulletListItem | OrderedListItem(start: _) | TaskItem(
+          checked: _
+        ) | Quote | Callout(tone: _, icon: _) | CodeBlock(language: _) | Divider | Image(
+          attachment_id: _,
+          caption: _
+        ) | FileEmbed(attachment_id: _, filename: _) | PageLink(target_page_id: _) | DatabaseViewEmbed(
+          database_id: _,
+          view_id: _
+        ): return Error(BadInput(reason: "block '#{tblk.id}' is not an ai-brief card"))
+      end
+
+      eff_scope = case sc_opt
+        Some(s) if not s.trim.empty?: Some(s.trim)
+        Some(_) | None: Some(pg.collection_id)
+      end
+      sums = try Packs.list_permitted_summaries(store, auth, eff_scope, None)
+      var lines = []
+      var citations = []
+      for s in sums.take(15)
+        blurb = s.semantic_summary or s.structural_summary
+        lines = lines.append("- [#{s.entity_kind} #{s.entity_id}] #{s.title}: #{blurb}")
+        if s.entity_kind == "page" and citations.size < 5
+          citations = citations.append(
+            Citation(
+              source_kind: "living_summary",
+              source_ref: s.entity_id,
+              label: s.title,
+              excerpt: Some(blurb)
+            )
+          )
+        end
+      end
+      Ok((pg, tblk, pr_txt, sc_opt, lines, citations))
+    end
+  )
+
+  digest = if sum_lines.empty?
+    "- No accessible workspace summaries in scope yet."
+  else
+    sum_lines.join("\n")
+  end
+
+  (brief_md, model_name) = case ai_config(env)
+    Ok(cfg):
+      sys_prompt = "You maintain a concise Living Brief card inside a Vellum knowledge document. Synthesize strictly from the provided workspace summaries using crisp Markdown bullet points."
+      usr_prompt = "Document: #{pg.title}\nBrief Goal: #{brief_prompt}\n\nAccessible Living Summaries:\n#{digest}"
+      http_res = try Http.send(build_llm_request(cfg, sys_prompt, usr_prompt), net).map_error(fn(e)
+        ServerFailed(reason: "AI brief LLM request failed: #{e.to_text}")
+      end)
+      if http_res.status < 200 or http_res.status >= 300
+        return Error(ServerFailed(reason: "LLM provider returned HTTP #{http_res.status}"))
+      end
+      raw = try extract_llm_text(cfg, http_res.body)
+      (raw.trim, cfg.model)
+    Error(cfg_err):
+      if input.deterministic_fallback == Some(true)
+        ("**#{brief_prompt}**\n#{digest}", "deterministic-summary")
+      else
+        return Error(cfg_err)
+      end
+  end
+
+  now = clock.now
+  prov = Provenance(
+    author_id: auth.principal.id,
+    author_kind: case auth.principal.kind
+      Human: HumanAuthor
+      Agent: AgentAuthor(model: auth.principal.model_id)
+    end,
+    grant_id: if auth.principal.kind == Agent: Some(auth.grant_id) else: None,
+    proposal_id: None,
+    reason: Some("AI brief refresh: #{brief_prompt}"),
+    citations: cits,
+    updated_at: now
+  )
+  next_kind = AiBrief(prompt: brief_prompt, source_scope: scope_opt, refreshed_at: Some(now.to_text))
+  ops = [
+    ReplaceBlock(
+      block_id: target_blk.id,
+      expected_version: target_blk.version,
+      kind: Some(next_kind),
+      markdown: brief_md
+    )
+  ]
+
+  prop_id = "prop_#{Id.ulid(rng, clock)}"
+  world_id = "w_#{Id.ulid(rng, clock)}"
+  _wrec = try World.open_world_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    world_id,
+    auth.grant_id,
+    now,
+    now + 7.days
+  ).map_error(Db.map_world_error)
+
+  wargs = WorldPatchArgs(
+    page_id: pg.id,
+    ops: ops,
+    new_ids: [],
+    provenance: prov,
+    expected_versions: {target_blk.id: target_blk.version},
+    updated_at: now
+  )
+  _step = try World.world_call_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.world_catalog(),
+    world_id,
+    "propose",
+    wargs.to_json,
+    "stage refreshed ai-brief block",
+    now
+  ).map_error(Db.map_world_error)
+
+  pm = ProposalMeta(
+    id: prop_id,
+    world_id: world_id,
+    collection_id: pg.collection_id,
+    target_page_id: pg.id,
+    target_database_id: None,
+    branch_kind: "proposal",
+    title: "Refresh Living Brief: #{brief_prompt}",
+    reason: "Proposals-only Living AI Brief refresh on '#{target_blk.id}'",
+    author_id: auth.principal.id,
+    author_handle: auth.principal.handle,
+    grant_id: auth.grant_id,
+    status: "open",
+    created_at: now,
+    updated_at: now,
+    decided_by: None,
+    decided_at: None
+  )
+
+  meta = Ledger.WriteMeta(
+    principal: auth.principal.handle,
+    action: "ai.refresh_brief_proposal",
+    reason: "stage refreshed ai-brief proposal on #{pg.id}",
+    at: now
+  )
+  saved = try Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    meta,
+    "created AI brief proposal #{prop_id} for #{pg.id}",
+    Json.Object({"proposal_id": Json.String(prop_id), "page_id": Json.String(pg.id)}),
+    Db.map_ledger_error,
+    fn(tx)
+      t1 = if auth.principal.kind == Agent
+        (tg, _g) = try Grants.tx_authorize(tx, auth.grant_id, "propose", now).map_error(
+          Db.map_grants_error
+        )
+        tg
+      else
+        tx
+      end
+      t2 = try Table.put(t1, Db.proposals_table(), pm.id, pm).map_error(Db.map_table_error)
+      Ok((t2, pm))
+    end
+  )
+
+  Ok(
+    json_ok(
+      201,
+      Json.Object({
+        "proposal": saved.to_json,
+        "draft_markdown": Json.String(brief_md),
+        "block_id": Json.String(target_blk.id),
+        "model": Json.String(model_name)
+      })
+    )
+  )
 end

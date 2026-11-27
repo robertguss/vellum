@@ -53,6 +53,8 @@ function formatBlockKind(kind: BlockKind | null): string {
   if ("image" in kind) return "Image";
   if ("file_embed" in kind) return "File";
   if ("page_link" in kind) return "Page Link";
+  if ("database_view_embed" in kind) return "DB Embed";
+  if ("ai_brief" in kind) return "AI Brief";
   return "Block";
 }
 

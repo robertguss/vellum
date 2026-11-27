@@ -34,6 +34,7 @@ mo check domain/blocks.mo
 mo check domain/policy.mo
 mo check domain/database-model.mo
 mo check domain/blueprints.mo
+mo check domain/packs.mo
 mo check domain/collab.mo
 mo check domain/notion-import.mo
 mo check db.mo
@@ -44,12 +45,14 @@ mo check routes/collab.mo
 mo check routes/mcp.mo
 mo check routes/importer.mo
 mo check routes/ai.mo
+mo check routes/packs.mo
 mo check main.mo
 
 mo test domain/blocks.mo
 mo test domain/policy.mo
 mo test domain/database-model.mo
 mo test domain/blueprints.mo
+mo test domain/packs.mo
 mo test domain/collab.mo
 mo test domain/notion-import.mo
 mo test db.mo

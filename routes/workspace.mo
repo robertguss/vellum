@@ -52,6 +52,7 @@ use Domain.Blocks
 use Domain.Blueprints{BlueprintDef, PageBlueprintMeta}
 use Domain.Collab{WebhookJobPayload}
 use Domain.DatabaseModel{CellValue, DatabaseDef, EnrichedRow, PropertyDef, PropertyKind, RollupAgg}
+use Domain.Packs{LivingSummary}
 use Domain.Policy
 use Domain.Types{
   AppError,
@@ -2500,7 +2501,92 @@ fn extract_indexed_page_id(payload_json: Text) : Result(Text, Text)
   end
 end
 
-## Periodic `mo serve` job handler draining neural embedding + signed webhook jobs and pruning expired MoDB sessions.
+fn refresh_semantic_summary_if_stale(
+  pid: Text,
+  cfg: Ai.AiConfig,
+  files: Files,
+  clock: Clock,
+  net: Network
+) : Unit
+  prep_res = Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      pg = case try Table.get(store, Db.pages_table(), pid).map_error(Db.map_table_error)
+        Some(p) if p.archived_at == None and p.kind == Document: p
+        Some(_) | None: return Ok(None)
+      end
+      s_opt = try Table.get(store, Db.summaries_table(), Db.page_summary_key(pg.id)).map_error(
+        Db.map_table_error
+      )
+      needs_refresh? = case s_opt
+        Some(sm): sm.semantic_source_version < pg.version or sm.semantic_summary == None
+        None: false
+      end
+      return Ok(None) if not needs_refresh?
+      blks = try Db.load_page_blocks(store, pg.id)
+      plain = Blocks.blocks_plain_text(blks)
+      Ok(Some((pg.title, pg.version, plain)))
+    end
+  )
+  (title, pg_ver, plain) = case prep_res
+    Ok(Some(t)): t
+    Ok(None) | Error(_): return Unit
+  end
+  sem_txt = case Ai.generate_semantic_summary(cfg, title, plain, net)
+    Ok(s) if not s.trim.empty?: s.trim
+    Ok(_) | Error(_): return Unit
+  end
+  now = clock.now
+  _saved = Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Ledger.WriteMeta(
+      principal: "system:jobs",
+      action: "page.semantic_summarized",
+      reason: "refresh debounced semantic summary for #{pid}",
+      at: now
+    ),
+    "updated semantic summary for #{pid}",
+    Json.Object({"page_id": Json.String(pid), "version": Json.int(pg_ver)}),
+    Db.map_ledger_error,
+    fn(tx)
+      skey = Db.page_summary_key(pid)
+      case try Table.tx_get(tx, Db.summaries_table(), skey).map_error(Db.map_table_error)
+        Some(cur) if cur.semantic_source_version < pg_ver:
+          nxt = LivingSummary(
+            id: cur.id,
+            entity_kind: cur.entity_kind,
+            entity_id: cur.entity_id,
+            collection_id: cur.collection_id,
+            title: cur.title,
+            structural_summary: cur.structural_summary,
+            semantic_summary: Some(sem_txt),
+            headings: cur.headings,
+            word_count: cur.word_count,
+            open_tasks: cur.open_tasks,
+            done_tasks: cur.done_tasks,
+            row_count: cur.row_count,
+            blueprint_slug: cur.blueprint_slug,
+            estimated_tokens: cur.estimated_tokens,
+            source_version: cur.source_version,
+            semantic_source_version: pg_ver,
+            updated_at: now
+          )
+          t1 = try Table.put(tx, Db.summaries_table(), nxt.id, nxt).map_error(Db.map_table_error)
+          Ok((t1, Unit))
+        Some(_) | None: Ok((tx, Unit))
+      end
+    end
+  )
+  Unit
+end
+
+## Periodic `mo serve` job handler draining neural embedding, semantic summaries, + signed webhook jobs and pruning expired MoDB sessions.
 fn drain_jobs(_payload: Json, files: Files, clock: Clock, env: Env, net: Network) : Result(
   Unit,
   AppError
@@ -2573,20 +2659,20 @@ fn drain_jobs(_payload: Json, files: Files, clock: Clock, env: Env, net: Network
               end
           end
         else
-          case Ai.embed_config(env)
-            None: try Jobs.complete(files, Db.ledger_db_path, clock, job.id, job.attempts)
-              .map_error(Db.map_table_error)
-            Some(ecfg):
-              case extract_indexed_page_id(job.payload_json)
-                Error(bad): try Jobs.fail_or_retry(
-                  files,
-                  Db.ledger_db_path,
-                  clock,
-                  job.id,
-                  job.attempts,
-                  bad
-                ).map_error(Db.map_table_error)
-                Ok(pid):
+          case extract_indexed_page_id(job.payload_json)
+            Error(bad): try Jobs.fail_or_retry(
+              files,
+              Db.ledger_db_path,
+              clock,
+              job.id,
+              job.attempts,
+              bad
+            ).map_error(Db.map_table_error)
+            Ok(pid):
+              case Ai.embed_config(env)
+                None: try Jobs.complete(files, Db.ledger_db_path, clock, job.id, job.attempts)
+                  .map_error(Db.map_table_error)
+                Some(ecfg):
                   embed_input_res = Ledger.read_locked(
                     files.read_only,
                     Db.ledger_db_path,
@@ -2721,6 +2807,10 @@ fn drain_jobs(_payload: Json, files: Files, clock: Clock, env: Env, net: Network
                             .map_error(Db.map_table_error)
                       end
                   end
+              end
+              case Ai.ai_config(env)
+                Ok(ai_cfg): refresh_semantic_summary_if_stale(pid, ai_cfg, files, clock, net)
+                Error(_): Unit
               end
           end
         end

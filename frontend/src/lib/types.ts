@@ -103,7 +103,8 @@ export type BlockKind =
   | { image: { attachment_id: string; caption: string } }
   | { file_embed: { attachment_id: string; filename: string } }
   | { page_link: { target_page_id: string } }
-  | { database_view_embed: { database_id: string; view_id: string | null } };
+  | { database_view_embed: { database_id: string; view_id: string | null } }
+  | { ai_brief: { prompt: string; source_scope: string | null; refreshed_at: string | null } };
 
 export interface Block {
   id: string;
@@ -552,4 +553,63 @@ export interface BlockContextResponse {
   page_blueprint: BlueprintDef | null;
   page_meta: PageBlueprintMeta | null;
   comments: Comment[];
+}
+
+export interface LivingSummary {
+  id: string;
+  entity_kind: "page" | "database" | string;
+  entity_id: string;
+  collection_id: string;
+  title: string;
+  structural_summary: string;
+  semantic_summary: string | null;
+  headings: string[];
+  word_count: number;
+  open_tasks: number;
+  done_tasks: number;
+  row_count: number;
+  blueprint_slug: string | null;
+  estimated_tokens: number;
+  source_version: number;
+  semantic_source_version: number;
+  updated_at: string;
+}
+
+export interface ContextPack {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  collection_ids: string[];
+  pinned_page_ids: string[];
+  database_ids: string[];
+  query_hint: string | null;
+  fresh_only: boolean;
+  include_full_blocks: boolean;
+  token_budget: number;
+  created_by: string;
+  updated_at: string;
+  version: number;
+}
+
+export interface CompiledPackItem {
+  entity_kind: string;
+  entity_id: string;
+  collection_id: string;
+  title: string;
+  inclusion_mode: string;
+  tokens_used: number;
+  pinned: boolean;
+}
+
+export interface CompiledPackResult {
+  pack: ContextPack;
+  markdown: string;
+  tokens_used: number;
+  token_budget: number;
+  budget_utilization_pct: number;
+  included_items: CompiledPackItem[];
+  omitted_count: number;
+  skipped_stale_count: number;
+  compiled_at: string;
 }
