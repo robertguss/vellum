@@ -15,7 +15,6 @@ use Domain.Types{AppError, AuthContext, AuthorKind, Page, PageKind, PrincipalKin
 use Json
 use Modb.Grants
 use Modb.Ledger
-use Modb.Table
 use Routes.Auth
 use VaultOps
 
@@ -300,9 +299,7 @@ fn import_notion(
       else
         tx
       end
-      col = case try Table.tx_get(cur, Db.collections_table(), input.collection_id).map_error(
-        Db.map_table_error
-      )
+      col = case try Db.tx_get_collection(cur, input.collection_id)
         Some(c) if c.archived_at == None: c
         Some(_) | None: return Error(Missing(entity: "collection", id: input.collection_id))
       end

@@ -6,6 +6,11 @@ messages_bucket,
 idempotency_bucket,
 reads_bucket,
 inbox_bucket,
+links_bucket,
+link_key,
+tx_put_chat_link,
+scan_chat_links_for_target,
+extract_entity_refs,
 slugify_channel,
 normalize_handle,
 extract_mentions,
@@ -50,6 +55,7 @@ messages_bucket = "vlm_chat_messages"
 idempotency_bucket = "vlm_chat_idempotency"
 reads_bucket = "vlm_chat_reads"
 inbox_bucket = "vlm_chat_inbox"
+links_bucket = "vlm_chat_links"
 
 fn parse_bytes_json(raw: Bytes) : Option(Json)
   case raw.decode_utf8
@@ -97,6 +103,258 @@ fn is_mention_body_char?(ch: Char) : Bool
 end
 
 ## Extracts unique lowercased `@handle` mentions from chat markdown while ignoring emails.
+## Builds composite key for reverse lookup of chat messages referencing workspaces entities.
+fn link_key(target_kind: Text, target_id: Text, channel_id: Text, msg_id: Text) : Text
+  "#{target_kind}:#{target_id}:#{channel_id}:#{msg_id}"
+end
+
+## Persists a reverse link record in `vlm_chat_links` (`target_kind:target_id:channel_id:msg_id`).
+fn tx_put_chat_link(
+  tx: WriteTx,
+  target_kind: Text,
+  target_id: Text,
+  channel_id: Text,
+  msg_id: Text,
+  link_json: Json
+) : Result(WriteTx, AppError)
+  key = link_key(target_kind, target_id, channel_id, msg_id)
+  Modb.tx_put(tx, links_bucket, key.bytes, link_json.to_text.bytes).map_error(fn(e)
+    ServerFailed(reason: e.to_text)
+  end)
+end
+
+## Scans `vlm_chat_links` for all chat link records referencing `(target_kind, target_id)`.
+fn scan_chat_links_for_target(
+  store: Store,
+  target_kind: Text,
+  target_id: Text,
+  limit: Int
+) : Result(List(Json), AppError)
+  prefix = "#{target_kind}:#{target_id}:"
+  hi = "#{target_kind}:#{target_id};"
+  rows = try Modb.scan(store, links_bucket, Some(prefix.bytes), Some(hi.bytes), limit).map_error(
+    fn(e)
+      ServerFailed(reason: e.to_text)
+    end
+  )
+  var out = []
+  for (k_bytes, v_bytes) in rows
+    k_txt = k_bytes.decode_utf8 or ""
+    if k_txt.starts_with?(prefix)
+      case v_bytes.decode_utf8
+        Some(txt):
+          case Json.parse(txt)
+            Ok(j): out = out.append(j)
+            Error(_): Unit
+          end
+        None: Unit
+      end
+    end
+  end
+  Ok(out)
+end
+
+fn is_ref_id_char?(c: Char) : Bool
+  c.ascii_letter? or c.ascii_digit? or c == '_' or c == '-'
+end
+
+fn parse_entity_ref_inner(inner: Text) : Option((Text, Text))
+  clean = inner.trim
+  if clean.empty? or clean.contains?(" ") or clean.contains?("\n") or clean.contains?("\r")
+    return None
+  end
+  if clean.starts_with?("page:")
+    pid = clean.drop_prefix("page:") or ""
+    if pid.empty?
+      None
+    else
+      Some(("page", pid))
+    end
+  else if clean.starts_with?("pg_")
+    Some(("page", clean))
+  else if clean.starts_with?("row:")
+    rid = clean.drop_prefix("row:") or ""
+    if rid.empty?
+      None
+    else
+      Some(("row", rid))
+    end
+  else if clean.starts_with?("task:")
+    rid = clean.drop_prefix("task:") or ""
+    if rid.empty?
+      None
+    else
+      Some(("row", rid))
+    end
+  else if clean.starts_with?("proposal:")
+    prid = clean.drop_prefix("proposal:") or ""
+    if prid.empty?
+      None
+    else
+      Some(("proposal", prid))
+    end
+  else if clean.starts_with?("thread:")
+    rest = clean.drop_prefix("thread:") or ""
+    parts = rest.split(":")
+    if parts.size == 2
+      cid = parts.get(0) or ""
+      mid = parts.get(1) or ""
+      if not cid.empty? and not mid.empty?
+        Some(("thread", "#{cid}:#{mid}"))
+      else
+        None
+      end
+    else
+      None
+    end
+  else
+    None
+  end
+end
+
+fn try_append_entity_ref(
+  out: List(Json),
+  seen: List(Text),
+  kind: Text,
+  id: Text,
+  raw: Text
+) : (List(Json), List(Text))
+  if out.size >= 20
+    return (out, seen)
+  end
+  dedup_key = "#{kind}:#{id}"
+  if seen.contains?(dedup_key)
+    return (out, seen)
+  end
+  item = Json.Object({
+    "kind": Json.String(kind),
+    "id": Json.String(id),
+    "raw": Json.String(raw)
+  })
+  (out.append(item), seen.append(dedup_key))
+end
+
+fn parse_bracket_entity_ref(chars: List(Char), start: Int) : Option((Text, Text, Text, Int))
+  var j = start + 2
+  max_end = if chars.size < start + 162
+    chars.size
+  else
+    start + 162
+  end
+  var inner_chars = []
+  var found_close? = false
+  while j + 1 < max_end and not found_close?
+    c = chars.get(j) or '\n'
+    c2 = chars.get(j + 1) or '\n'
+    if c == ']' and c2 == ']'
+      found_close? = true
+    else if c == '\n' or c == '\r' or c == '['
+      j = max_end
+    else
+      inner_chars = inner_chars.append(c)
+      j = j + 1
+    end
+  end
+  if not found_close?
+    return None
+  end
+  inner = Text.from_chars(inner_chars)
+  case parse_entity_ref_inner(inner)
+    Some((kind, id)): Some((kind, id, "[[#{inner.trim}]]", j + 2))
+    None: None
+  end
+end
+
+fn parse_at_entity_ref(chars: List(Char), at_idx: Int) : Option((Text, Text, Text, Int))
+  if at_idx > 0
+    prev = chars.get(at_idx - 1) or ' '
+    if is_ref_id_char?(prev)
+      return None
+    end
+  end
+  var k = at_idx + 1
+  var pfx_chars = []
+  while k < chars.size and (chars.get(k) or ' ').ascii_letter?
+    pfx_chars = pfx_chars.append(chars.get(k) or ' ')
+    k = k + 1
+  end
+  if chars.get(k) != Some(':')
+    return None
+  end
+  pfx = Text.from_chars(pfx_chars).ascii_lowercase
+  is_supported? = pfx == "page" or pfx == "row" or pfx == "task" or pfx == "proposal" or pfx == "thread"
+  if not is_supported?
+    return None
+  end
+  norm_kind = if pfx == "task"
+    "row"
+  else
+    pfx
+  end
+  var m = k + 1
+  var part1 = []
+  while m < chars.size and is_ref_id_char?(chars.get(m) or ' ')
+    part1 = part1.append(chars.get(m) or ' ')
+    m = m + 1
+  end
+  if part1.empty?
+    return None
+  end
+  if norm_kind == "thread"
+    if chars.get(m) != Some(':')
+      return None
+    end
+    m = m + 1
+    var part2 = []
+    while m < chars.size and is_ref_id_char?(chars.get(m) or ' ')
+      part2 = part2.append(chars.get(m) or ' ')
+      m = m + 1
+    end
+    if part2.empty?
+      return None
+    end
+    id = "#{Text.from_chars(part1)}:#{Text.from_chars(part2)}"
+    return Some((norm_kind, id, "@#{pfx}:#{id}", m))
+  end
+  id = Text.from_chars(part1)
+  Some((norm_kind, id, "@#{pfx}:#{id}", m))
+end
+
+## Extracts unique inline entity citations (`[[page:...]]`, `[[pg_...]]`, `[[row:...]]`, `[[task:...]]`,
+## `[[proposal:...]]`, `[[thread:...:...]]`, and `@page:...`/`@row:...`/`@task:...`/`@proposal:...`/`@thread:...:...`)
+## capped at 20 references per message.
+fn extract_entity_refs(body: Text) : List(Json)
+  chars = body.chars
+  var out = []
+  var seen = []
+  var i = 0
+  while i < chars.size and out.size < 20
+    c = chars.get(i) or ' '
+    if c == '[' and chars.get(i + 1) == Some('[')
+      case parse_bracket_entity_ref(chars, i)
+        Some((kind, id, raw, next_i)):
+          (out2, seen2) = try_append_entity_ref(out, seen, kind, id, raw)
+          out = out2
+          seen = seen2
+          i = next_i
+        None: i = i + 1
+      end
+    else if c == '@'
+      case parse_at_entity_ref(chars, i)
+        Some((kind, id, raw, next_i)):
+          (out2, seen2) = try_append_entity_ref(out, seen, kind, id, raw)
+          out = out2
+          seen = seen2
+          i = next_i
+        None: i = i + 1
+      end
+    else
+      i = i + 1
+    end
+  end
+  out
+end
+
 fn extract_mentions(body: Text) : List(Text)
   chars = body.chars
   var out = []
@@ -127,7 +385,11 @@ fn extract_mentions(body: Text) : List(Text)
         end
         if not h_chars.empty? and h_chars.any?(fn(c) c.ascii_letter? or c.ascii_digit? end)
           norm = Text.from_chars(h_chars).ascii_lowercase
-          if not out.contains?(norm)
+          next_is_colon? = chars.get(j) == Some(':')
+          is_entity_prefix? = next_is_colon? and (
+            norm == "page" or norm == "row" or norm == "task" or norm == "proposal" or norm == "thread"
+          )
+          if not is_entity_prefix? and not out.contains?(norm)
             out = out.append(norm)
           end
         end

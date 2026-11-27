@@ -4,6 +4,7 @@ use Domain.Types{AuthContext}
 use Routes.Ai
 use Routes.Auth
 use Routes.Chat
+use Routes.ChatMoat
 use Routes.Collab
 use Routes.Databases
 use Routes.Importer
@@ -155,6 +156,10 @@ api
     get "/chat/inbox" Chat.list_inbox
     post "/chat/inbox/ack" Chat.ack_inbox
     get "/chat/search" Chat.search_chat
+    post "/chat/channels/:id/messages/:msg_id/create-task" ChatMoat.create_task_from_message
+    post "/chat/channels/:id/messages/:msg_id/draft-proposal" ChatMoat.draft_proposal_from_message
+    get "/chat/entities" ChatMoat.list_linkable_entities
+    post "/chat/import/slack" ChatMoat.import_slack_batch
   end
 
   job "arvo.jobs.drain" Workspace.drain_jobs every 10.seconds

@@ -4523,6 +4523,494 @@ pack(sys.argv[3], sys.argv[4])`,
 
   console.log("✓ Live v3 M3.1 Unified Vellum Chat Core, Live SSE, VersityGW Attachments, FERPA Vault Isolation & Modb.Erasure Scrub verified");
 }
+
+// 25. Live v3 M3.2: Vellum Chat Moat (Thread->Task + Live Status Sync, Citations, World Proposals, FERPA Locks & Slack Export ZIP CLI)
+{
+  const { spawn } = await import("node:child_process");
+  const runCli = (cmd, args) =>
+    new Promise((resolve) => {
+      const child = spawn(cmd, args, { encoding: "utf8" });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (d) => {
+        stdout += d;
+      });
+      child.stderr.on("data", (d) => {
+        stderr += d;
+      });
+      child.on("close", (status) => resolve({ status, stdout, stderr }));
+    });
+
+  const colRes = await apiJson("/api/collections", {
+    method: "POST",
+    body: JSON.stringify({
+      slug: "moat-live-e2e",
+      name: "Chat Moat Live",
+      description: "Live v3 M3.2 E2E",
+      icon: null,
+      write_policy: "direct_with_audit",
+      freshness_ttl_days: null,
+    }),
+  });
+  assert.equal(colRes.res.status, 201, colRes.text);
+  const moatColId = colRes.json.id;
+
+  const targetPgRes = await apiJson("/api/pages", {
+    method: "POST",
+    body: JSON.stringify({
+      collection_id: moatColId,
+      parent_page_id: null,
+      title: "Moat Runbook Live",
+      markdown: "# Moat Runbook Live\n\nLive proposal target.",
+      icon: null,
+      freshness_ttl_days: null,
+      reason: "seed live moat target page",
+    }),
+  });
+  assert.equal(targetPgRes.res.status, 201, targetPgRes.text);
+  const moatTargetPgId = targetPgRes.json.page.id;
+
+  const moatDbRes = await apiJson("/api/databases", {
+    method: "POST",
+    body: JSON.stringify({
+      collection_id: moatColId,
+      parent_page_id: null,
+      title: "Moat Live Tasks",
+      description: null,
+      properties: [
+        { id: "title", name: "Title", kind: "title", required: true, sort_order: "a" },
+        {
+          id: "status",
+          name: "Status",
+          kind: {
+            status: {
+              options: [
+                { id: "opt_todo", label: "Todo", color: "gray" },
+                { id: "opt_done", label: "Done", color: "green" },
+              ],
+              done_option_ids: ["opt_done"],
+            },
+          },
+          required: false,
+          sort_order: "b",
+        },
+      ],
+    }),
+  });
+  assert.equal(moatDbRes.res.status, 201, moatDbRes.text);
+  const moatDbId = moatDbRes.json.database.id;
+
+  const chRes = await apiJson("/api/v1/chat/channels", {
+    method: "POST",
+    body: JSON.stringify({
+      kind: "public",
+      collection_id: moatColId,
+      name: "moat-live",
+      topic: "Chat Moat verification",
+      member_principal_ids: [],
+    }),
+  });
+  assert.equal(chRes.res.status, 201, chRes.text);
+  const moatChId = chRes.json.channel.id;
+
+  const msgRes = await apiJson(`/api/v1/chat/channels/${moatChId}/messages`, {
+    method: "POST",
+    body: JSON.stringify({ body_markdown: "Live decision: enable CDN cache tag invalidation." }),
+  });
+  assert.equal(msgRes.res.status, 201, msgRes.text);
+  const moatMsgId = msgRes.json.message.id;
+
+  // 25a. 1-Click Thread -> Task + Live Status Sync + Bidirectional Backlinks
+  const ctRes = await apiJson(`/api/v1/chat/channels/${moatChId}/messages/${moatMsgId}/create-task`, {
+    method: "POST",
+    body: JSON.stringify({
+      database_id: moatDbId,
+      title: "Ship CDN cache tags",
+      cells: { status: { select_val: { option_id: "opt_todo" } } },
+    }),
+  });
+  assert.equal(ctRes.res.status, 201, ctRes.text);
+  const taskRowId = ctRes.json.row.id;
+  const taskRowPgId = ctRes.json.row.page_id;
+  assert.equal(ctRes.json.message.linked_rows?.[0]?.status_label, "Todo");
+
+  const patchRow = await apiJson(`/api/databases/${moatDbId}/rows/${taskRowId}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      cells: { status: { select_val: { option_id: "opt_done" } } },
+      expected_version: 1,
+      reason: "mark live moat task done",
+    }),
+  });
+  assert.equal(patchRow.res.status, 200, patchRow.text);
+
+  const msgsSynced = await apiJson(`/api/v1/chat/channels/${moatChId}/messages`);
+  assert.equal(msgsSynced.res.status, 200, msgsSynced.text);
+  const syncedRoot = (msgsSynced.json.messages ?? []).find((m) => m.id === moatMsgId);
+  assert.equal(syncedRoot?.linked_rows?.[0]?.status_label, "Done");
+  assert.equal(syncedRoot?.linked_rows?.[0]?.status_color, "green");
+
+  const dbShow = await apiJson(`/api/databases/${moatDbId}`);
+  assert.equal(dbShow.res.status, 200, dbShow.text);
+  assert.equal(dbShow.json.row_chat_links?.[taskRowId]?.[0]?.channel_id, moatChId);
+  assert.equal(dbShow.json.row_chat_links?.[taskRowId]?.[0]?.message_id, moatMsgId);
+
+  const rowPgShow = await apiJson(`/api/pages/${taskRowPgId}`);
+  assert.equal(rowPgShow.res.status, 200, rowPgShow.text);
+  assert.ok((rowPgShow.json.origin_chat_threads ?? []).some((l) => l.channel_id === moatChId && l.message_id === moatMsgId));
+
+  // 25b. Decision -> Modb.World Change Proposal & accept + Inline Citations & Autocomplete
+  const dpRes = await apiJson(`/api/v1/chat/channels/${moatChId}/messages/${moatMsgId}/draft-proposal`, {
+    method: "POST",
+    body: JSON.stringify({ target_page_id: moatTargetPgId, tone: "info" }),
+  });
+  assert.equal(dpRes.res.status, 201, dpRes.text);
+  const moatPropId = dpRes.json.proposal.id;
+
+  const accRes = await apiJson(`/api/proposals/${moatPropId}/accept`, { method: "POST", body: "{}" });
+  assert.equal(accRes.res.status, 200, accRes.text);
+
+  const targetPgShow = await apiJson(`/api/pages/${moatTargetPgId}`);
+  assert.equal(targetPgShow.res.status, 200, targetPgShow.text);
+  assert.ok(
+    (targetPgShow.json.blocks ?? []).some(
+      (b) => b.kind?.callout && String(b.markdown ?? "").includes(`[[thread:${moatChId}:${moatMsgId}]]`)
+    ),
+    "Accepted proposal landed cited Callout on target page"
+  );
+  assert.ok((targetPgShow.json.origin_chat_threads ?? []).some((l) => l.link_kind === "proposal" && l.channel_id === moatChId));
+
+  const citeRes = await apiJson(`/api/v1/chat/channels/${moatChId}/messages`, {
+    method: "POST",
+    body: JSON.stringify({
+      body_markdown: `Live refs [[page:${moatTargetPgId}]] @row:${taskRowId} @proposal:${moatPropId} @thread:${moatChId}:${moatMsgId}`,
+    }),
+  });
+  assert.equal(citeRes.res.status, 201, citeRes.text);
+  const refs = citeRes.json.message.inline_refs ?? [];
+  assert.ok(refs.some((r) => r.kind === "page" && r.redacted === false && r.accessible === true));
+  assert.ok(refs.some((r) => r.kind === "row" && r.redacted === false && r.accessible === true));
+  assert.ok(refs.some((r) => r.kind === "proposal" && r.redacted === false && r.accessible === true));
+  assert.ok(refs.some((r) => r.kind === "thread" && r.redacted === false && r.accessible === true));
+
+  const entRes = await apiJson("/api/v1/chat/entities?q=Moat%20Runbook");
+  assert.equal(entRes.res.status, 200, entRes.text);
+  assert.ok((entRes.json.entities ?? []).some((e) => e.id === moatTargetPgId));
+
+  // 25c. FERPA Cross-Boundary 403 Lock + Inline Citation Redaction for Non-Vault Agent
+  const vStat25 = await apiJson("/api/admin/vault/status");
+  assert.equal(vStat25.res.status, 200, vStat25.text);
+  const adaPid25 = (vStat25.json.principals ?? []).find((p) => p.email === "ada@acme.io")?.id;
+  assert.ok(adaPid25);
+
+  const extBotRes = await apiJson("/api/admin/agents", {
+    method: "POST",
+    body: JSON.stringify({
+      handle: "ext-moat-bot-25",
+      display_name: "External Moat Checker",
+      model_id: "gpt-4o-mini",
+      label: "wildcard",
+      allowed_actions: ["read", "comment", "propose", "write_db", "write_direct", "upload_attachment"],
+      allowed_collections: null,
+      max_calls: 200,
+      ttl_days: 7,
+    }),
+  });
+  assert.equal(extBotRes.res.status, 201, extBotRes.text);
+  const extHeaders25 = { Authorization: `Bearer ${extBotRes.json.raw_token}` };
+
+  const fColRes25 = await apiJson("/api/collections", {
+    method: "POST",
+    body: JSON.stringify({
+      slug: "ferpa-moat-live",
+      name: "FERPA Moat Live",
+      description: null,
+      icon: null,
+      write_policy: "direct_with_audit",
+      freshness_ttl_days: null,
+    }),
+  });
+  assert.equal(fColRes25.res.status, 201, fColRes25.text);
+  const fColId25 = fColRes25.json.id;
+
+  const grpRes25 = await apiJson("/api/admin/groups", {
+    method: "POST",
+    body: JSON.stringify({
+      name: "Vault Moat Group",
+      slug: null,
+      description: "Live FERPA group",
+      member_principal_ids: [adaPid25],
+    }),
+  });
+  assert.equal(grpRes25.res.status, 201, grpRes25.text);
+
+  const secRes25 = await apiJson(`/api/collections/${fColId25}/security`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      security_tier: "ferpa_restricted",
+      allowed_group_ids: [grpRes25.json.group.id],
+      allowed_principal_ids: [],
+      allow_local_ai: false,
+      reason: "enable live ferpa moat",
+    }),
+  });
+  assert.equal(secRes25.res.status, 200, secRes25.text);
+
+  const fPgRes25 = await apiJson("/api/pages", {
+    method: "POST",
+    body: JSON.stringify({
+      collection_id: fColId25,
+      parent_page_id: null,
+      title: "Live Secret FERPA Case",
+      markdown: "# Restricted",
+      icon: null,
+      freshness_ttl_days: null,
+      reason: "seed ferpa live moat",
+    }),
+  });
+  assert.equal(fPgRes25.res.status, 201, fPgRes25.text);
+  const fPgId25 = fPgRes25.json.page.id;
+
+  const fChRes25 = await apiJson("/api/v1/chat/channels", {
+    method: "POST",
+    body: JSON.stringify({
+      kind: "public",
+      collection_id: fColId25,
+      name: "ferpa-moat-room",
+      topic: "Vault",
+      member_principal_ids: [],
+    }),
+  });
+  assert.equal(fChRes25.res.status, 201, fChRes25.text);
+  const fChId25 = fChRes25.json.channel.id;
+
+  const fMsgRes25 = await apiJson(`/api/v1/chat/channels/${fChId25}/messages`, {
+    method: "POST",
+    body: JSON.stringify({ body_markdown: "Confidential FERPA live note" }),
+  });
+  assert.equal(fMsgRes25.res.status, 201, fMsgRes25.text);
+  const fMsgId25 = fMsgRes25.json.message.id;
+
+  const crossTask = await apiJson(`/api/v1/chat/channels/${fChId25}/messages/${fMsgId25}/create-task`, {
+    method: "POST",
+    body: JSON.stringify({ database_id: moatDbId }),
+  });
+  assert.equal(crossTask.res.status, 403, "Cross-boundary FERPA create-task blocked with 403");
+
+  const crossProp = await apiJson(`/api/v1/chat/channels/${fChId25}/messages/${fMsgId25}/draft-proposal`, {
+    method: "POST",
+    body: JSON.stringify({ target_page_id: moatTargetPgId }),
+  });
+  assert.equal(crossProp.res.status, 403, "Cross-boundary FERPA draft-proposal blocked with 403");
+
+  const pubFerpaCite = await apiJson(`/api/v1/chat/channels/${moatChId}/messages`, {
+    method: "POST",
+    body: JSON.stringify({ body_markdown: `Restricted @page:${fPgId25} @thread:${fChId25}:${fMsgId25}` }),
+  });
+  assert.equal(pubFerpaCite.res.status, 201, pubFerpaCite.text);
+  const pubFerpaCiteId = pubFerpaCite.json.message.id;
+
+  const extViewRes = await fetch(`${BASE}/api/v1/chat/channels/${moatChId}/messages`, { headers: extHeaders25 });
+  assert.equal(extViewRes.status, 200);
+  const extViewTxt = await extViewRes.text();
+  assert.ok(!extViewTxt.includes("Live Secret FERPA Case"), "Unauthorized principal never sees restricted title");
+  const extCiteMsg = (JSON.parse(extViewTxt).messages ?? []).find((m) => m.id === pubFerpaCiteId);
+  assert.equal(extCiteMsg?.inline_refs?.length, 2);
+  assert.ok(extCiteMsg.inline_refs.every((r) => r.redacted === true && r.accessible === false));
+
+  // 25d. Synthetic acme.io Slack Export ZIP CLI Import -> VersityGW S3 Attachment -> Read-Only 403 -> Idempotency
+  const impBotRes = await apiJson("/api/admin/agents", {
+    method: "POST",
+    body: JSON.stringify({
+      handle: "slack-import-bot-25",
+      display_name: "Slack Import CLI",
+      model_id: "gpt-4o-mini",
+      label: "wildcard",
+      allowed_actions: ["read", "comment", "write_direct", "manage_schema", "upload_attachment"],
+      allowed_collections: null,
+      max_calls: 200,
+      ttl_days: 7,
+    }),
+  });
+  assert.equal(impBotRes.res.status, 201, impBotRes.text);
+  const slkTok = impBotRes.json.raw_token;
+
+  const slkTmp = fs.mkdtempSync(path.join(LIVE_DATA, "slack-zip-"));
+  try {
+    const zipSrc = path.join(slkTmp, "export_src");
+    fs.mkdirSync(path.join(zipSrc, "engineering"), { recursive: true });
+    fs.mkdirSync(path.join(zipSrc, "files", "F01"), { recursive: true });
+
+    const attPayloadStr = "Live S3 Slack Attachment Content\n";
+    fs.writeFileSync(path.join(zipSrc, "files", "F01", "spec.txt"), attPayloadStr);
+    fs.writeFileSync(
+      path.join(zipSrc, "users.json"),
+      JSON.stringify([
+        {
+          id: "U01",
+          name: "ada",
+          profile: { email: "ada@acme.io", display_name: "Ada Lovelace" },
+        },
+      ])
+    );
+    fs.writeFileSync(
+      path.join(zipSrc, "channels.json"),
+      JSON.stringify([
+        {
+          id: "C_SLK_E2E",
+          name: "engineering",
+          topic: { value: "Engineering Slack Archive" },
+          is_private: false,
+        },
+      ])
+    );
+    fs.writeFileSync(
+      path.join(zipSrc, "engineering", "2026-01-15.json"),
+      JSON.stringify([
+        {
+          type: "message",
+          ts: "1768471200.000100",
+          user: "U01",
+          text: "Review <!here> deploy in <#C_SLK_E2E|engineering>",
+          reactions: [{ name: "rocket", users: ["U01"] }],
+          files: [{ id: "F01", name: "spec.txt", mimetype: "text/plain" }],
+        },
+        {
+          type: "message",
+          ts: "1768471260.000200",
+          thread_ts: "1768471200.000100",
+          user: "U01",
+          text: "Thread reply synced cleanly",
+        },
+      ])
+    );
+
+    const slkZipPath = path.join(slkTmp, "acme-slack-export.zip");
+    execFileSync(
+      "python3",
+      [
+        "-c",
+        `import os, sys, zipfile
+with zipfile.ZipFile(sys.argv[2], 'w') as zf:
+    for r, _, files in os.walk(sys.argv[1]):
+        for fn in files:
+            p = os.path.join(r, fn)
+            zf.write(p, os.path.relpath(p, sys.argv[1]))`,
+        zipSrc,
+        slkZipPath,
+      ],
+      { stdio: "pipe" }
+    );
+
+    const dryRun = await runCli("node", ["scripts/slack-import.mjs", "--zip", slkZipPath, "--dry-run"]);
+    assert.equal(dryRun.status, 0, dryRun.stderr);
+    const dryPlan = JSON.parse(dryRun.stdout);
+    assert.equal(dryPlan.dry_run, true);
+    assert.equal(dryPlan.channels_count, 1);
+    assert.equal(dryPlan.channels?.[0]?.bundled_files_count, 1);
+
+    const slkState = path.join(slkTmp, "slack-state.json");
+    const run1 = await runCli("node", [
+      "scripts/slack-import.mjs",
+      "--zip",
+      slkZipPath,
+      "--vellum-url",
+      BASE,
+      "--vellum-token",
+      slkTok,
+      "--collection-slug",
+      "slack-archive-e2e",
+      "--collection-name",
+      "Slack Archive Live",
+      "--since-days",
+      "3650",
+      "--read-only-archive",
+      "--state",
+      slkState,
+    ]);
+    assert.equal(run1.status, 0, `${run1.stderr}\n${run1.stdout}`);
+    const sum1 = JSON.parse(run1.stdout);
+    assert.equal(sum1.messages_created, 2);
+    assert.equal(sum1.attachments_uploaded, 1);
+    const importedChId = sum1.channels?.[0]?.channel_id;
+    assert.ok(importedChId);
+
+    const slkMsgsRes = await apiJson(`/api/v1/chat/channels/${importedChId}/messages`);
+    assert.equal(slkMsgsRes.res.status, 200, slkMsgsRes.text);
+    const slkMsgs = slkMsgsRes.json.messages ?? [];
+    const pMsg = slkMsgs.find((m) => m.slack_ts === "1768471200.000100");
+    assert.ok(pMsg, "Slack parent message imported");
+    assert.equal(pMsg.reply_count, 1);
+
+    const slkRepliesRes = await apiJson(
+      `/api/v1/chat/channels/${importedChId}/messages?parent_message_id=${encodeURIComponent(pMsg.id)}`
+    );
+    assert.equal(slkRepliesRes.res.status, 200, slkRepliesRes.text);
+    const rMsg = (slkRepliesRes.json.messages ?? []).find((m) => m.slack_ts === "1768471260.000200");
+    assert.ok(rMsg && rMsg.parent_message_id === pMsg.id, "Slack thread reply imported & linked");
+    const slkAttId = pMsg.attachments?.[0]?.id;
+    assert.ok(slkAttId, "Slack attachment uploaded & linked");
+
+    const slkAttDl = await rawFetch(`${BASE}/api/attachments/${slkAttId}/download`);
+    assert.equal(slkAttDl.status, 302);
+    const slkS3Res = await fetch(slkAttDl.headers.get("location"));
+    assert.equal(slkS3Res.status, 200);
+    assert.equal(await slkS3Res.text(), attPayloadStr);
+
+    const roPost = await apiJson(`/api/v1/chat/channels/${importedChId}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ body_markdown: "Blocked post into read-only Slack archive" }),
+    });
+    assert.equal(roPost.res.status, 403, "read_only archive channel rejects new posts");
+
+    const run2 = await runCli("node", [
+      "scripts/slack-import.mjs",
+      "--zip",
+      slkZipPath,
+      "--vellum-url",
+      BASE,
+      "--vellum-token",
+      slkTok,
+      "--collection-slug",
+      "slack-archive-e2e",
+      "--since-days",
+      "3650",
+      "--read-only-archive",
+      "--state",
+      slkState,
+    ]);
+    assert.equal(run2.status, 0, run2.stderr);
+    const sum2 = JSON.parse(run2.stdout);
+    assert.equal(sum2.messages_created, 0);
+    assert.equal(sum2.messages_skipped, 2);
+
+    const run3 = await runCli("node", [
+      "scripts/slack-import.mjs",
+      "--zip",
+      slkZipPath,
+      "--vellum-url",
+      BASE,
+      "--vellum-token",
+      slkTok,
+      "--collection-slug",
+      "slack-archive-e2e",
+      "--since-days",
+      "3650",
+      "--read-only-archive",
+      "--skip-attachments",
+      "--state",
+      path.join(slkTmp, "slack-state-fresh.json"),
+    ]);
+    assert.equal(run3.status, 0, run3.stderr);
+    const sum3 = JSON.parse(run3.stdout);
+    assert.equal(sum3.messages_created, 0, "Backend slack_import idempotency deduplicates replay");
+    assert.equal(sum3.messages_skipped, 2);
+  } finally {
+    fs.rmSync(slkTmp, { recursive: true, force: true });
+  }
+
+  console.log("✓ Live v3 M3.2 Chat Moat, Live Status Sync, Citations, World Proposals, FERPA Locks & Slack Export ZIP Importer verified");
+}
 EOF
 
 echo "All Live Vellum E2E checks against mo serve + Dex + VersityGW S3 passed."

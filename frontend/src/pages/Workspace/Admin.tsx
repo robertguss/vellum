@@ -95,6 +95,19 @@ export default function AdminConsole({
   const [impCsvText, setImpCsvText] = useState("");
   const [impResult, setImpResult] = useState<string | null>(null);
 
+  // Slack Export Importer
+  const [slackColId, setSlackColId] = useState(collections[0]?.id ?? "col_general");
+  const [slackChName, setSlackChName] = useState("eng-archive");
+  const slackTopic = "Imported Slack archive";
+  const [slackSinceDays, setSlackSinceDays] = useState("30");
+  const [slackReadOnly, setSlackReadOnly] = useState(true);
+  const [slackDryRun, setSlackDryRun] = useState(true);
+  const [slackSampleText, setSlackSampleText] = useState(
+    "Decision: rotate gateway certificates every 90 days."
+  );
+  const [slackBusy, setSlackBusy] = useState(false);
+  const [slackResult, setSlackResult] = useState<string | null>(null);
+
   // Selective Undo (Modb.Replay)
   const [replayFilterKind, setReplayFilterKind] = useState<
     "exclude_principal" | "exclude_grant" | "exclude_world" | "stop_before_seq"
@@ -667,6 +680,52 @@ export default function AdminConsole({
     }
   }
 
+  async function handleSlackQuickImport(e: React.FormEvent) {
+    e.preventDefault();
+    if (slackBusy) return;
+    setSlackBusy(true);
+    setError(null);
+    setSlackResult(null);
+    try {
+      const targetCol = slackColId || collections[0]?.id || "col_general";
+      const nowSec = Math.floor(Date.now() / 1000);
+      const res = await apiFetch<{
+        channel: { id: string; slug: string };
+        created_count: number;
+        skipped_count: number;
+      }>("/api/v1/chat/import/slack", {
+        method: "POST",
+        body: JSON.stringify({
+          collection_id: targetCol,
+          channel: {
+            slack_id: `C_${slackChName.replace(/[^A-Za-z0-9]/g, "").toUpperCase() || "ARCHIVE"}`,
+            name: slackChName.trim() || "slack-archive",
+            topic: slackTopic.trim(),
+            read_only: slackReadOnly,
+          },
+          messages: slackSampleText.trim()
+            ? [
+                {
+                  ts: `${nowSec}.000100`,
+                  author_handle: "slack_archive",
+                  author_name: "Slack Archive",
+                  text: slackSampleText.trim(),
+                  created_at: new Date(nowSec * 1000).toISOString(),
+                },
+              ]
+            : [],
+        }),
+      });
+      setSlackResult(
+        `Channel #${res.channel.slug} (${res.channel.id}): created ${res.created_count}, skipped ${res.skipped_count}.`
+      );
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Slack archive import failed");
+    } finally {
+      setSlackBusy(false);
+    }
+  }
+
   async function handleSimulateReplay(e: React.FormEvent) {
     e.preventDefault();
     setReplayBusy(true);
@@ -1208,9 +1267,108 @@ export default function AdminConsole({
           </div>
         )}
 
-        {/* TAB 3: NOTION IMPORTER */}
+        {/* TAB 3: NOTION & SLACK IMPORTERS */}
         {tab === "importer" && (
           <div className="space-y-4">
+            <form
+              onSubmit={handleSlackQuickImport}
+              className="rounded-2xl border border-stone-200 bg-white p-6 space-y-4"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h2 className="text-base font-semibold text-stone-900">
+                  Slack Export ZIP Importer
+                </h2>
+                <span className="rounded-full bg-sky-50 border border-sky-200 px-2.5 py-0.5 font-mono text-[10px] text-sky-800">
+                  POST /api/v1/chat/import/slack
+                </span>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+                <div>
+                  <label className="font-medium text-stone-700">Target Collection</label>
+                  <select
+                    value={slackColId}
+                    onChange={(e) => setSlackColId(e.target.value)}
+                    className="mt-1 w-full rounded-lg border border-stone-200 px-3 py-2 bg-white"
+                  >
+                    {collections.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="font-medium text-stone-700">Channel Name</label>
+                  <input
+                    value={slackChName}
+                    onChange={(e) => setSlackChName(e.target.value)}
+                    className="mt-1 w-full rounded-lg border border-stone-200 px-3 py-2 font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="font-medium text-stone-700">Window (`--since-days`)</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={36500}
+                    value={slackSinceDays}
+                    onChange={(e) => setSlackSinceDays(e.target.value)}
+                    className="mt-1 w-full rounded-lg border border-stone-200 px-3 py-2 font-mono"
+                  />
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-4 text-xs text-stone-700">
+                <label className="inline-flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={slackReadOnly}
+                    onChange={(e) => setSlackReadOnly(e.target.checked)}
+                  />
+                  Read-only archive (`--read-only-archive`)
+                </label>
+                <label className="inline-flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={slackDryRun}
+                    onChange={(e) => setSlackDryRun(e.target.checked)}
+                  />
+                  CLI dry-run (`--dry-run`)
+                </label>
+              </div>
+              <div className="rounded-lg border border-stone-200 bg-stone-50 p-3 text-[11px] font-mono text-stone-700 overflow-x-auto">
+                node scripts/slack-import.mjs --zip ./slack-export.zip --vellum-url{" "}
+                {typeof window !== "undefined" ? window.location.origin : "http://127.0.0.1:8080"}{" "}
+                --solo-login --collection-slug{" "}
+                {collections.find((c) => c.id === slackColId)?.slug ?? "slack-archive"}
+                {slackSinceDays.trim() ? ` --since-days ${slackSinceDays.trim()}` : ""}
+                {slackReadOnly ? " --read-only-archive" : ""}
+                {slackDryRun ? " --dry-run" : ""}
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs items-end">
+                <div className="md:col-span-2">
+                  <label className="font-medium text-stone-700">Quick Archive Test Message</label>
+                  <input
+                    value={slackSampleText}
+                    onChange={(e) => setSlackSampleText(e.target.value)}
+                    className="mt-1 w-full rounded-lg border border-stone-200 px-3 py-2 font-mono"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={slackBusy}
+                  className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-stone-900 px-4 py-2 text-xs font-medium text-white hover:bg-stone-800 disabled:opacity-50"
+                >
+                  <Upload className="h-3.5 w-3.5" />
+                  {slackBusy ? "Importing..." : "Import Slack Sample"}
+                </button>
+              </div>
+              {slackResult && (
+                <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-900">
+                  {slackResult}
+                </div>
+              )}
+            </form>
+
             <form
               onSubmit={handleNotionImport}
               className="rounded-2xl border border-stone-200 bg-white p-6 space-y-4"

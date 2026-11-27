@@ -118,11 +118,9 @@ fn load_page_bp_meta(store: Store, page_id: Text) : Result(
   (Option(BlueprintDef), Option(PageBlueprintMeta)),
   AppError
 )
-  pm_opt = try Table.get(store, Db.page_meta_table(), page_id).map_error(Db.map_table_error)
+  pm_opt = try Db.get_page_meta(store, page_id)
   bp_opt = case pm_opt
-    Some(pm): try Table.get(store, Db.blueprints_table(), pm.blueprint_id).map_error(
-      Db.map_table_error
-    )
+    Some(pm): try Db.get_blueprint(store, pm.blueprint_id)
     None: None
   end
   Ok((bp_opt, pm_opt))
@@ -133,7 +131,7 @@ fn resolve_snapshot_collections(
   auth: AuthContext,
   filter_param: Option(Text)
 ) : Result(List(Collection), AppError)
-  rows = try Table.scan(store, Db.collections_table(), None, None, 200).map_error(Db.map_table_error)
+  rows = try Db.scan_collections(store, 200)
   active = rows.filter(fn(p) p.1.archived_at == None end).map(fn(p) p.1 end).sort_by(fn(c)
     c.slug
   end)
@@ -299,32 +297,32 @@ fn sync_push_create(
   col_tok = try infer_collection_token(input, fm).or_fail(
     BadInput(reason: "new page push requires collection_id or <collection_slug>/<file>.md path")
   )
-  col = try Ledger.read_locked(
+  col_j = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
     fn(db)
-      rows = try Table.scan(Ledger.store(db), Db.collections_table(), None, None, 200).map_error(
-        Db.map_table_error
-      )
+      rows = try Db.scan_collections(Ledger.store(db), 200)
       found = rows.filter(fn(p) p.1.archived_at == None end).map(fn(p) p.1 end).find(fn(c)
         c.id == col_tok or c.slug == col_tok
       end)
-      case found
-        Some(c): Ok(c)
-        None: Error(Missing(entity: "collection", id: col_tok))
+      c = case found
+        Some(col_rec): col_rec
+        None: return Error(Missing(entity: "collection", id: col_tok))
       end
+      try Policy.require_collection_access(auth, "write_direct", c.id)
+      if not Policy.can_write_page_direct?(auth, c)
+        return Error(
+          Forbidden(
+            reason: "collection '#{c.slug}' write policy requires change proposals for this principal"
+          )
+        )
+      end
+      Ok(Json.Object({"id": Json.String(c.id), "slug": Json.String(c.slug)}))
     end
   )
-  try Policy.require_collection_access(auth, "write_direct", col.id)
-  if not Policy.can_write_page_direct?(auth, col)
-    return Error(
-      Forbidden(
-        reason: "collection '#{col.slug}' write policy requires change proposals for this principal"
-      )
-    )
-  end
+  col_id = col_j.text_at("id") or ""
 
   new_pid = "pg_#{Id.ulid(rng, clock)}"
   id_prefix = Id.ulid(rng, clock)
@@ -332,7 +330,7 @@ fn sync_push_create(
   blocks = Blocks.reconcile_blocks_from_markdown(new_pid, [], fm.body_markdown, prov, id_prefix)
   page = Page(
     id: new_pid,
-    collection_id: col.id,
+    collection_id: col_id,
     parent_page_id: None,
     title: title,
     icon: None,
@@ -389,10 +387,10 @@ fn sync_push_create(
   )
 
   doc = push_doc_json.text_at("doc") or ""
-  rel = Sync.page_rel_path(col.slug, page.title, page.id)
+  rel = Sync.page_rel_path(col_j.text_at("slug") or "", page.title, page.id)
   ev = Json.Object({
     "page_id": Json.String(page.id),
-    "collection_id": Json.String(col.id),
+    "collection_id": Json.String(col_id),
     "version": Json.int(page.version),
     "actor": Json.String(auth.principal.handle)
   })
@@ -407,7 +405,7 @@ fn sync_push_create(
         "content_sha256": Json.String(Sync.sha256_text(doc)),
         "proposal": Json.Null
       })
-    ).with_sse_publish_json("collection:#{col.id}", "page.created", ev)
+    ).with_sse_publish_json("collection:#{col_id}", "page.created", ev)
   )
 end
 
@@ -499,7 +497,7 @@ fn sync_push_stage_proposal_from_json(
     reason: prop_reason,
     at: now
   )
-  saved_pm = try Ledger.transact_locked(
+  _saved_pm = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -514,15 +512,15 @@ fn sync_push_stage_proposal_from_json(
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "propose", now)
       t2 = try Db.tx_put_proposal(t1, pm)
-      Ok((t2, pm))
+      Ok((t2, Unit))
     end
   )
 
   prop_ev = Json.Object({
-    "proposal_id": Json.String(saved_pm.id),
+    "proposal_id": Json.String(pm.id),
     "page_id": Json.String(old_page_id),
     "collection_id": Json.String(col_id),
-    "title": Json.String(saved_pm.title),
+    "title": Json.String(pm.title),
     "actor": Json.String(auth.principal.handle)
   })
   Ok(
@@ -535,7 +533,7 @@ fn sync_push_stage_proposal_from_json(
         "live_version": Json.int(old_page_version),
         "ops_staged": Json.int(ops_size),
         "page": old_page_json,
-        "proposal": saved_pm.to_json,
+        "proposal": pm.to_json,
         "review_url": Json.String("/proposals"),
         "live_markdown_document": Json.String(live_doc),
         "live_content_sha256": Json.String(live_sha)
@@ -560,13 +558,11 @@ fn prep_sync_stage_json(
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
-      pg = case try Table.get(store, Db.pages_table(), pid).map_error(Db.map_table_error)
+      pg = case try Db.get_page(store, pid)
         Some(p) if p.archived_at == None: p
         Some(_) | None: return Error(Missing(entity: "page", id: pid))
       end
-      col = case try Table.get(store, Db.collections_table(), pg.collection_id).map_error(
-        Db.map_table_error
-      )
+      col = case try Db.get_collection(store, pg.collection_id)
         Some(c): c
         None: return Error(Missing(entity: "collection", id: pg.collection_id))
       end
@@ -642,7 +638,7 @@ fn sync_push_direct_update(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "write_direct", now)
-      live = case try Table.tx_get(t1, Db.pages_table(), pid).map_error(Db.map_table_error)
+      live = case try Db.tx_get_page(t1, pid)
         Some(p) if p.archived_at == None: p
         Some(_) | None: return Error(Missing(entity: "page", id: pid))
       end
@@ -650,13 +646,9 @@ fn sync_push_direct_update(
         return Error(Conflict(reason: "version_mismatch"))
       end
 
-      (cur_bp_opt, cur_pm_opt) = case try Table.tx_get(t1, Db.page_meta_table(), live.id).map_error(
-        Db.map_table_error
-      )
+      (cur_bp_opt, cur_pm_opt) = case try Db.tx_get_page_meta(t1, live.id)
         Some(pm):
-          bp = try Table.tx_get(t1, Db.blueprints_table(), pm.blueprint_id).map_error(
-            Db.map_table_error
-          )
+          bp = try Db.tx_get_blueprint(t1, pm.blueprint_id)
           (bp, Some(pm))
         None: (None, None)
       end
@@ -670,9 +662,7 @@ fn sync_push_direct_update(
         Some(_) | None: t1
       end
 
-      live_rows = try Table.tx_lookup(t2, Db.blocks_table(), Db.blocks_by_page(), live.id).map_error(
-        Db.map_table_error
-      )
+      live_rows = try Db.tx_lookup_blocks_by_page(t2, live.id)
       live_blocks = Blocks.sort_blocks(live_rows.map(fn(p) p.1 end))
       reconciled = Blocks.reconcile_blocks_from_markdown(
         live.id,
@@ -829,7 +819,7 @@ fn sync_push(
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
-      pg = case try Table.get(store, Db.pages_table(), pid).map_error(Db.map_table_error)
+      pg = case try Db.get_page(store, pid)
         Some(p) if p.archived_at == None: p
         Some(_) | None: return Error(Missing(entity: "page", id: pid))
       end
@@ -837,9 +827,7 @@ fn sync_push(
       if pg.kind != Document
         return Error(BadInput(reason: "vellum sync only supports Document pages"))
       end
-      c = case try Table.get(store, Db.collections_table(), pg.collection_id).map_error(
-        Db.map_table_error
-      )
+      c = case try Db.get_collection(store, pg.collection_id)
         Some(col_rec): col_rec
         None: return Error(Missing(entity: "collection", id: pg.collection_id))
       end

@@ -1226,3 +1226,84 @@ export interface ChatInboxItem {
   read_at: string | null;
   created_at: string;
 }
+
+export interface ChatLinkedRowSummary {
+  row_id: string;
+  page_id: string;
+  database_id: string;
+  database_title: string;
+  collection_id: string;
+  title: string;
+  status_label?: string | null;
+  status_color?: string | null;
+  updated_at?: string;
+}
+
+export interface ChatLinkedProposalSummary {
+  proposal_id: string;
+  target_page_id: string;
+  collection_id: string;
+  title: string;
+  status: string;
+  updated_at?: string;
+}
+
+export interface ChatInlineRefCard {
+  kind: "page" | "row" | "proposal" | "thread" | string;
+  id: string;
+  raw: string;
+  accessible: boolean;
+  redacted: boolean;
+  title: string;
+  subtitle: string;
+  url?: string | null;
+  collection_id?: string | null;
+  database_id?: string | null;
+  page_id?: string | null;
+  target_page_id?: string | null;
+  channel_id?: string | null;
+  message_id?: string | null;
+  channel_name?: string | null;
+  status?: string | null;
+  status_label?: string | null;
+  status_color?: string | null;
+}
+
+export interface OriginChatThreadLink {
+  link_kind: string;
+  channel_id: string;
+  channel_name: string;
+  channel_kind: string;
+  message_id: string;
+  root_message_id: string;
+  author_handle: string;
+  preview: string;
+  created_at: string;
+  url: string;
+}
+
+export interface ChatLinkableEntity {
+  kind: "page" | "row" | "proposal" | string;
+  id: string;
+  title: string;
+  subtitle: string;
+  collection_id: string;
+  page_id?: string;
+  insert_token: string;
+  url: string;
+}
+
+export interface ChatChannel {
+  read_only?: boolean;
+  source_type?: string | null;
+  slack_channel_id?: string | null;
+}
+
+export interface ChatMessage {
+  linked_rows?: ChatLinkedRowSummary[];
+  linked_proposals?: ChatLinkedProposalSummary[];
+  inline_refs?: ChatInlineRefCard[];
+  needs_enrichment?: boolean;
+  source_type?: string | null;
+  slack_ts?: string | null;
+}

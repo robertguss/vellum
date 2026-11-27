@@ -15,8 +15,11 @@ diff_blocks_to_ops,
 find_block_idx,
 insert_block_sorted,
 decode_block_ops_json,
+decode_block_ops_from_json,
+decode_citations_json,
+decode_provenance_json,
 decode_version_map_json
-use Domain.Types{Block, BlockKind, BlockOp, Provenance}
+use Domain.Types{AuthorKind, Block, BlockKind, BlockOp, Citation, Provenance}
 use Json
 
 alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
@@ -1246,9 +1249,269 @@ fn diff_blocks_to_ops(existing: List(Block), incoming: List(Block)) : (List(Bloc
   (ops, new_ids)
 end
 
-## Decodes a JSON array into `List(BlockOp)` once to avoid duplicate monomorphic decoders.
+fn req_blk_text(j: Json, field: Text) : Result(Text, Text)
+  case j.text_at(field)
+    Some(s): Ok(s)
+    None: Error("missing string field '#{field}'")
+  end
+end
+
+fn req_blk_opt_text(j: Json, field: Text) : Result(Option(Text), Text)
+  case j.get(field)
+    None | Some(Json.Null): Ok(None)
+    Some(Json.String(s)): Ok(Some(s))
+    Some(Json.Boolean(_)) | Some(Json.Number(_)) | Some(Json.Array(_)) | Some(Json.Object(_)):
+      Error("field '#{field}' must be string or null")
+  end
+end
+
+fn req_blk_bool(j: Json, field: Text) : Result(Bool, Text)
+  case j.get(field)
+    Some(Json.Boolean(b)): Ok(b)
+    None | Some(Json.Null) | Some(Json.Number(_)) | Some(Json.String(_)) | Some(Json.Array(_)) |
+      Some(Json.Object(_)): Error("missing boolean field '#{field}'")
+  end
+end
+
+fn req_blk_int(j: Json, field: Text) : Result(Int, Text)
+  case j.int_at(field)
+    Some(n): Ok(n)
+    None: Error("missing integer field '#{field}'")
+  end
+end
+
+fn req_blk_obj(j: Json, msg: Text) : Result(Json, Text)
+  case j
+    Json.Object(_): Ok(j)
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): Error(msg)
+  end
+end
+
+## Decodes a JSON array into `List(Citation)` without generic `Json.decode_strict` lowering.
+fn decode_citations_json(j: Json) : Result(List(Citation), Text)
+  items = case j
+    Json.Array(xs): xs
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Object(_): return Error(
+      "citations must be a JSON array"
+    )
+  end
+  var out = []
+  for item in items
+    _obj = try req_blk_obj(item, "citation entry must be an object")
+    out = out.append(
+      Citation(
+        source_kind: try req_blk_text(item, "source_kind"),
+        source_ref: try req_blk_text(item, "source_ref"),
+        label: try req_blk_text(item, "label"),
+        excerpt: try req_blk_opt_text(item, "excerpt")
+      )
+    )
+  end
+  Ok(out)
+end
+
+fn decode_author_kind_json(j: Json) : Result(AuthorKind, Text)
+  case j
+    Json.String(s):
+      if s == "human_author"
+        Ok(HumanAuthor)
+      else
+        Error("unknown AuthorKind '#{s}'")
+      end
+    Json.Object(m):
+      if m.entries.size != 1
+        return Error("AuthorKind object must have 1 variant key")
+      end
+      (k, val) = m.entries.first or ("", Json.Null)
+      if k == "agent_author"
+        _obj = try req_blk_obj(val, "agent_author must be an object")
+        Ok(AgentAuthor(model: try req_blk_opt_text(val, "model")))
+      else
+        Error("unknown AuthorKind object '#{k}'")
+      end
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_): Error("invalid AuthorKind JSON")
+  end
+end
+
+## Decodes a JSON object into `Provenance` without generic `Json.decode_strict` lowering.
+fn decode_provenance_json(j: Json) : Result(Provenance, Text)
+  _obj = try req_blk_obj(j, "provenance must be a JSON object")
+  ak = try decode_author_kind_json(j.get("author_kind") or Json.Null)
+  cits = case j.get("citations")
+    None: []
+    Some(cv): try decode_citations_json(cv)
+  end
+  ts_str = try req_blk_text(j, "updated_at")
+  ts = case Time.parse(ts_str.trim)
+    Some(t): t
+    None: return Error("invalid ISO timestamp '#{ts_str}' in provenance.updated_at")
+  end
+  Ok(
+    Provenance(
+      author_id: try req_blk_text(j, "author_id"),
+      author_kind: ak,
+      grant_id: try req_blk_opt_text(j, "grant_id"),
+      proposal_id: try req_blk_opt_text(j, "proposal_id"),
+      reason: try req_blk_opt_text(j, "reason"),
+      citations: cits,
+      updated_at: ts
+    )
+  )
+end
+
+fn decode_block_kind_json(j: Json) : Result(BlockKind, Text)
+  case j
+    Json.String(s):
+      if s == "paragraph"
+        Ok(Paragraph)
+      else if s == "bullet_list_item"
+        Ok(BulletListItem)
+      else if s == "quote"
+        Ok(Quote)
+      else if s == "divider"
+        Ok(Divider)
+      else if s == "table_of_contents"
+        Ok(TableOfContents)
+      else
+        Error("unknown BlockKind string '#{s}'")
+      end
+    Json.Object(m):
+      if m.entries.size != 1
+        return Error("BlockKind object must have 1 variant key")
+      end
+      (k, val) = m.entries.first or ("", Json.Null)
+      _obj = try req_blk_obj(val, "BlockKind variant '#{k}' payload must be an object")
+      if k == "heading"
+        Ok(Heading(level: try req_blk_int(val, "level")))
+      else if k == "ordered_list_item"
+        Ok(OrderedListItem(start: try req_blk_int(val, "start")))
+      else if k == "task_item"
+        Ok(TaskItem(checked: try req_blk_bool(val, "checked")))
+      else if k == "callout"
+        tone = try req_blk_text(val, "tone")
+        icon = try req_blk_opt_text(val, "icon")
+        Ok(Callout(tone: tone, icon: icon))
+      else if k == "code_block"
+        Ok(CodeBlock(language: try req_blk_text(val, "language")))
+      else if k == "table_block"
+        Ok(TableBlock(has_header: try req_blk_bool(val, "has_header")))
+      else if k == "toggle"
+        sum = try req_blk_text(val, "summary")
+        open? = try req_blk_bool(val, "open")
+        Ok(Toggle(summary: sum, open: open?))
+      else if k == "image"
+        aid = try req_blk_text(val, "attachment_id")
+        cap = try req_blk_text(val, "caption")
+        Ok(Image(attachment_id: aid, caption: cap))
+      else if k == "file_embed"
+        aid = try req_blk_text(val, "attachment_id")
+        fname = try req_blk_text(val, "filename")
+        Ok(FileEmbed(attachment_id: aid, filename: fname))
+      else if k == "page_link"
+        Ok(PageLink(target_page_id: try req_blk_text(val, "target_page_id")))
+      else if k == "database_view_embed"
+        did = try req_blk_text(val, "database_id")
+        vid = try req_blk_opt_text(val, "view_id")
+        Ok(DatabaseViewEmbed(database_id: did, view_id: vid))
+      else if k == "ai_brief"
+        pr = try req_blk_text(val, "prompt")
+        sc = try req_blk_opt_text(val, "source_scope")
+        ra = try req_blk_opt_text(val, "refreshed_at")
+        Ok(AiBrief(prompt: pr, source_scope: sc, refreshed_at: ra))
+      else
+        Error("unknown BlockKind object '#{k}'")
+      end
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_): Error("invalid BlockKind JSON")
+  end
+end
+
+fn decode_single_block_op(item: Json) : Result(BlockOp, Text)
+  m = case item
+    Json.Object(om): om
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+      "BlockOp entry must be an object"
+    )
+  end
+  if m.entries.size != 1
+    return Error("BlockOp object must have 1 variant key")
+  end
+  (k, val) = m.entries.first or ("", Json.Null)
+  _obj = try req_blk_obj(val, "BlockOp '#{k}' payload must be an object")
+  if k == "replace_block"
+    kind_opt = case val.get("kind")
+      None | Some(Json.Null): None
+      Some(kv): Some(try decode_block_kind_json(kv))
+    end
+    Ok(
+      ReplaceBlock(
+        block_id: try req_blk_text(val, "block_id"),
+        expected_version: try req_blk_int(val, "expected_version"),
+        kind: kind_opt,
+        markdown: try req_blk_text(val, "markdown")
+      )
+    )
+  else if k == "insert_block_after"
+    Ok(
+      InsertBlockAfter(
+        after_block_id: try req_blk_opt_text(val, "after_block_id"),
+        parent_block_id: try req_blk_opt_text(val, "parent_block_id"),
+        kind: try decode_block_kind_json(val.get("kind") or Json.Null),
+        markdown: try req_blk_text(val, "markdown")
+      )
+    )
+  else if k == "delete_block"
+    Ok(
+      DeleteBlock(
+        block_id: try req_blk_text(val, "block_id"),
+        expected_version: try req_blk_int(val, "expected_version")
+      )
+    )
+  else if k == "move_block"
+    Ok(
+      MoveBlock(
+        block_id: try req_blk_text(val, "block_id"),
+        new_parent_id: try req_blk_opt_text(val, "new_parent_id"),
+        after_block_id: try req_blk_opt_text(val, "after_block_id")
+      )
+    )
+  else if k == "attach_citations"
+    Ok(
+      AttachCitations(
+        block_id: try req_blk_text(val, "block_id"),
+        citations: try decode_citations_json(val.get("citations") or Json.Null)
+      )
+    )
+  else
+    Error("unknown BlockOp '#{k}'")
+  end
+end
+
+## Decodes a JSON array `Json` value into `List(BlockOp)` without generic lowering.
+fn decode_block_ops_from_json(j: Json) : Result(List(BlockOp), Text)
+  items = case j
+    Json.Array(xs): xs
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Object(_): return Error(
+      "expected BlockOp JSON array"
+    )
+  end
+  var out = []
+  for item in items
+    out = out.append(try decode_single_block_op(item))
+  end
+  Ok(out)
+end
+
+## Decodes a JSON array byte buffer into `List(BlockOp)` without generic `Json.decode_strict` lowering.
 fn decode_block_ops_json(raw: Bytes) : Result(List(BlockOp), Text)
-  Json.decode_strict[List(BlockOp)](raw).map_error(fn(e) e.to_text end)
+  txt = case raw.decode_utf8
+    Some(s): s
+    None: return Error("expected valid UTF-8 JSON")
+  end
+  parsed = case Json.parse(txt)
+    Ok(j): j
+    Error(e): return Error(e.to_text)
+  end
+  decode_block_ops_from_json(parsed)
 end
 
 ## Decodes a JSON object into `Map(Text, Int)` without generic `Json.decode_strict` lowering.

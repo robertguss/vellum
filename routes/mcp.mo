@@ -425,17 +425,27 @@ fn ensure_mcp_session_locked(
   if not files.read_only.exists?(Db.ledger_db_path)
     return Ok((sid, false))
   end
-  existing = try Ledger.read_locked(
+  existing_j = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
-    fn(db) TaintBridge.get_taint_session(Ledger.store(db), sid) end
+    fn(db)
+      case try TaintBridge.get_taint_session(Ledger.store(db), sid)
+        Some(s): Ok(
+          Json.Object({
+            "exists": Json.Boolean(true),
+            "tainted": Json.Boolean(s.untrusted_tainted)
+          })
+        )
+        None: Ok(Json.Object({"exists": Json.Boolean(false), "tainted": Json.Boolean(false)}))
+      end
+    end
   )
   grant_opt = if auth.principal.kind == Agent: Some(auth.grant_id) else: None
-  case existing
-    Some(s): Ok((sid, s.untrusted_tainted))
-    None:
+  if existing_j.bool_at("exists") == Some(true)
+    Ok((sid, existing_j.bool_at("tainted") or false))
+  else
       parent_opt = case args.text_at("parent_session_id")
         Some(p) if not p.trim.empty?: Some(p.trim)
         Some(_) | None: None
@@ -482,21 +492,19 @@ fn authorize_mcp_write_locked(
     Some(p) if not p.trim.empty?: Some(p.trim)
     Some(_) | None: None
   end
-  existing = try Ledger.read_locked(
+  existing_j = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
-    fn(db) TaintBridge.get_taint_session(Ledger.store(db), sid) end
+    fn(db) Ok(Json.Boolean((try TaintBridge.get_taint_session(Ledger.store(db), sid)) != None)) end
   )
-  case existing
-    Some(_): Unit
-    None:
-      case parent_opt
-        Some(_):
-          _forked = try ensure_mcp_session_locked(args, auth, files, now)
-        None: return Ok(Unit)
-      end
+  if existing_j != Json.Boolean(true)
+    case parent_opt
+      Some(_):
+        _forked = try ensure_mcp_session_locked(args, auth, files, now)
+      None: return Ok(Unit)
+    end
   end
   _ok_sess = try TaintBridge.authorize_action_locked(
     files,
@@ -526,14 +534,16 @@ fn mcp_search_vec_setup(
         )
       )
     Some(ecfg):
-      has_neural = try Ledger.read_locked(
+      has_neural_j = try Ledger.read_locked(
         rf,
         Db.ledger_db_path,
         Db.vellum_schema(),
         Db.map_ledger_error,
-        fn(db) Db.neural_vec_populated(Ledger.store(db), ecfg.dimensions) end
+        fn(db)
+          Ok(Json.Boolean(try Db.neural_vec_populated(Ledger.store(db), ecfg.dimensions)))
+        end
       )
-      if has_neural
+      if has_neural_j == Json.Boolean(true)
         case Ai.fetch_embedding(ecfg, q, net)
           Ok(qv): Ok((Some(qv), Db.neural_vec_index(ecfg.dimensions), "neural", Some(ecfg.min_score)))
           Error(_):
@@ -587,7 +597,7 @@ fn handle_mcp_db_schema(
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
-      def = case try Table.get(store, Db.databases_table(), db_id).map_error(Db.map_table_error)
+      def = case try Db.get_database(store, db_id)
         Some(d): d
         None: return Error(Missing(entity: "database", id: db_id))
       end
@@ -595,8 +605,7 @@ fn handle_mcp_db_schema(
       vpairs = try Table.lookup(store, Db.db_views_table(), Db.db_views_by_database(), def.id)
         .map_error(Db.map_table_error)
       views = vpairs.map(fn(p) p.1 end).sort_by(fn(v) v.sort_order end)
-      rpairs = try Table.lookup(store, Db.db_rows_table(), Db.db_rows_by_database(), def.id)
-        .map_error(Db.map_table_error)
+      rpairs = try Db.lookup_db_rows_by_database(store, def.id)
       row_count = rpairs.filter(fn(p) p.1.archived_at == None end).size
       Ok(
         Json.Object({
@@ -674,14 +683,12 @@ fn handle_mcp_db_create_row(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "write_db", now)
-      def = case try Table.tx_get(t1, Db.databases_table(), db_id).map_error(Db.map_table_error)
+      def = case try Db.tx_get_database(t1, db_id)
         Some(d): d
         None: return Error(Missing(entity: "database", id: db_id))
       end
       try Policy.require_collection_access(auth, "write_db", def.collection_id)
-      col = case try Table.tx_get(t1, Db.collections_table(), def.collection_id).map_error(
-        Db.map_table_error
-      )
+      col = case try Db.tx_get_collection(t1, def.collection_id)
         Some(c): c
         None: return Error(Missing(entity: "collection", id: def.collection_id))
       end
@@ -823,14 +830,12 @@ fn handle_mcp_db_update_row(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "write_db", now)
-      def = case try Table.tx_get(t1, Db.databases_table(), db_id).map_error(Db.map_table_error)
+      def = case try Db.tx_get_database(t1, db_id)
         Some(d): d
         None: return Error(Missing(entity: "database", id: db_id))
       end
       try Policy.require_collection_access(auth, "write_db", def.collection_id)
-      col = case try Table.tx_get(t1, Db.collections_table(), def.collection_id).map_error(
-        Db.map_table_error
-      )
+      col = case try Db.tx_get_collection(t1, def.collection_id)
         Some(c): c
         None: return Error(Missing(entity: "collection", id: def.collection_id))
       end
@@ -841,7 +846,7 @@ fn handle_mcp_db_update_row(
           )
         )
       end
-      old_row = case try Table.tx_get(t1, Db.db_rows_table(), row_id).map_error(Db.map_table_error)
+      old_row = case try Db.tx_get_db_row(t1, row_id)
         Some(r) if r.database_id == def.id and r.archived_at == None: r
         Some(_) | None: return Error(Missing(entity: "db_row", id: row_id))
       end
@@ -875,14 +880,11 @@ fn handle_mcp_db_update_row(
         Some(msg): return Error(BadInput(reason: msg))
         None: Unit
       end
-      old_page = case try Table.tx_get(t1, Db.pages_table(), old_row.page_id).map_error(
-        Db.map_table_error
-      )
+      old_page = case try Db.tx_get_page(t1, old_row.page_id)
         Some(p): p
         None: return Error(Missing(entity: "page", id: old_row.page_id))
       end
-      block_rows = try Table.tx_lookup(t1, Db.blocks_table(), Db.blocks_by_page(), old_page.id)
-        .map_error(Db.map_table_error)
+      block_rows = try Db.tx_lookup_blocks_by_page(t1, old_page.id)
       existing_blocks = Blocks.sort_blocks(block_rows.map(fn(x) x.1 end))
       bumped_page = Page(
         id: old_page.id,
@@ -994,25 +996,24 @@ fn decode_mcp_world_mutation(
           Error(e): return Error("invalid expected_versions: #{e}")
         end
     end
-    pg = try Ledger.read_locked(
+    pg_j = try Ledger.read_locked(
       files.read_only,
       Db.ledger_db_path,
       Db.vellum_schema(),
       Db.map_ledger_error,
       fn(db)
-        found_pg = case try Table.get(Ledger.store(db), Db.pages_table(), pid).map_error(
-          Db.map_table_error
-        )
+        found_pg = case try Db.get_page(Ledger.store(db), pid)
           Some(p) if p.archived_at == None: p
           Some(_) | None: return Error(Missing(entity: "page", id: pid))
         end
         try Policy.require_collection_access(auth, "propose", found_pg.collection_id)
-        Ok(found_pg)
+        Ok(Json.Object({"id": Json.String(found_pg.id)}))
       end
     ).map_error(fn(e) e.to_text end)
+    pg_id = pg_j.text_at("id") or pid
     return Ok(
       PatchPageBlocks(
-        page_id: pg.id,
+        page_id: pg_id,
         ops: ops,
         new_ids: generate_insert_ids(ops, rng, clock),
         provenance: prov,
@@ -1026,20 +1027,18 @@ fn decode_mcp_world_mutation(
     Some(_) | None: def_id
   end
   if mut_db_id != def_id
-    _d = try Ledger.read_locked(
+    _u = try Ledger.read_locked(
       files.read_only,
       Db.ledger_db_path,
       Db.vellum_schema(),
       Db.map_ledger_error,
       fn(db)
-        fd = case try Table.get(Ledger.store(db), Db.databases_table(), mut_db_id).map_error(
-          Db.map_table_error
-        )
+        fd = case try Db.get_database(Ledger.store(db), mut_db_id)
           Some(d): d
           None: return Error(Missing(entity: "database", id: mut_db_id))
         end
         try Policy.require_collection_access(auth, "propose", fd.collection_id)
-        Ok(fd)
+        Ok(Unit)
       end
     ).map_error(fn(e) e.to_text end)
   end
@@ -1167,31 +1166,38 @@ fn handle_mcp_db_propose_changes(
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
-      found_def = case try Table.get(store, Db.databases_table(), db_id).map_error(
-        Db.map_table_error
-      )
+      found_def = case try Db.get_database(store, db_id)
         Some(d): d
         None: return Error(Missing(entity: "database", id: db_id))
       end
       try Policy.require_collection_access(auth, "propose", found_def.collection_id)
-      Ok(found_def)
+      Ok(
+        Json.Object({
+          "id": Json.String(found_def.id),
+          "page_id": Json.String(found_def.page_id),
+          "collection_id": Json.String(found_def.collection_id)
+        })
+      )
     end
   )
-  def = case target_def_res
+  def_j = case target_def_res
     Ok(d): d
     Error(e): return Ok(Mcp.tool_error(id, e.to_text))
   end
+  def_id = def_j.text_at("id") or db_id
+  def_page_id = def_j.text_at("page_id") or ""
+  def_col_id = def_j.text_at("collection_id") or ""
 
   prov = make_provenance(auth, reason, now)
   var decoded_muts = []
   for item in muts_raw
-    case decode_mcp_world_mutation(item, def.id, def.page_id, prov, auth, files, rng, clock)
+    case decode_mcp_world_mutation(item, def_id, def_page_id, prov, auth, files, rng, clock)
       Ok(mut): decoded_muts = decoded_muts.append(mut)
       Error(msg): return Ok(Mcp.tool_error(id, msg))
     end
   end
 
-  (pm, opened_new?) = case existing_pid_opt
+  (pm_j, opened_new?) = case existing_pid_opt
     Some(pid):
       pm_res = Ledger.read_locked(
         files.read_only,
@@ -1199,27 +1205,26 @@ fn handle_mcp_db_propose_changes(
         Db.vellum_schema(),
         Db.map_ledger_error,
         fn(db)
-          found = case try Table.get(Ledger.store(db), Db.proposals_table(), pid).map_error(
-            Db.map_table_error
-          )
+          found = case try Db.get_proposal(Ledger.store(db), pid)
             Some(p): p
             None: return Error(Missing(entity: "proposal", id: pid))
           end
           try Policy.require_collection_access(auth, "propose", found.collection_id)
-          Ok(found)
+          Ok(found.to_json)
         end
       )
-      found = case pm_res
+      found_j = case pm_res
         Ok(p): p
         Error(e): return Ok(Mcp.tool_error(id, e.to_text))
       end
       is_admin? = auth.principal.role == Owner or auth.principal.role == Admin
-      if found.status != "open" or (found.author_id != auth.principal.id and not is_admin?)
+      if (found_j.text_at("status") or "") != "open" or
+        ((found_j.text_at("author_id") or "") != auth.principal.id and not is_admin?)
         return Ok(
           Mcp.tool_error(id, "proposal '#{pid}' must be open and authored by caller or admin")
         )
       end
-      (found, false)
+      (found_j, false)
     None:
       title = case args.text_at("title")
         Some(s) if not s.trim.empty?: s.trim
@@ -1242,9 +1247,9 @@ fn handle_mcp_db_propose_changes(
       pm_new = ProposalMeta(
         id: prop_id,
         world_id: world_id,
-        collection_id: def.collection_id,
-        target_page_id: def.page_id,
-        target_database_id: Some(def.id),
+        collection_id: def_col_id,
+        target_page_id: def_page_id,
+        target_database_id: Some(def_id),
         branch_kind: bkind,
         title: title,
         reason: reason,
@@ -1263,22 +1268,28 @@ fn handle_mcp_db_propose_changes(
         reason: reason,
         at: now
       )
-      saved_pm = try Ledger.transact_locked(
+      try Ledger.transact_locked(
         files,
         Db.ledger_db_path,
         Db.vellum_schema(),
         meta,
-        "mcp opened db proposal #{prop_id} on #{def.id}",
-        Json.Object({"proposal_id": Json.String(prop_id), "database_id": Json.String(def.id)}),
+        "mcp opened db proposal #{prop_id} on #{def_id}",
+        Json.Object({"proposal_id": Json.String(prop_id), "database_id": Json.String(def_id)}),
         Db.map_ledger_error,
         fn(tx)
           t1 = try tx_authorize_if_agent(tx, auth, "propose", now)
           t2 = try Db.tx_put_proposal(t1, pm_new)
-          Ok((t2, pm_new))
+          Ok((t2, Unit))
         end
       )
-      (saved_pm, true)
+      (pm_new.to_json, true)
   end
+
+  pm_id = pm_j.text_at("id") or ""
+  pm_world_id = pm_j.text_at("world_id") or ""
+  pm_col_id = pm_j.text_at("collection_id") or def_col_id
+  pm_target_page_id = pm_j.text_at("target_page_id") or def_page_id
+  pm_title = pm_j.text_at("title") or ""
 
   var step_replies = []
   for mut in decoded_muts
@@ -1288,7 +1299,7 @@ fn handle_mcp_db_propose_changes(
       Db.ledger_db_path,
       Db.vellum_schema(),
       Db.world_catalog(),
-      pm.world_id,
+      pm_world_id,
       "propose",
       bargs.to_json,
       reason,
@@ -1301,25 +1312,25 @@ fn handle_mcp_db_propose_changes(
 
   ev_name = if opened_new?: "proposal.opened" else: "proposal.updated"
   ev_payload = Json.Object({
-    "proposal_id": Json.String(pm.id),
-    "database_id": Json.String(def.id),
-    "page_id": Json.String(pm.target_page_id),
-    "collection_id": Json.String(pm.collection_id),
-    "title": Json.String(pm.title),
+    "proposal_id": Json.String(pm_id),
+    "database_id": Json.String(def_id),
+    "page_id": Json.String(pm_target_page_id),
+    "collection_id": Json.String(pm_col_id),
+    "title": Json.String(pm_title),
     "actor": Json.String(auth.principal.handle)
   })
   out_json = Json.Object({
-    "proposal": pm.to_json,
+    "proposal": pm_j,
     "staged_count": Json.int(step_replies.size),
     "step_replies": Json.Array(step_replies)
   })
   Ok(
     Mcp.tool_ok(
       id,
-      "Staged #{step_replies.size} database mutation(s) in proposal #{pm.id}.",
+      "Staged #{step_replies.size} database mutation(s) in proposal #{pm_id}.",
       Some(out_json)
-    ).with_sse_publish_json("collection:#{pm.collection_id}", ev_name, ev_payload)
-      .with_sse_publish_json("database:#{def.id}", ev_name, ev_payload)
+    ).with_sse_publish_json("collection:#{pm_col_id}", ev_name, ev_payload)
+      .with_sse_publish_json("database:#{def_id}", ev_name, ev_payload)
   )
 end
 
@@ -1340,7 +1351,7 @@ fn handle_mcp_proposal_comments(
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
-      pm = case try Table.get(store, Db.proposals_table(), pid).map_error(Db.map_table_error)
+      pm = case try Db.get_proposal(store, pid)
         Some(p): p
         None: return Error(Missing(entity: "proposal", id: pid))
       end
@@ -1470,9 +1481,7 @@ fn handle_tool_call(
       Db.map_ledger_error,
       fn(db)
         store = Ledger.store(db)
-        cols = try Table.scan(store, Db.collections_table(), None, None, 200).map_error(
-          Db.map_table_error
-        )
+        cols = try Db.scan_collections(store, 200)
         vis_cols = cols.filter(fn(p)
           p.1.archived_at == None and Policy.collection_permitted?(auth, p.1.id)
         end).map(fn(p) p.1 end)
@@ -1509,9 +1518,7 @@ fn handle_tool_call(
       Db.vellum_schema(),
       Db.map_ledger_error,
       fn(db)
-        rows = try Table.scan(Ledger.store(db), Db.collections_table(), None, None, 200).map_error(
-          Db.map_table_error
-        )
+        rows = try Db.scan_collections(Ledger.store(db), 200)
         cols = rows.filter(fn(p)
           p.1.archived_at == None and Policy.collection_permitted?(auth, p.1.id)
         end).map(fn(p) p.1 end)
@@ -1576,9 +1583,7 @@ fn handle_tool_call(
             try Policy.require_collection_access(auth, "read", cid)
             Ok(Json.Array([Json.String(cid)]))
           None:
-            rows = try Table.scan(store, Db.collections_table(), None, None, 200).map_error(
-              Db.map_table_error
-            )
+            rows = try Db.scan_collections(store, 200)
             var out = []
             for (_id, c) in rows
               if c.archived_at == None and Policy.collection_permitted?(auth, c.id)
@@ -1779,7 +1784,7 @@ fn handle_tool_call(
       Db.map_ledger_error,
       fn(db)
         store = Ledger.store(db)
-        pg = case try Table.get(store, Db.pages_table(), pid).map_error(Db.map_table_error)
+        pg = case try Db.get_page(store, pid)
           Some(p) if p.archived_at == None: p
           Some(_) | None: return Error(Missing(entity: "page", id: pid))
         end
@@ -1890,14 +1895,12 @@ fn handle_tool_call(
       Db.map_ledger_error,
       fn(tx)
         t1 = try tx_authorize_if_agent(tx, auth, "write_direct", now)
-        old_pg = case try Table.tx_get(t1, Db.pages_table(), pid).map_error(Db.map_table_error)
+        old_pg = case try Db.tx_get_page(t1, pid)
           Some(p) if p.archived_at == None: p
           Some(_) | None: return Error(Missing(entity: "page", id: pid))
         end
         try Policy.require_collection_access(auth, "write_direct", old_pg.collection_id)
-        col = case try Table.tx_get(t1, Db.collections_table(), old_pg.collection_id).map_error(
-          Db.map_table_error
-        )
+        col = case try Db.tx_get_collection(t1, old_pg.collection_id)
           Some(c): c
           None: return Error(Missing(entity: "collection", id: old_pg.collection_id))
         end
@@ -2060,20 +2063,20 @@ fn handle_tool_call(
       Db.vellum_schema(),
       Db.map_ledger_error,
       fn(db)
-        pg = case try Table.get(Ledger.store(db), Db.pages_table(), pid).map_error(
-          Db.map_table_error
-        )
+        pg = case try Db.get_page(Ledger.store(db), pid)
           Some(p) if p.archived_at == None: p
           Some(_) | None: return Error(Missing(entity: "page", id: pid))
         end
         try Policy.require_collection_access(auth, "propose", pg.collection_id)
-        Ok(pg)
+        Ok(Json.Object({"id": Json.String(pg.id), "collection_id": Json.String(pg.collection_id)}))
       end
     )
-    pg = case pg_res
+    pg_j = case pg_res
       Ok(p): p
       Error(e): return Ok(Mcp.tool_error(id, e.to_text))
     end
+    pg_id = pg_j.text_at("id") or pid
+    pg_col_id = pg_j.text_at("collection_id") or ""
     prop_id = "prop_#{Id.ulid(rng, clock)}"
     world_id = "w_#{Id.ulid(rng, clock)}"
     case World.open_world_locked(
@@ -2091,8 +2094,8 @@ fn handle_tool_call(
     pm = ProposalMeta(
       id: prop_id,
       world_id: world_id,
-      collection_id: pg.collection_id,
-      target_page_id: pg.id,
+      collection_id: pg_col_id,
+      target_page_id: pg_id,
       target_database_id: None,
       branch_kind: "proposal",
       title: title,
@@ -2112,7 +2115,7 @@ fn handle_tool_call(
       reason: reason,
       at: now
     )
-    saved = try Ledger.transact_locked(
+    try Ledger.transact_locked(
       files,
       Db.ledger_db_path,
       Db.vellum_schema(),
@@ -2123,20 +2126,20 @@ fn handle_tool_call(
       fn(tx)
         t1 = try tx_authorize_if_agent(tx, auth, "propose", now)
         t2 = try Db.tx_put_proposal(t1, pm)
-        Ok((t2, pm))
+        Ok((t2, Unit))
       end
     )
     prop_ev = Json.Object({
-      "proposal_id": Json.String(saved.id),
-      "page_id": Json.String(saved.target_page_id),
-      "collection_id": Json.String(saved.collection_id),
-      "title": Json.String(saved.title),
+      "proposal_id": Json.String(pm.id),
+      "page_id": Json.String(pm.target_page_id),
+      "collection_id": Json.String(pm.collection_id),
+      "title": Json.String(pm.title),
       "actor": Json.String(auth.principal.handle)
     })
     return Ok(
-      Mcp.tool_ok(id, "Opened proposal #{saved.id}.", Some(saved.to_json))
-        .with_sse_publish_json("collection:#{saved.collection_id}", "proposal.opened", prop_ev)
-        .with_sse_publish_json("page:#{saved.target_page_id}", "proposal.opened", prop_ev)
+      Mcp.tool_ok(id, "Opened proposal #{pm.id}.", Some(pm.to_json))
+        .with_sse_publish_json("collection:#{pm.collection_id}", "proposal.opened", prop_ev)
+        .with_sse_publish_json("page:#{pm.target_page_id}", "proposal.opened", prop_ev)
     )
   end
 
@@ -2159,27 +2162,28 @@ fn handle_tool_call(
       Db.vellum_schema(),
       Db.map_ledger_error,
       fn(db)
-        found = case try Table.get(Ledger.store(db), Db.proposals_table(), prop_id).map_error(
-          Db.map_table_error
-        )
+        found = case try Db.get_proposal(Ledger.store(db), prop_id)
           Some(p): p
           None: return Error(Missing(entity: "proposal", id: prop_id))
         end
         try Policy.require_collection_access(auth, "propose", found.collection_id)
-        Ok(found)
+        Ok(found.to_json)
       end
     )
-    pm = case pm_res
+    pm_j = case pm_res
       Ok(p): p
       Error(e): return Ok(Mcp.tool_error(id, e.to_text))
     end
-    if pm.status != "open" or pm.author_id != auth.principal.id
+    if (pm_j.text_at("status") or "") != "open" or (pm_j.text_at("author_id") or "") != auth.principal.id
       return Ok(Mcp.tool_error(id, "proposal '#{prop_id}' must be open and authored by caller"))
     end
+    pm_id = pm_j.text_at("id") or prop_id
+    pm_world_id = pm_j.text_at("world_id") or ""
+    pm_target_page_id = pm_j.text_at("target_page_id") or ""
     new_ids = generate_insert_ids(ops, rng, clock)
     prov = make_provenance(auth, reason, now)
     wargs = WorldPatchArgs(
-      page_id: pm.target_page_id,
+      page_id: pm_target_page_id,
       ops: ops,
       new_ids: new_ids,
       provenance: prov,
@@ -2191,13 +2195,13 @@ fn handle_tool_call(
       Db.ledger_db_path,
       Db.vellum_schema(),
       Db.world_catalog(),
-      pm.world_id,
+      pm_world_id,
       "propose",
       wargs.to_json,
       reason,
       now
     ).map_error(Db.map_world_error)
-      Ok(rep): Ok(Mcp.tool_ok(id, "Staged #{ops.size} ops on #{pm.id}.", Some(rep)))
+      Ok(rep): Ok(Mcp.tool_ok(id, "Staged #{ops.size} ops on #{pm_id}.", Some(rep)))
       Error(e): Ok(Mcp.tool_error(id, e.to_text))
     end
   end
@@ -2213,28 +2217,28 @@ fn handle_tool_call(
       Db.vellum_schema(),
       Db.map_ledger_error,
       fn(db)
-        found = case try Table.get(Ledger.store(db), Db.proposals_table(), prop_id).map_error(
-          Db.map_table_error
-        )
+        found = case try Db.get_proposal(Ledger.store(db), prop_id)
           Some(p): p
           None: return Error(Missing(entity: "proposal", id: prop_id))
         end
         try Policy.require_collection_access(auth, "read", found.collection_id)
-        Ok(found)
+        Ok(found.to_json)
       end
     )
-    pm = case pm_res
+    pm_j = case pm_res
       Ok(p): p
       Error(e): return Ok(Mcp.tool_error(id, e.to_text))
     end
+    pm_id = pm_j.text_at("id") or prop_id
+    pm_world_id = pm_j.text_at("world_id") or ""
     return case World.world_diff_locked(
       files.read_only,
       Db.ledger_db_path,
       Db.vellum_schema(),
       Db.world_catalog(),
-      pm.world_id
+      pm_world_id
     ).map_error(Db.map_world_error)
-      Ok(diffs): Ok(Mcp.tool_ok(id, "Computed diff for #{pm.id}.", Some(diffs.to_json)))
+      Ok(diffs): Ok(Mcp.tool_ok(id, "Computed diff for #{pm_id}.", Some(diffs.to_json)))
       Error(e): Ok(Mcp.tool_error(id, e.to_text))
     end
   end
@@ -2268,13 +2272,12 @@ fn handle_tool_call(
       Db.map_ledger_error,
       fn(db)
         store = Ledger.store(db)
-        def = case try Table.get(store, Db.databases_table(), db_id).map_error(Db.map_table_error)
+        def = case try Db.get_database(store, db_id)
           Some(d): d
           None: return Error(Missing(entity: "database", id: db_id))
         end
         try Policy.require_collection_access(auth, read_act, def.collection_id)
-        pairs = try Table.lookup(store, Db.db_rows_table(), Db.db_rows_by_database(), def.id)
-          .map_error(Db.map_table_error)
+        pairs = try Db.lookup_db_rows_by_database(store, def.id)
         active = pairs.filter(fn(p) p.1.archived_at == None end).map(fn(p) p.1 end)
         enriched = try Db.enrich_rows_with_rollups(store, def, active)
         filtered = enriched.filter(fn(er)
@@ -2440,15 +2443,16 @@ fn handle_resource_read(
       Db.ledger_db_path,
       Db.vellum_schema(),
       Db.map_ledger_error,
-      fn(db) Packs.render_llms_txt_from_store(Ledger.store(db), auth) end
+      fn(db) Packs.render_llms_txt_from_store(Ledger.store(db), auth).map(fn(s) Json.String(s) end) end
     )
     return case idx_res
-      Ok(md): Ok(
+      Ok(Json.String(md)): Ok(
         Mcp.resource_response(
           id,
           [Mcp.ResourceContent(uri: uri, mime_type: "text/markdown", text: md)]
         )
       )
+      Ok(_): Ok(Mcp.json_rpc_error(id, Mcp.RpcError(code: -32603, message: "unexpected llms index payload", data: None)))
       Error(e): Ok(Mcp.json_rpc_error(id, Mcp.RpcError(code: -32004, message: e.to_text, data: None)))
     end
   end
@@ -2488,15 +2492,11 @@ fn handle_resource_read(
       Db.map_ledger_error,
       fn(db)
         store = Ledger.store(db)
-        cols = try Table.scan(store, Db.collections_table(), None, None, 200).map_error(
-          Db.map_table_error
-        )
+        cols = try Db.scan_collections(store, 200)
         vis_cols = cols.filter(fn(p)
           p.1.archived_at == None and Policy.collection_permitted?(auth, p.1.id)
         end).map(fn(p) p.1 end)
-        dbs = try Table.scan(store, Db.databases_table(), None, None, 200).map_error(
-          Db.map_table_error
-        )
+        dbs = try Db.scan_databases(store, 200)
         vis_dbs = dbs.filter(fn(p) Policy.collection_permitted?(auth, p.1.collection_id) end).map(
           fn(p) p.1 end
         )
@@ -2520,20 +2520,26 @@ fn handle_resource_read(
         Db.map_ledger_error,
         fn(db)
           store = Ledger.store(db)
-          pg = case try Table.get(store, Db.pages_table(), pid.trim).map_error(Db.map_table_error)
+          pg = case try Db.get_page(store, pid.trim)
             Some(p) if p.archived_at == None: p
             Some(_) | None: return Error(Missing(entity: "page", id: pid.trim))
           end
           try Policy.require_collection_access(auth, "read", pg.collection_id)
           blks = try Db.load_page_blocks(store, pg.id)
-          Ok(Blocks.to_anchored_markdown(blks))
+          Ok(Json.String(Blocks.to_anchored_markdown(blks)))
         end
       )
       return case page_res
-        Ok(md): Ok(
+        Ok(Json.String(md)): Ok(
           Mcp.resource_response(
             id,
             [Mcp.ResourceContent(uri: uri, mime_type: "text/markdown", text: md)]
+          )
+        )
+        Ok(_): Ok(
+          Mcp.json_rpc_error(
+            id,
+            Mcp.RpcError(code: -32603, message: "unexpected page payload", data: None)
           )
         )
         Error(e): Ok(

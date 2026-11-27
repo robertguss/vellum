@@ -351,3 +351,96 @@ test "ChatOps helpers, ACL checks, and Modb channel/message/inbox/search operati
   )
   assert chk is Ok(Unit)
 end
+
+test "ChatOps entity ref extraction, mention prefix filtering, and vlm_chat_links lookups"
+  refs = ChatOps.extract_entity_refs(
+    "See [[page:pg_1]], [[pg_2]], @page:pg_3, [[row:row_1]], [[task:row_2]], @task:row_3, [[proposal:pr_1]], @proposal:pr_2, [[thread:ch_1:msg_1]], @thread:ch_2:msg_2, and dup [[page:pg_1]]."
+  )
+  assert refs.size == 10
+  pairs = refs.map(fn(r) "#{r.text_at("kind") or ""}:#{r.text_at("id") or ""}" end)
+  assert pairs.contains?("page:pg_1")
+  assert pairs.contains?("page:pg_2")
+  assert pairs.contains?("page:pg_3")
+  assert pairs.contains?("row:row_1")
+  assert pairs.contains?("row:row_2")
+  assert pairs.contains?("row:row_3")
+  assert pairs.contains?("proposal:pr_1")
+  assert pairs.contains?("proposal:pr_2")
+  assert pairs.contains?("thread:ch_1:msg_1")
+  assert pairs.contains?("thread:ch_2:msg_2")
+
+  # Entity ref extraction caps at 20 unique refs
+  var many_parts = []
+  var idx = 0
+  while idx < 25
+    many_parts = many_parts.append("[[page:pg_#{idx}]]")
+    idx += 1
+  end
+  capped = ChatOps.extract_entity_refs(many_parts.join(" "))
+  assert capped.size == 20
+
+  # extract_mentions ignores entity prefixes followed by ':' while keeping real @handles
+  mentions = ChatOps.extract_mentions(
+    "Hey @alice please review @page:pg_1 @row:row_1 @task:row_2 @proposal:pr_1 @thread:ch_1:msg_1 with @bob."
+  )
+  assert mentions == ["alice", "bob"]
+
+  # Reverse link persistence & prefix-scoped scans in vlm_chat_links
+  t0 = Time.parse("2026-11-27T12:00:00Z") or stop "t0"
+  files = Files.in_memory({})
+  wmeta = Ledger.WriteMeta(principal: "system", action: "test.chat_links", reason: "seed", at: t0)
+  saved = Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    wmeta,
+    "seed chat links",
+    Json.Object({}),
+    Db.map_ledger_error,
+    fn(tx)
+      t1 = try ChatOps.tx_put_chat_link(
+        tx,
+        "row",
+        "row_99",
+        "ch_1",
+        "msg_1",
+        Json.Object({"channel_id": Json.String("ch_1"), "message_id": Json.String("msg_1")})
+      )
+      t2 = try ChatOps.tx_put_chat_link(
+        t1,
+        "row",
+        "row_99",
+        "ch_2",
+        "msg_2",
+        Json.Object({"channel_id": Json.String("ch_2"), "message_id": Json.String("msg_2")})
+      )
+      t3 = try ChatOps.tx_put_chat_link(
+        t2,
+        "page",
+        "pg_99",
+        "ch_1",
+        "msg_1",
+        Json.Object({"channel_id": Json.String("ch_1"), "message_id": Json.String("msg_1")})
+      )
+      Ok((t3, Unit))
+    end
+  )
+  assert saved is Ok(Unit)
+
+  chk = Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      row_links = try ChatOps.scan_chat_links_for_target(store, "row", "row_99", 50)
+      assert row_links.size == 2
+      page_links = try ChatOps.scan_chat_links_for_target(store, "page", "pg_99", 50)
+      assert page_links.size == 1
+      assert ChatOps.link_key("row", "row_99", "ch_1", "msg_1") == "row:row_99:ch_1:msg_1"
+      Ok(Unit)
+    end
+  )
+  assert chk is Ok(Unit)
+end

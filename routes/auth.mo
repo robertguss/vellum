@@ -520,9 +520,7 @@ fn authenticate_bearer(raw_tok: Text, rf: ReadFiles, now: Time) : Result(AuthCon
         Some(_) | None: Unit
       end
 
-      principal = case try Table.get(store, Db.principals_table(), tok.principal_id).map_error(
-        Db.map_table_error
-      )
+      principal = case try Db.get_principal(store, tok.principal_id)
         Some(p) if not p.suspended: p
         Some(_) | None: return Error(Unauthenticated)
       end
@@ -580,9 +578,7 @@ fn authenticate(req: Api.Request, rf: ReadFiles, clock: Clock, env: Env) : Resul
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
-      principal = case try Table.get(store, Db.principals_table(), sess.member_id).map_error(
-        Db.map_table_error
-      )
+      principal = case try Db.get_principal(store, sess.member_id)
         Some(p) if not p.suspended: p
         Some(_) | None: return Error(Unauthenticated)
       end
@@ -649,7 +645,7 @@ fn finish_local_owner_login(
   new_gid = "gr_#{Id.ulid(rng, clock)}"
   meta = Ledger.WriteMeta(principal: norm_email, action: action_name, reason: reason, at: now)
   audit_payload = Json.Object({"email": Json.String(norm_email), "action": Json.String(action_name)})
-  principal = try Ledger.transact_locked(
+  principal_j = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -658,9 +654,14 @@ fn finish_local_owner_login(
     audit_payload,
     Db.map_ledger_error,
     fn(tx)
-      Db.tx_upsert_human_principal(tx, norm_email, display_name, None, new_pid, new_gid, now)
+      (t1, p) = try Db.tx_upsert_human_principal(tx, norm_email, display_name, None, new_pid, new_gid, now)
+      Ok((t1, Json.String(p.id)))
     end
   )
+  principal_id = case principal_j
+    Json.String(pid): pid
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json.Object(_): new_pid
+  end
   scfg = session_cfg(env)
   (sess, cookie_val) = try Sessions.create(
     files,
@@ -668,7 +669,7 @@ fn finish_local_owner_login(
     rng,
     clock,
     key,
-    principal.id,
+    principal_id,
     scfg
   ).map_error(fn(_e) ServerFailed(reason: "failed to create session") end)
 
@@ -725,13 +726,17 @@ end
 
 ## `POST /auth/personal/login` — Authenticates single Workspace Owner via configured passphrase/scrypt hash in `VELLUM_MODE=personal`.
 fn personal_login(
-  _req: Api.Request,
-  input: PersonalLoginInput,
+  req: Api.Request,
   files: Files,
   rng: SecureRandom,
   clock: Clock,
   env: Env
 ) : Result(Api.Response, AppError)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = PersonalLoginInput(
+    passphrase: try VaultOps.req_text(rj, "passphrase"),
+    return_to: rj.text_at("return_to")
+  )
   mode = try auth_mode(env)
   if mode != PersonalMode
     return Error(Forbidden(reason: "personal login is only available in VELLUM_MODE=personal"))
@@ -854,7 +859,7 @@ fn oidc_callback(
     "email": Json.String(norm_email)
   })
   avatar = identity.picture
-  principal = try Ledger.transact_locked(
+  principal_j = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -863,9 +868,22 @@ fn oidc_callback(
     audit_payload,
     Db.map_ledger_error,
     fn(tx)
-      Db.tx_upsert_human_principal(tx, norm_email, display_name, avatar, new_pid, new_gid, now)
+      (t1, p) = try Db.tx_upsert_human_principal(
+        tx,
+        norm_email,
+        display_name,
+        avatar,
+        new_pid,
+        new_gid,
+        now
+      )
+      Ok((t1, Json.String(p.id)))
     end
   )
+  principal_id = case principal_j
+    Json.String(pid): pid
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json.Object(_): new_pid
+  end
 
   scfg = session_cfg(env)
   (sess, cookie_val) = try Sessions.create(
@@ -874,7 +892,7 @@ fn oidc_callback(
     rng,
     clock,
     key,
-    principal.id,
+    principal_id,
     scfg
   ).map_error(fn(_e) ServerFailed(reason: "failed to create session") end)
 

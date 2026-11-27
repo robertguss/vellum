@@ -52,6 +52,7 @@ use Modb.Grants
 use Modb.Ledger
 use Modb.Table
 use Routes.Auth
+use Routes.ChatMoat
 use VaultOps
 
 ## JSON payload for `POST /api/databases`.
@@ -511,9 +512,7 @@ fn validate_view_def(def: DatabaseDef, v: DbViewDef) : Option(Text)
 end
 
 fn load_active_db_rows(store: Store, db_id: Text) : Result(List(DbRow), AppError)
-  pairs = try Table.lookup(store, Db.db_rows_table(), Db.db_rows_by_database(), db_id).map_error(
-    Db.map_table_error
-  )
+  pairs = try Db.lookup_db_rows_by_database(store, db_id)
   var out = []
   for (_rid, r) in pairs
     if r.archived_at == None
@@ -539,9 +538,7 @@ fn list_databases(auth: AuthContext, rf: ReadFiles) : Result(Api.Response, AppEr
     Db.vellum_schema(),
     Db.map_ledger_error,
     fn(db)
-      rows = try Table.scan(Ledger.store(db), Db.databases_table(), None, None, 200).map_error(
-        Db.map_table_error
-      )
+      rows = try Db.scan_databases(Ledger.store(db), 200)
       var visible = []
       for (_did, def) in rows
         if Policy.collection_permitted?(auth, def.collection_id)
@@ -655,9 +652,7 @@ fn create_database(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "manage_schema", now)
-      case try Table.tx_get(t1, Db.collections_table(), input.collection_id).map_error(
-        Db.map_table_error
-      )
+      case try Db.tx_get_collection(t1, input.collection_id)
         Some(c) if c.archived_at == None: Unit
         Some(_) | None: return Error(Missing(entity: "collection", id: input.collection_id))
       end
@@ -846,23 +841,19 @@ fn show_database(
       Db.map_ledger_error,
       fn(db)
         store = Ledger.store(db)
-        def = case try Table.get(store, Db.databases_table(), id).map_error(Db.map_table_error)
+        def = case try Db.get_database(store, id)
           Some(d): d
           None: return Error(Missing(entity: "database", id: id))
         end
         try Policy.require_collection_access(a, read_act, def.collection_id)
-        col_rows = try Table.scan(store, Db.collections_table(), None, None, 200).map_error(
-          Db.map_table_error
-        )
+        col_rows = try Db.scan_collections(store, 200)
         var cols = []
         for (_cid, c) in col_rows
           if c.archived_at == None and Policy.collection_permitted?(a, c.id)
             cols = cols.append(c)
           end
         end
-        db_rows = try Table.scan(store, Db.databases_table(), None, None, 200).map_error(
-          Db.map_table_error
-        )
+        db_rows = try Db.scan_databases(store, 200)
         var dbs = []
         var db_by_id = {}
         for (_did, d) in db_rows
@@ -877,9 +868,7 @@ fn show_database(
         active_rows = try load_active_db_rows(store, def.id)
         enr = try Db.enrich_rows_with_rollups(store, def, active_rows)
 
-        p_rows = try Table.scan(store, Db.principals_table(), None, None, 200).map_error(
-          Db.map_table_error
-        )
+        p_rows = try Db.scan_principals(store, 200)
         var principals_list = []
         for (_pid, pr) in p_rows
           if not pr.suspended
@@ -959,7 +948,12 @@ fn show_database(
           "relation_targets": show_payload.get("relation_targets") or Json.Null,
           "scenarios": show_payload.get("scenarios") or Json.Null,
           "ai_cell_meta": show_payload.get("ai_cell_meta") or Json.Null,
-          "ai_usage": show_payload.get("ai_usage") or Json.Null
+          "ai_usage": show_payload.get("ai_usage") or Json.Null,
+          "row_chat_links": try ChatMoat.row_links_for_rows_json(
+            files.read_only,
+            a,
+            show_payload.get("rows") or Json.Null
+          )
         })
       )
     )
@@ -984,7 +978,12 @@ fn show_database(
       "relation_targets": show_payload.get("relation_targets") or Json.Null,
       "scenarios": show_payload.get("scenarios") or Json.Null,
       "ai_cell_meta": show_payload.get("ai_cell_meta") or Json.Null,
-      "ai_usage": show_payload.get("ai_usage") or Json.Null
+      "ai_usage": show_payload.get("ai_usage") or Json.Null,
+      "row_chat_links": try ChatMoat.row_links_for_rows_json(
+        files.read_only,
+        a,
+        show_payload.get("rows") or Json.Null
+      )
     },
     shared
   )
@@ -1034,7 +1033,7 @@ fn update_database_schema(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "manage_schema", now)
-      old_def = case try Table.tx_get(t1, Db.databases_table(), id).map_error(Db.map_table_error)
+      old_def = case try Db.tx_get_database(t1, id)
         Some(d): d
         None: return Error(Missing(entity: "database", id: id))
       end
@@ -1178,7 +1177,7 @@ fn create_view(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, view_act, now)
-      def = case try Table.tx_get(t1, Db.databases_table(), id).map_error(Db.map_table_error)
+      def = case try Db.tx_get_database(t1, id)
         Some(d): d
         None: return Error(Missing(entity: "database", id: id))
       end
@@ -1286,7 +1285,7 @@ fn update_view(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, view_act, now)
-      def = case try Table.tx_get(t1, Db.databases_table(), id).map_error(Db.map_table_error)
+      def = case try Db.tx_get_database(t1, id)
         Some(d): d
         None: return Error(Missing(entity: "database", id: id))
       end
@@ -1361,7 +1360,7 @@ fn delete_view(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, view_act, now)
-      def = case try Table.tx_get(t1, Db.databases_table(), id).map_error(Db.map_table_error)
+      def = case try Db.tx_get_database(t1, id)
         Some(d): d
         None: return Error(Missing(entity: "database", id: id))
       end
@@ -1435,7 +1434,7 @@ fn query_database(
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
-      def = case try Table.get(store, Db.databases_table(), id).map_error(Db.map_table_error)
+      def = case try Db.get_database(store, id)
         Some(d): d
         None: return Error(Missing(entity: "database", id: id))
       end
@@ -1591,7 +1590,7 @@ fn create_row(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "write_db", now)
-      def = case try Table.tx_get(t1, Db.databases_table(), id).map_error(Db.map_table_error)
+      def = case try Db.tx_get_database(t1, id)
         Some(d): d
         None: return Error(Missing(entity: "database", id: id))
       end
@@ -1711,13 +1710,13 @@ fn update_row(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "write_db", now)
-      def = case try Table.tx_get(t1, Db.databases_table(), id).map_error(Db.map_table_error)
+      def = case try Db.tx_get_database(t1, id)
         Some(d): d
         None: return Error(Missing(entity: "database", id: id))
       end
       try Policy.require_collection_access(auth, "write_db", def.collection_id)
 
-      old_row = case try Table.tx_get(t1, Db.db_rows_table(), row_id).map_error(Db.map_table_error)
+      old_row = case try Db.tx_get_db_row(t1, row_id)
         Some(r) if r.database_id == def.id and r.archived_at == None: r
         Some(_) | None: return Error(Missing(entity: "db_row", id: row_id))
       end
@@ -1754,14 +1753,11 @@ fn update_row(
         None: Unit
       end
 
-      old_page = case try Table.tx_get(t1, Db.pages_table(), old_row.page_id).map_error(
-        Db.map_table_error
-      )
+      old_page = case try Db.tx_get_page(t1, old_row.page_id)
         Some(p): p
         None: return Error(Missing(entity: "page", id: old_row.page_id))
       end
-      block_rows = try Table.tx_lookup(t1, Db.blocks_table(), Db.blocks_by_page(), old_page.id)
-        .map_error(Db.map_table_error)
+      block_rows = try Db.tx_lookup_blocks_by_page(t1, old_page.id)
       existing_blocks = Blocks.sort_blocks(block_rows.map(fn(x) x.1 end))
 
       bumped_page = Page(
@@ -1865,12 +1861,12 @@ fn delete_row(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "write_db", now)
-      def = case try Table.tx_get(t1, Db.databases_table(), id).map_error(Db.map_table_error)
+      def = case try Db.tx_get_database(t1, id)
         Some(d): d
         None: return Error(Missing(entity: "database", id: id))
       end
       try Policy.require_collection_access(auth, "write_db", def.collection_id)
-      old_row = case try Table.tx_get(t1, Db.db_rows_table(), row_id).map_error(Db.map_table_error)
+      old_row = case try Db.tx_get_db_row(t1, row_id)
         Some(r) if r.database_id == def.id: r
         Some(_) | None: return Error(Missing(entity: "db_row", id: row_id))
       end

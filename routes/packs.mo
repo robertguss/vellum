@@ -99,9 +99,7 @@ fn pack_write_action(auth: AuthContext) : Text
 end
 
 fn permitted_collections(store: Store, auth: AuthContext) : Result(List(Collection), AppError)
-  rows = try Table.scan(store, Db.collections_table(), None, None, 200).map_error(
-    Db.map_table_error
-  )
+  rows = try Db.scan_collections(store, 200)
   var out = []
   for (_id, col) in rows
     if col.archived_at == None and Policy.collection_permitted?(auth, col.id)
@@ -112,7 +110,7 @@ fn permitted_collections(store: Store, auth: AuthContext) : Result(List(Collecti
 end
 
 fn permitted_databases(store: Store, auth: AuthContext) : Result(List(DatabaseDef), AppError)
-  rows = try Table.scan(store, Db.databases_table(), None, None, 200).map_error(Db.map_table_error)
+  rows = try Db.scan_databases(store, 200)
   var out = []
   for (_id, d) in rows
     if Policy.collection_permitted?(auth, d.collection_id)
@@ -126,11 +124,9 @@ fn load_page_bp_and_meta(store: Store, page_id: Text) : Result(
   (Option(BlueprintDef), Option(PageBlueprintMeta)),
   AppError
 )
-  pm_opt = try Table.get(store, Db.page_meta_table(), page_id).map_error(Db.map_table_error)
+  pm_opt = try Db.get_page_meta(store, page_id)
   bp_opt = case pm_opt
-    Some(pm): try Table.get(store, Db.blueprints_table(), pm.blueprint_id).map_error(
-      Db.map_table_error
-    )
+    Some(pm): try Db.get_blueprint(store, pm.blueprint_id)
     None: None
   end
   Ok((bp_opt, pm_opt))
@@ -173,7 +169,7 @@ fn list_permitted_summaries(
 
   var out = []
   if want_pages?
-    p_rows = try Table.scan(store, Db.pages_table(), None, None, 1000).map_error(Db.map_table_error)
+    p_rows = try Db.scan_pages(store, 1000)
     for (_pid, pg) in p_rows
       if pg.archived_at == None and pg.kind == Document and Policy.collection_permitted?(
         auth,
@@ -198,9 +194,7 @@ fn list_permitted_summaries(
   end
 
   if want_dbs?
-    d_rows = try Table.scan(store, Db.databases_table(), None, None, 500).map_error(
-      Db.map_table_error
-    )
+    d_rows = try Db.scan_databases(store, 500)
     for (_did, def) in d_rows
       if Policy.collection_permitted?(auth, def.collection_id)
         match_col? = case col_filter
@@ -211,12 +205,7 @@ fn list_permitted_summaries(
           sum_rec = case by_id.get(Db.db_summary_key(def.id))
             Some(existing): existing
             None:
-              r_pairs = try Table.lookup(
-                store,
-                Db.db_rows_table(),
-                Db.db_rows_by_database(),
-                def.id
-              ).map_error(Db.map_table_error)
+              r_pairs = try Db.lookup_db_rows_by_database(store, def.id)
               active = r_pairs.filter(fn(p) p.1.archived_at == None end).map(fn(p) p.1 end)
               enr = try Db.enrich_rows_with_rollups(store, def, active)
               fallback_t = Time.parse("2026-11-27T00:00:00Z") or stop "fallback_t"
@@ -328,7 +317,7 @@ fn compile_pack_from_store(
   var pinned_inputs = []
   for pid in pack.pinned_page_ids
     continue if seen_pages.get(pid) != None
-    case try Table.get(store, Db.pages_table(), pid).map_error(Db.map_table_error)
+    case try Db.get_page(store, pid)
       Some(pg) if pg.archived_at == None and pg.kind == Document and Policy.collection_permitted?(
         auth,
         pg.collection_id
@@ -352,9 +341,7 @@ fn compile_pack_from_store(
     end
   end
 
-  all_pages = try Table.scan(store, Db.pages_table(), None, None, 1000).map_error(
-    Db.map_table_error
-  )
+  all_pages = try Db.scan_pages(store, 1000)
   hint_raw = (query_override or (pack.query_hint or "")).trim.ascii_lowercase
   var match_inputs = []
   var other_inputs = []
@@ -398,11 +385,10 @@ fn compile_pack_from_store(
   var seen_dbs = {}
   for did in pack.database_ids
     continue if seen_dbs.get(did) != None
-    case try Table.get(store, Db.databases_table(), did).map_error(Db.map_table_error)
+    case try Db.get_database(store, did)
       Some(def) if Policy.collection_permitted?(auth, def.collection_id):
         seen_dbs = seen_dbs.set(def.id, true)
-        r_pairs = try Table.lookup(store, Db.db_rows_table(), Db.db_rows_by_database(), def.id)
-          .map_error(Db.map_table_error)
+        r_pairs = try Db.lookup_db_rows_by_database(store, def.id)
         active = r_pairs.filter(fn(p) p.1.archived_at == None end).map(fn(p) p.1 end)
         enr = try Db.enrich_rows_with_rollups(store, def, active)
         dsum_opt = sum_by_id.get(Db.db_summary_key(def.id))
@@ -412,9 +398,7 @@ fn compile_pack_from_store(
   end
 
   if pack.database_ids.empty?
-    all_dbs = try Table.scan(store, Db.databases_table(), None, None, 200).map_error(
-      Db.map_table_error
-    )
+    all_dbs = try Db.scan_databases(store, 200)
     for (_did, def) in all_dbs
       continue if seen_dbs.get(def.id) != None
       continue if not Policy.collection_permitted?(auth, def.collection_id)
@@ -424,8 +408,7 @@ fn compile_pack_from_store(
       end
       continue if not in_scope?
       seen_dbs = seen_dbs.set(def.id, true)
-      r_pairs = try Table.lookup(store, Db.db_rows_table(), Db.db_rows_by_database(), def.id)
-        .map_error(Db.map_table_error)
+      r_pairs = try Db.lookup_db_rows_by_database(store, def.id)
       active = r_pairs.filter(fn(p) p.1.archived_at == None end).map(fn(p) p.1 end)
       enr = try Db.enrich_rows_with_rollups(store, def, active)
       dsum_opt = sum_by_id.get(Db.db_summary_key(def.id))
@@ -442,21 +425,21 @@ fn validate_pack_targets_tx(tx: WriteTx, auth: AuthContext, pack: ContextPack) :
   AppError
 )
   for cid in pack.collection_ids
-    col = case try Table.tx_get(tx, Db.collections_table(), cid).map_error(Db.map_table_error)
+    col = case try Db.tx_get_collection(tx, cid)
       Some(c) if c.archived_at == None: c
       Some(_) | None: return Error(BadInput(reason: "collection '#{cid}' not found"))
     end
     try Policy.require_collection_access(auth, "read", col.id)
   end
   for pid in pack.pinned_page_ids
-    pg = case try Table.tx_get(tx, Db.pages_table(), pid).map_error(Db.map_table_error)
+    pg = case try Db.tx_get_page(tx, pid)
       Some(p) if p.archived_at == None: p
       Some(_) | None: return Error(BadInput(reason: "pinned page '#{pid}' not found"))
     end
     try Policy.require_collection_access(auth, "read", pg.collection_id)
   end
   for did in pack.database_ids
-    def = case try Table.tx_get(tx, Db.databases_table(), did).map_error(Db.map_table_error)
+    def = case try Db.tx_get_database(tx, did)
       Some(d): d
       None: return Error(BadInput(reason: "database '#{did}' not found"))
     end
@@ -473,13 +456,20 @@ fn llms_txt(_req: Api.Request, auth: AuthContext, rf: ReadFiles) : Result(Api.Re
   if not rf.exists?(Db.ledger_db_path)
     return Ok(markdown_ok(200, "# Vellum Workspace Index (/llms.txt)\n\n_Empty workspace._", []))
   end
-  body = try Ledger.read_locked(
+  body_j = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
-    fn(db) render_llms_txt_from_store(Ledger.store(db), auth) end
+    fn(db)
+      txt = try render_llms_txt_from_store(Ledger.store(db), auth)
+      Ok(Json.String(txt))
+    end
   )
+  body = case body_j
+    Json.String(s): s
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json.Object(_): ""
+  end
   Ok(markdown_ok(200, body, []))
 end
 
@@ -678,7 +668,7 @@ fn create_pack(
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, act, now)
       try validate_pack_targets_tx(t1, auth, pk)
-      t2 = try Table.put(t1, Db.packs_table(), pk.id, pk).map_error(Db.map_table_error)
+      t2 = try Db.tx_put_pack(t1, pk)
       Ok((t2, pk.to_json))
     end
   )
@@ -787,7 +777,7 @@ fn update_pack(
         None: Unit
       end
       try validate_pack_targets_tx(t1, auth, next_pk)
-      t2 = try Table.put(t1, Db.packs_table(), next_pk.id, next_pk).map_error(Db.map_table_error)
+      t2 = try Db.tx_put_pack(t1, next_pk)
       Ok((t2, next_pk.to_json))
     end
   )

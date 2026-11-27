@@ -201,7 +201,14 @@ fn fetch_remote_snapshot(cfg: SyncCliConfig, net: Network) : Result(
   if res.status < 200 or res.status >= 300
     return Error("GET /api/sync/snapshot returned HTTP #{res.status}: #{res.text}")
   end
-  body = try Json.decode_strict[Json](res.body).map_error(fn(e) e.to_text end)
+  raw_txt = case res.body.decode_utf8
+    Some(t): t
+    None: return Error("snapshot response was not valid UTF-8")
+  end
+  body = case Json.parse(raw_txt)
+    Ok(j): j
+    Error(e): return Error(e.to_text)
+  end
   cols_json = body.list_at("collections") or []
   col_slugs = cols_json.map(fn(c) c.text_at("slug") or "" end).filter(fn(s) not s.empty? end)
   pages_json = body.list_at("pages") or []
@@ -245,7 +252,14 @@ fn post_sync_push(
   if res.status < 200 or res.status >= 300
     return Error("POST /api/sync/push returned HTTP #{res.status}: #{res.text}")
   end
-  parsed = try Json.decode_strict[Json](res.body).map_error(fn(e) e.to_text end)
+  raw_push_txt = case res.body.decode_utf8
+    Some(t): t
+    None: return Error("push response was not valid UTF-8")
+  end
+  parsed = case Json.parse(raw_push_txt)
+    Ok(j): j
+    Error(e): return Error(e.to_text)
+  end
   Ok((res.status, parsed))
 end
 
