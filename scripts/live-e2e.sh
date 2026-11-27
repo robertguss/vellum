@@ -509,6 +509,7 @@ const dbRes = await apiJson("/api/databases", {
 });
 assert.equal(dbRes.res.status, 201, dbRes.text);
 const dbId = dbRes.json.database.id;
+const defaultViewId = dbRes.json.default_view.id;
 
 const rowRes = await apiJson(`/api/databases/${dbId}/rows`, {
   method: "POST",
@@ -523,6 +524,7 @@ const rowRes = await apiJson(`/api/databases/${dbId}/rows`, {
   }),
 });
 assert.equal(rowRes.res.status, 201, rowRes.text);
+const rowId = rowRes.json.row.id;
 
 const qRes = await apiJson(`/api/databases/${dbId}/query`, {
   method: "POST",
@@ -537,7 +539,75 @@ const qRes = await apiJson(`/api/databases/${dbId}/query`, {
 });
 assert.equal(qRes.res.status, 200, qRes.text);
 assert.equal(qRes.json.total_count, 1);
-console.log("✓ Relational Database + Decimal row + Query verified");
+
+// 6b. Saved view PATCH + What-If Scenario fork -> Decimal delta -> merge to Live
+const renameVwRes = await apiJson(`/api/databases/${dbId}/views/${defaultViewId}`, {
+  method: "PATCH",
+  body: JSON.stringify({ name: "Incidents Grid" }),
+});
+assert.equal(renameVwRes.res.status, 200, renameVwRes.text);
+assert.equal(renameVwRes.json.name, "Incidents Grid");
+
+const scenRes = await apiJson(`/api/databases/${dbId}/scenarios`, {
+  method: "POST",
+  body: JSON.stringify({
+    title: "Escalation Cost Model",
+    reason: "Model higher mitigation cost",
+    branch_kind: "scenario",
+  }),
+});
+assert.equal(scenRes.res.status, 201, scenRes.text);
+const scenId = scenRes.json.id;
+
+const scenMutRes = await apiJson(`/api/proposals/${scenId}/mutations`, {
+  method: "POST",
+  body: JSON.stringify({
+    kind: "db_row_update",
+    database_id: dbId,
+    row_id: rowId,
+    cells: { cost: { number_val: "142.75" } },
+    expected_version: 1,
+    reason: "Model failover hardware cost",
+  }),
+});
+assert.equal(scenMutRes.res.status, 200, scenMutRes.text);
+
+const scenQRes = await apiJson(`/api/databases/${dbId}/scenarios/${scenId}/query`, {
+  method: "POST",
+  body: JSON.stringify({
+    view_id: defaultViewId,
+    filters: [],
+    filter_match_all: true,
+    sorts: [],
+    from_date: null,
+    to_date: null,
+  }),
+});
+assert.equal(scenQRes.res.status, 200, scenQRes.text);
+const costDelta = (scenQRes.json.deltas ?? []).find((d) => d.prop_id === "cost");
+assert.ok(costDelta, "Cost DecimalDelta present in scenario query");
+assert.equal(costDelta.delta, "100.25");
+
+const scenAcceptRes = await apiJson(`/api/proposals/${scenId}/accept`, {
+  method: "POST",
+  body: JSON.stringify({ reason: "Approve escalation budget" }),
+});
+assert.equal(scenAcceptRes.res.status, 200, scenAcceptRes.text);
+
+const postMergeQ = await apiJson(`/api/databases/${dbId}/query`, {
+  method: "POST",
+  body: JSON.stringify({
+    view_id: null,
+    filters: [],
+    filter_match_all: true,
+    sorts: [],
+    from_date: null,
+    to_date: null,
+  }),
+});
+assert.equal(postMergeQ.res.status, 200, postMergeQ.text);
+assert.equal(postMergeQ.json.rows[0].row.cells.cost.number_val, "142.75");
+console.log("✓ Relational Database + Decimal row + Query + What-If Scenario delta & merge verified");
 
 // 7. Mint Agent Token + live /mcp tool workflow + Modb.World Proposal Accept
 const mintRes = await apiJson("/api/admin/agents", {

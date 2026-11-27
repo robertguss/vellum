@@ -1,17 +1,47 @@
-import { Link } from "@inertiajs/react";
-import { Calendar as CalIcon, Columns, ExternalLink, Filter, Plus, Table2 } from "lucide-react";
+import { Link, router } from "@inertiajs/react";
+import {
+  Calendar as CalIcon,
+  Check,
+  Columns,
+  Copy,
+  GitBranch,
+  Layers,
+  Pencil,
+  Plus,
+  Save,
+  SlidersHorizontal,
+  Table2,
+  Trash2,
+  X,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import WorkspaceLayout from "../../components/WorkspaceLayout";
+import InlineCellEditor, {
+  SELECT_COLOR_CLASSES,
+  formatNumberCell,
+  getEffectiveCell,
+  getRowTitle,
+  getSelectOptions,
+  renderCellDisplay,
+} from "../../components/database/InlineCellEditor";
+import ScenarioDeltaRibbon from "../../components/database/ScenarioDeltaRibbon";
+import SchemaBuilderDrawer from "../../components/database/SchemaBuilderDrawer";
 import { ApiError, apiFetch } from "../../lib/api";
 import type {
   CellValue,
   Collection,
   DatabaseDef,
+  DbFilterRule,
+  DbSortRule,
   DbViewDef,
+  DbViewKind,
   EnrichedRow,
   FilterOp,
+  PrincipalSummary,
   PropertyDef,
-  SelectOption,
+  ProposalMeta,
+  RelationTargetOption,
+  ScenarioQueryResponse,
   SelectOptionColor,
   ViewQueryResult,
 } from "../../lib/types";
@@ -22,98 +52,9 @@ interface DatabasePageProps {
   database: DatabaseDef;
   views: DbViewDef[];
   rows: EnrichedRow[];
-}
-
-const SELECT_COLOR_CLASSES: Record<SelectOptionColor, string> = {
-  gray: "border-stone-200 bg-stone-100 text-stone-700",
-  blue: "border-blue-200 bg-blue-50 text-blue-700",
-  green: "border-emerald-200 bg-emerald-50 text-emerald-700",
-  amber: "border-amber-200 bg-amber-50 text-amber-800",
-  red: "border-red-200 bg-red-50 text-red-700",
-  purple: "border-purple-200 bg-purple-50 text-purple-700",
-};
-
-function getEffectiveCell(er: EnrichedRow, propId: string): CellValue {
-  return er.effective_cells?.[propId] ?? er.rollups?.[propId] ?? er.row.cells?.[propId] ?? "empty";
-}
-
-function getRowTitle(er: EnrichedRow, properties: PropertyDef[]): string {
-  if (er.title && er.title.trim()) return er.title;
-  const titleProp = properties.find((p) => p.kind === "title");
-  if (titleProp) {
-    const c = getEffectiveCell(er, titleProp.id);
-    if (c && typeof c === "object" && "text_val" in c && c.text_val.trim()) {
-      return c.text_val;
-    }
-  }
-  for (const p of properties) {
-    const c = getEffectiveCell(er, p.id);
-    if (c && typeof c === "object" && "text_val" in c && c.text_val.trim()) {
-      return c.text_val;
-    }
-  }
-  return er.row.id;
-}
-
-function formatNumberCell(raw: string, format: string): string {
-  const num = Number(raw);
-  if (!Number.isFinite(num)) return raw;
-  if (format === "currency") {
-    return new Intl.NumberFormat("en-US", {
-      style: "currency",
-      currency: "USD",
-      minimumFractionDigits: num % 1 === 0 ? 0 : 2,
-      maximumFractionDigits: 2,
-    }).format(num);
-  }
-  if (format === "percent") {
-    return `${new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(num)}%`;
-  }
-  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 4 }).format(num);
-}
-
-function isSafeHttpUrl(url: string): boolean {
-  return /^https?:\/\//i.test(url.trim());
-}
-
-function getSelectOptions(prop: PropertyDef): SelectOption[] {
-  if (typeof prop.kind === "object" && "select" in prop.kind) {
-    return prop.kind.select.options;
-  }
-  if (typeof prop.kind === "object" && "multi_select" in prop.kind) {
-    return prop.kind.multi_select.options;
-  }
-  return [];
-}
-
-function renderCellDisplay(cell: CellValue | undefined, prop: PropertyDef): string {
-  if (!cell || cell === "empty") return "—";
-  if ("text_val" in cell) return cell.text_val;
-  if ("number_val" in cell) {
-    const fmt =
-      typeof prop.kind === "object" && "number" in prop.kind ? prop.kind.number.format : "plain";
-    return formatNumberCell(cell.number_val, fmt);
-  }
-  if ("date_val" in cell) {
-    return cell.date_val.end_date
-      ? `${cell.date_val.start} → ${cell.date_val.end_date}`
-      : cell.date_val.start;
-  }
-  if ("select_val" in cell) {
-    const opt = getSelectOptions(prop).find((o) => o.id === cell.select_val.option_id);
-    return opt ? opt.label : cell.select_val.option_id;
-  }
-  if ("multi_select_val" in cell) {
-    const opts = getSelectOptions(prop);
-    return cell.multi_select_val.option_ids
-      .map((id) => opts.find((o) => o.id === id)?.label ?? id)
-      .join(", ");
-  }
-  if ("bool_val" in cell) return cell.bool_val ? "Yes" : "No";
-  if ("principal_val" in cell) return cell.principal_val.join(", ");
-  if ("url_val" in cell) return cell.url_val;
-  if ("relation_val" in cell) return `${cell.relation_val.row_ids.length} linked`;
-  return "";
+  principals?: PrincipalSummary[];
+  relation_targets?: Record<string, RelationTargetOption[]>;
+  scenarios?: ProposalMeta[];
 }
 
 function encodeInputToCell(prop: PropertyDef, raw: string): CellValue {
@@ -134,16 +75,40 @@ function encodeInputToCell(prop: PropertyDef, raw: string): CellValue {
   return { text_val: trimmed };
 }
 
+function viewKindIcon(kind: DbViewKind) {
+  if ("board_view" in kind) return <Columns className="h-3.5 w-3.5" />;
+  if ("calendar_view" in kind) return <CalIcon className="h-3.5 w-3.5" />;
+  return <Table2 className="h-3.5 w-3.5" />;
+}
+
 export default function DatabaseView({
   collections = [],
   databases = [],
-  database,
+  database: initialDatabase,
   views: initialViews = [],
   rows: initialRows = [],
+  principals = [],
+  relation_targets: initialRelationTargets = {},
+  scenarios: initialScenarios = [],
 }: DatabasePageProps) {
+  const [liveDb, setLiveDb] = useState<DatabaseDef>(initialDatabase);
   const [views, setViews] = useState<DbViewDef[]>(initialViews);
-  const [rows, setRows] = useState<EnrichedRow[]>(initialRows);
-  const [mode, setMode] = useState<"table" | "board" | "calendar">("table");
+  const [activeViewId, setActiveViewId] = useState<string | null>(initialViews[0]?.id ?? null);
+  const [liveRows, setLiveRows] = useState<EnrichedRow[]>(initialRows);
+  const [relationTargets, setRelationTargets] = useState<Record<string, RelationTargetOption[]>>(
+    initialRelationTargets
+  );
+  const [scenarios, setScenarios] = useState<ProposalMeta[]>(initialScenarios);
+
+  const [activeScenario, setActiveScenario] = useState<ProposalMeta | null>(null);
+  const [scenarioData, setScenarioData] = useState<ScenarioQueryResponse | null>(null);
+
+  const [mode, setMode] = useState<"table" | "board" | "calendar">(() => {
+    const firstKind = initialViews[0]?.kind;
+    if (firstKind && "board_view" in firstKind) return "board";
+    if (firstKind && "calendar_view" in firstKind) return "calendar";
+    return "table";
+  });
   const [filterProp, setFilterProp] = useState<string>("");
   const [filterOp, setFilterOp] = useState<FilterOp>("eq");
   const [filterVal, setFilterVal] = useState<string>("");
@@ -155,48 +120,196 @@ export default function DatabaseView({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const selectProp = useMemo(
-    () =>
-      database.properties.find(
-        (p) => typeof p.kind === "object" && "select" in p.kind
-      ) ?? null,
-    [database.properties]
+  // Saved-view editing state
+  const [renamingViewId, setRenamingViewId] = useState<string | null>(null);
+  const [renameViewName, setRenameViewName] = useState("");
+  const [newViewOpen, setNewViewOpen] = useState(false);
+  const [newViewName, setNewViewName] = useState("");
+  const [newViewType, setNewViewType] = useState<"table" | "board" | "calendar">("table");
+  const [newViewGroupBy, setNewViewGroupBy] = useState("");
+  const [newViewDateProp, setNewViewDateProp] = useState("");
+
+  // Drawers & Modals
+  const [schemaDrawerOpen, setSchemaDrawerOpen] = useState(false);
+  const [forkModalOpen, setForkModalOpen] = useState(false);
+  const [forkTitle, setForkTitle] = useState("");
+  const [forkReason, setForkReason] = useState("");
+
+  // Kanban drag state
+  const [draggingRowId, setDraggingRowId] = useState<string | null>(null);
+  const [dragOverColKey, setDragOverColKey] = useState<string | null>(null);
+
+  const activeDb = activeScenario && scenarioData ? scenarioData.database : liveDb;
+  const rows = activeScenario && scenarioData ? scenarioData.query_result.rows : liveRows;
+  const activeView = useMemo(
+    () => views.find((v) => v.id === activeViewId) ?? null,
+    [views, activeViewId]
   );
 
-  const dateProp = useMemo(
+  const groupableProps = useMemo(
     () =>
-      database.properties.find(
+      activeDb.properties.filter(
+        (p) => p.kind === "checkbox" || (typeof p.kind === "object" && "select" in p.kind)
+      ),
+    [activeDb.properties]
+  );
+
+  const boardGroupProp = useMemo(() => {
+    if (activeView && "board_view" in activeView.kind) {
+      const gid = activeView.kind.board_view.group_by_prop_id;
+      const found = activeDb.properties.find((p) => p.id === gid);
+      if (found) return found;
+    }
+    return (
+      activeDb.properties.find((p) => typeof p.kind === "object" && "select" in p.kind) ??
+      activeDb.properties.find((p) => p.kind === "checkbox") ??
+      null
+    );
+  }, [activeDb.properties, activeView]);
+
+  const dateProps = useMemo(
+    () =>
+      activeDb.properties.filter(
         (p) => typeof p.kind === "object" && "date_prop" in p.kind
-      ) ?? null,
-    [database.properties]
+      ),
+    [activeDb.properties]
   );
 
-  async function runQuery(viewId?: string | null) {
+  const dateProp = useMemo(() => {
+    if (activeView && "calendar_view" in activeView.kind) {
+      const dpid = activeView.kind.calendar_view.date_prop_id;
+      const found = activeDb.properties.find((p) => p.id === dpid);
+      if (found) return found;
+    }
+    return dateProps[0] ?? null;
+  }, [activeDb.properties, activeView, dateProps]);
+
+  const firstSelectProp = useMemo(
+    () =>
+      activeDb.properties.find((p) => typeof p.kind === "object" && "select" in p.kind) ?? null,
+    [activeDb.properties]
+  );
+
+  const firstNumberProp = useMemo(
+    () =>
+      activeDb.properties.find((p) => typeof p.kind === "object" && "number" in p.kind) ?? null,
+    [activeDb.properties]
+  );
+
+  useEffect(() => {
+    setLiveDb(initialDatabase);
+  }, [initialDatabase]);
+
+  useEffect(() => {
+    setLiveRows(initialRows);
+  }, [initialRows]);
+
+  useEffect(() => {
+    setViews(initialViews);
+    if (initialViews.length > 0 && !initialViews.some((v) => v.id === activeViewId)) {
+      setActiveViewId(initialViews[0].id);
+    }
+  }, [initialViews, activeViewId]);
+
+  useEffect(() => {
+    setRelationTargets(initialRelationTargets);
+  }, [initialRelationTargets]);
+
+  useEffect(() => {
+    setScenarios(initialScenarios);
+    if (activeScenario && !initialScenarios.some((s) => s.id === activeScenario.id)) {
+      setActiveScenario(null);
+      setScenarioData(null);
+    }
+  }, [initialScenarios, activeScenario]);
+
+  async function runQuery(
+    viewIdOverride?: string | null,
+    opts?: {
+      filterPropVal?: string;
+      filterOpVal?: FilterOp;
+      filterInputVal?: string;
+      sortPropVal?: string;
+      sortDescVal?: boolean;
+      scenarioOverride?: ProposalMeta | null;
+      skipAdhocFilter?: boolean;
+    }
+  ) {
     setBusy(true);
     setError(null);
+    const fProp = opts?.filterPropVal ?? filterProp;
+    const fOp = opts?.filterOpVal ?? filterOp;
+    const fVal = opts?.filterInputVal ?? filterVal;
+    const sProp = opts?.sortPropVal ?? sortProp;
+    const sDesc = opts?.sortDescVal ?? sortDesc;
+    const scen = opts && "scenarioOverride" in opts ? opts.scenarioOverride ?? null : activeScenario;
+
     try {
       const filters =
-        filterProp && (filterVal.trim() || filterOp === "is_empty" || filterOp === "is_not_empty")
-          ? [{ prop_id: filterProp, op: filterOp, value: filterVal.trim() }]
+        !opts?.skipAdhocFilter &&
+        fProp &&
+        (fVal.trim() || fOp === "is_empty" || fOp === "is_not_empty")
+          ? [{ prop_id: fProp, op: fOp, value: fVal.trim() }]
           : [];
-      const sorts = sortProp ? [{ prop_id: sortProp, desc: sortDesc }] : [];
-      const res = await apiFetch<ViewQueryResult>(`/api/databases/${database.id}/query`, {
-        method: "POST",
-        body: JSON.stringify({
-          view_id: viewId ?? null,
-          filters,
-          filter_match_all: true,
-          sorts,
-          from_date: null,
-          to_date: null,
-        }),
-      });
-      setRows(res.rows);
+      const sorts = sProp ? [{ prop_id: sProp, desc: sDesc }] : [];
+      const payload = {
+        view_id: viewIdOverride ?? null,
+        filters,
+        filter_match_all: true,
+        sorts,
+        from_date: null,
+        to_date: null,
+      };
+      if (scen) {
+        const sres = await apiFetch<ScenarioQueryResponse>(
+          `/api/databases/${liveDb.id}/scenarios/${scen.id}/query`,
+          {
+            method: "POST",
+            body: JSON.stringify(payload),
+          }
+        );
+        setScenarioData(sres);
+      } else {
+        const res = await apiFetch<ViewQueryResult>(`/api/databases/${liveDb.id}/query`, {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        setLiveRows(res.rows);
+      }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Query failed");
     } finally {
       setBusy(false);
     }
+  }
+
+  function applySavedView(v: DbViewDef, scenOverride?: ProposalMeta | null) {
+    setActiveViewId(v.id);
+    if ("board_view" in v.kind) setMode("board");
+    else if ("calendar_view" in v.kind) setMode("calendar");
+    else setMode("table");
+
+    const f0 = v.filters[0];
+    const nextFProp = f0?.prop_id ?? "";
+    const nextFOp = f0?.op ?? "eq";
+    const nextFVal = f0 && typeof f0.value === "string" ? f0.value : "";
+    const s0 = v.sorts[0];
+    const nextSProp = s0?.prop_id ?? "";
+    const nextSDesc = s0?.desc ?? false;
+    setFilterProp(nextFProp);
+    setFilterOp(nextFOp);
+    setFilterVal(nextFVal);
+    setSortProp(nextSProp);
+    setSortDesc(nextSDesc);
+    void runQuery(v.id, {
+      filterPropVal: nextFProp,
+      filterOpVal: nextFOp,
+      filterInputVal: nextFVal,
+      sortPropVal: nextSProp,
+      sortDescVal: nextSDesc,
+      scenarioOverride: scenOverride !== undefined ? scenOverride : activeScenario,
+      skipAdhocFilter: true,
+    });
   }
 
   async function handleCreateRow(e: React.FormEvent) {
@@ -205,29 +318,42 @@ export default function DatabaseView({
     setBusy(true);
     setError(null);
     try {
-      const titleProp = database.properties.find((p) => p.kind === "title") ?? database.properties[0];
+      const titleProp =
+        activeDb.properties.find((p) => p.kind === "title") ?? activeDb.properties[0];
       const cells: Record<string, CellValue> = {};
       if (titleProp) {
         cells[titleProp.id] = { text_val: newTitle.trim() };
       }
-      for (const prop of database.properties) {
+      for (const prop of activeDb.properties) {
         if (titleProp && prop.id === titleProp.id) continue;
         const raw = newCellDrafts[prop.id];
         if (raw && raw.trim()) {
           cells[prop.id] = encodeInputToCell(prop, raw);
         }
       }
-      await apiFetch(`/api/databases/${database.id}/rows`, {
-        method: "POST",
-        body: JSON.stringify({
-          cells,
-          markdown: null,
-          reason: "row added from UI",
-        }),
-      });
+      if (activeScenario) {
+        await apiFetch(`/api/proposals/${activeScenario.id}/mutations`, {
+          method: "POST",
+          body: JSON.stringify({
+            kind: "db_row_create",
+            database_id: activeDb.id,
+            cells,
+            reason: `create row in scenario '${activeScenario.title}'`,
+          }),
+        });
+      } else {
+        await apiFetch(`/api/databases/${liveDb.id}/rows`, {
+          method: "POST",
+          body: JSON.stringify({
+            cells,
+            markdown: null,
+            reason: "row added from UI",
+          }),
+        });
+      }
       setNewTitle("");
       setNewCellDrafts({});
-      await runQuery(null);
+      await runQuery(activeViewId);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to create row");
     } finally {
@@ -239,30 +365,136 @@ export default function DatabaseView({
     setBusy(true);
     setError(null);
     try {
-      const nextCells = { ...er.row.cells, [propId]: cellValue };
-      await apiFetch(`/api/databases/${database.id}/rows/${er.row.id}`, {
-        method: "PATCH",
+      if (activeScenario) {
+        await apiFetch(`/api/proposals/${activeScenario.id}/mutations`, {
+          method: "POST",
+          body: JSON.stringify({
+            kind: "db_row_update",
+            database_id: activeDb.id,
+            row_id: er.row.id,
+            cells: { [propId]: cellValue },
+            expected_version: null,
+            reason: `updated ${propId} in scenario`,
+          }),
+        });
+      } else {
+        const nextCells = { ...er.row.cells, [propId]: cellValue };
+        await apiFetch(`/api/databases/${liveDb.id}/rows/${er.row.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({
+            cells: nextCells,
+            expected_version: er.row.version,
+            reason: `updated ${propId}`,
+          }),
+        });
+      }
+      await runQuery(activeViewId);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to update cell");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleDeleteRow(er: EnrichedRow) {
+    setBusy(true);
+    setError(null);
+    try {
+      if (activeScenario) {
+        await apiFetch(`/api/proposals/${activeScenario.id}/mutations`, {
+          method: "POST",
+          body: JSON.stringify({
+            kind: "db_row_delete",
+            database_id: activeDb.id,
+            row_id: er.row.id,
+            reason: "removed row in scenario",
+          }),
+        });
+      } else {
+        await apiFetch(`/api/databases/${liveDb.id}/rows/${er.row.id}`, {
+          method: "DELETE",
+        });
+      }
+      await runQuery(activeViewId);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to delete row");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSaveSchema(nextProperties: PropertyDef[]) {
+    setBusy(true);
+    try {
+      if (activeScenario) {
+        await apiFetch(`/api/proposals/${activeScenario.id}/mutations`, {
+          method: "POST",
+          body: JSON.stringify({
+            kind: "db_schema_update",
+            database_id: activeDb.id,
+            properties: nextProperties,
+            expected_version: null,
+            reason: "schema updated in What-If Scenario",
+          }),
+        });
+        await runQuery(activeViewId);
+      } else {
+        const updatedDef = await apiFetch<DatabaseDef>(`/api/databases/${liveDb.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({
+            title: null,
+            description: null,
+            properties: nextProperties,
+            expected_version: liveDb.version,
+          }),
+        });
+        setLiveDb(updatedDef);
+        router.reload({ only: ["database", "views", "rows", "relation_targets"] });
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleCreateView(
+    name: string,
+    kind: DbViewKind,
+    filters: DbFilterRule[] = filterProp && filterVal.trim()
+      ? [{ prop_id: filterProp, op: filterOp, value: filterVal.trim() }]
+      : [],
+    sorts: DbSortRule[] = sortProp ? [{ prop_id: sortProp, desc: sortDesc }] : []
+  ) {
+    setBusy(true);
+    setError(null);
+    try {
+      const saved = await apiFetch<DbViewDef>(`/api/databases/${liveDb.id}/views`, {
+        method: "POST",
         body: JSON.stringify({
-          cells: nextCells,
-          expected_version: er.row.version,
-          reason: `updated ${propId}`,
+          name: name.trim(),
+          kind,
+          filters,
+          filter_match_all: true,
+          sorts,
         }),
       });
-      await runQuery(null);
+      setViews((prev) => [...prev, saved]);
+      applySavedView(saved);
+      setNewViewOpen(false);
+      setNewViewName("");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to update row");
+      setError(err instanceof ApiError ? err.message : "Failed to create view");
     } finally {
       setBusy(false);
     }
   }
 
   async function handleSaveCurrentView() {
-    const kind =
-      mode === "board" && selectProp
+    const kind: DbViewKind =
+      mode === "board" && boardGroupProp
         ? {
             board_view: {
-              group_by_prop_id: selectProp.id,
-              card_prop_ids: database.properties.slice(0, 3).map((p) => p.id),
+              group_by_prop_id: boardGroupProp.id,
+              card_prop_ids: activeDb.properties.slice(0, 3).map((p) => p.id),
               hide_empty_groups: false,
             },
           }
@@ -270,62 +502,199 @@ export default function DatabaseView({
           ? {
               calendar_view: {
                 date_prop_id: dateProp.id,
-                card_prop_ids: database.properties.slice(0, 2).map((p) => p.id),
+                card_prop_ids: activeDb.properties.slice(0, 2).map((p) => p.id),
               },
             }
           : {
               table_view: {
-                visible_prop_ids: database.properties.map((p) => p.id),
+                visible_prop_ids: activeDb.properties.map((p) => p.id),
                 column_widths: {},
               },
             };
+
+    if (activeView) {
+      setBusy(true);
+      setError(null);
+      try {
+        const filters =
+          filterProp && (filterVal.trim() || filterOp === "is_empty" || filterOp === "is_not_empty")
+            ? [{ prop_id: filterProp, op: filterOp, value: filterVal.trim() }]
+            : [];
+        const sorts = sortProp ? [{ prop_id: sortProp, desc: sortDesc }] : [];
+        const updated = await apiFetch<DbViewDef>(
+          `/api/databases/${liveDb.id}/views/${activeView.id}`,
+          {
+            method: "PATCH",
+            body: JSON.stringify({
+              kind,
+              filters,
+              filter_match_all: true,
+              sorts,
+            }),
+          }
+        );
+        setViews((prev) => prev.map((v) => (v.id === updated.id ? updated : v)));
+      } catch (err) {
+        setError(err instanceof ApiError ? err.message : "Failed to save view changes");
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
+
+    await handleCreateView(
+      `${mode.charAt(0).toUpperCase()}${mode.slice(1)} View`,
+      kind
+    );
+  }
+
+  async function handleRenameViewSubmit(v: DbViewDef) {
+    const trimmed = renameViewName.trim();
+    setRenamingViewId(null);
+    if (!trimmed || trimmed === v.name) return;
+    setBusy(true);
+    setError(null);
     try {
-      const saved = await apiFetch<DbViewDef>(`/api/databases/${database.id}/views`, {
+      const updated = await apiFetch<DbViewDef>(`/api/databases/${liveDb.id}/views/${v.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name: trimmed }),
+      });
+      setViews((prev) => prev.map((x) => (x.id === updated.id ? updated : x)));
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to rename view");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleDuplicateView(v: DbViewDef) {
+    await handleCreateView(`${v.name} (Copy)`, v.kind, v.filters, v.sorts);
+  }
+
+  async function handleDeleteView(v: DbViewDef) {
+    if (views.length <= 1) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await apiFetch(`/api/databases/${liveDb.id}/views/${v.id}`, { method: "DELETE" });
+      const remaining = views.filter((x) => x.id !== v.id);
+      setViews(remaining);
+      if (activeViewId === v.id && remaining[0]) {
+        applySavedView(remaining[0]);
+      }
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to delete view");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleForkScenario(e: React.FormEvent) {
+    e.preventDefault();
+    if (!forkTitle.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const created = await apiFetch<ProposalMeta>(`/api/databases/${liveDb.id}/scenarios`, {
         method: "POST",
         body: JSON.stringify({
-          name: `${mode.charAt(0).toUpperCase()}${mode.slice(1)} View`,
-          kind,
-          filters: [],
-          filter_match_all: true,
-          sorts: sortProp ? [{ prop_id: sortProp, desc: sortDesc }] : [],
+          title: forkTitle.trim(),
+          reason: forkReason.trim() || `What-If Scenario: ${forkTitle.trim()}`,
+          branch_kind: "scenario",
         }),
       });
-      setViews((prev) => [...prev, saved]);
+      setScenarios((prev) => [created, ...prev]);
+      setActiveScenario(created);
+      setForkModalOpen(false);
+      setForkTitle("");
+      setForkReason("");
+      await runQuery(activeViewId, { scenarioOverride: created });
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save view");
+      setError(err instanceof ApiError ? err.message : "Failed to fork scenario");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleMergeScenario() {
+    if (!activeScenario) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await apiFetch(`/api/proposals/${activeScenario.id}/accept`, {
+        method: "POST",
+        body: JSON.stringify({ reason: `Merge What-If Scenario '${activeScenario.title}'` }),
+      });
+      setScenarios((prev) => prev.filter((s) => s.id !== activeScenario.id));
+      setActiveScenario(null);
+      setScenarioData(null);
+      router.reload({ only: ["database", "views", "rows", "scenarios", "relation_targets"] });
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not merge scenario");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleDiscardScenario() {
+    if (!activeScenario) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await apiFetch(`/api/proposals/${activeScenario.id}/reject`, {
+        method: "POST",
+        body: JSON.stringify({ reason: `Discard scenario '${activeScenario.title}'` }),
+      });
+      setScenarios((prev) => prev.filter((s) => s.id !== activeScenario.id));
+      setActiveScenario(null);
+      setScenarioData(null);
+      await runQuery(activeViewId, { scenarioOverride: null });
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to discard scenario");
+    } finally {
+      setBusy(false);
     }
   }
 
   const boardColumns = useMemo(() => {
-    if (!selectProp) return [];
-    const opts = getSelectOptions(selectProp);
-    const grouped: Array<{
+    if (!boardGroupProp) return [];
+    const colBuckets: Array<{
       id: string;
       label: string;
       color: SelectOptionColor;
       items: EnrichedRow[];
-    }> = opts.map((o) => ({
-      id: o.id,
-      label: o.label,
-      color: o.color,
-      items: [],
-    }));
-    const uncategorized: EnrichedRow[] = [];
-    for (const r of rows) {
-      const c = getEffectiveCell(r, selectProp.id);
-      const optId = c && typeof c === "object" && "select_val" in c ? c.select_val.option_id : null;
-      const target = optId ? grouped.find((g) => g.id === optId) : undefined;
-      if (target) {
-        target.items.push(r);
-      } else {
-        uncategorized.push(r);
+    }> = [];
+
+    if (typeof boardGroupProp.kind === "object" && "select" in boardGroupProp.kind) {
+      for (const o of boardGroupProp.kind.select.options) {
+        colBuckets.push({ id: o.id, label: o.label, color: o.color, items: [] });
       }
+      const uncategorized: EnrichedRow[] = [];
+      for (const r of rows) {
+        const c = getEffectiveCell(r, boardGroupProp.id);
+        const optId =
+          c && typeof c === "object" && "select_val" in c ? c.select_val.option_id : null;
+        const target = optId ? colBuckets.find((g) => g.id === optId) : undefined;
+        if (target) target.items.push(r);
+        else uncategorized.push(r);
+      }
+      if (uncategorized.length > 0 || colBuckets.length === 0) {
+        colBuckets.push({ id: "__none__", label: "Unassigned", color: "gray", items: uncategorized });
+      }
+    } else if (boardGroupProp.kind === "checkbox") {
+      const checkedItems: EnrichedRow[] = [];
+      const uncheckedItems: EnrichedRow[] = [];
+      for (const r of rows) {
+        const c = getEffectiveCell(r, boardGroupProp.id);
+        const flag = typeof c === "object" && "bool_val" in c ? c.bool_val : false;
+        if (flag) checkedItems.push(r);
+        else uncheckedItems.push(r);
+      }
+      colBuckets.push({ id: "true", label: `Checked (${boardGroupProp.name})`, color: "green", items: checkedItems });
+      colBuckets.push({ id: "false", label: `Unchecked (${boardGroupProp.name})`, color: "gray", items: uncheckedItems });
     }
-    if (uncategorized.length > 0) {
-      grouped.push({ id: "", label: "Unassigned", color: "gray", items: uncategorized });
-    }
-    return grouped;
-  }, [rows, selectProp]);
+    return colBuckets;
+  }, [rows, boardGroupProp]);
 
   const calendarGroups = useMemo(() => {
     if (!dateProp) return [];
@@ -343,97 +712,405 @@ export default function DatabaseView({
 
   const runQueryRef = useRef(runQuery);
   runQueryRef.current = runQuery;
-
-  useEffect(() => {
-    setRows(initialRows);
-  }, [initialRows]);
-
-  useEffect(() => {
-    setViews(initialViews);
-  }, [initialViews]);
+  const activeScenarioRef = useRef(activeScenario);
+  activeScenarioRef.current = activeScenario;
+  const activeViewIdRef = useRef(activeViewId);
+  activeViewIdRef.current = activeViewId;
 
   const handleRealtimeEvent = useCallback((eventName: string) => {
+    if (
+      eventName === "db.schema_updated" ||
+      eventName === "db.views_updated" ||
+      eventName === "proposal.opened" ||
+      eventName === "proposal.accepted" ||
+      eventName === "proposal.rejected" ||
+      eventName === "resync_required"
+    ) {
+      router.reload({ only: ["database", "views", "rows", "scenarios", "relation_targets"] });
+    }
     if (
       eventName === "db.row_created" ||
       eventName === "db.row_updated" ||
       eventName === "db.row_deleted" ||
-      eventName === "resync_required"
+      eventName === "proposal.updated"
     ) {
-      void runQueryRef.current(null);
+      void runQueryRef.current(activeViewIdRef.current, {
+        scenarioOverride: activeScenarioRef.current,
+      });
     }
   }, []);
 
+  function moveRowToBoardCol(er: EnrichedRow, targetColId: string) {
+    if (!boardGroupProp) return;
+    if (boardGroupProp.kind === "checkbox") {
+      const targetBool = targetColId === "true";
+      const curCell = getEffectiveCell(er, boardGroupProp.id);
+      const curBool = typeof curCell === "object" && "bool_val" in curCell ? curCell.bool_val : false;
+      if (curBool === targetBool) return;
+      void handleUpdateRowCell(er, boardGroupProp.id, { bool_val: targetBool });
+    } else {
+      const curCell = getEffectiveCell(er, boardGroupProp.id);
+      const curOpt = typeof curCell === "object" && "select_val" in curCell ? curCell.select_val.option_id : "__none__";
+      if (curOpt === targetColId) return;
+      void handleUpdateRowCell(
+        er,
+        boardGroupProp.id,
+        targetColId === "__none__" ? "empty" : { select_val: { option_id: targetColId } }
+      );
+    }
+  }
+
   return (
     <WorkspaceLayout
-      title={database.title}
+      title={activeDb.title}
       collections={collections}
       databases={databases}
-      activeDatabaseId={database.id}
-      currentCollectionId={database.collection_id}
-      realtimeScope={{ databaseId: database.id }}
+      activeDatabaseId={liveDb.id}
+      currentCollectionId={liveDb.collection_id}
+      realtimeScope={{ databaseId: liveDb.id }}
       onRealtimeEvent={handleRealtimeEvent}
     >
-      <div className="space-y-5">
-        <div className="rounded-2xl border border-stone-200 bg-white p-6 flex flex-wrap items-center justify-between gap-4">
-          <div>
-            <h1 className="text-2xl font-semibold text-stone-950">{database.title}</h1>
-            <p className="text-sm text-stone-500 mt-0.5">
-              {database.description || `${rows.length} rows · ${views.length} saved views`}
-            </p>
+      <div className="space-y-4">
+        {/* Top Header Card */}
+        <div className="rounded-2xl border border-stone-200 bg-white p-5 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <div className="flex items-center gap-2">
+                <h1 className="text-2xl font-semibold text-stone-950">{activeDb.title}</h1>
+                <span className="rounded-md bg-stone-100 px-2 py-0.5 font-mono text-[11px] text-stone-500">
+                  v{activeDb.version}
+                </span>
+              </div>
+              <p className="text-sm text-stone-500 mt-0.5">
+                {activeDb.description ||
+                  `${rows.length} rows · ${views.length} saved views · ${activeDb.properties.length} columns`}
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              {/* Branch Switcher */}
+              <div className="inline-flex items-center gap-1.5 rounded-xl border border-stone-200 bg-stone-50 px-2.5 py-1 text-xs">
+                <GitBranch className="h-3.5 w-3.5 text-indigo-600" />
+                <select
+                  value={activeScenario?.id ?? ""}
+                  onChange={(e) => {
+                    const sid = e.target.value;
+                    if (!sid) {
+                      setActiveScenario(null);
+                      setScenarioData(null);
+                      void runQuery(activeViewId, { scenarioOverride: null });
+                    } else {
+                      const found = scenarios.find((s) => s.id === sid) ?? null;
+                      setActiveScenario(found);
+                      void runQuery(activeViewId, { scenarioOverride: found });
+                    }
+                  }}
+                  className="bg-transparent font-medium text-stone-800 outline-none cursor-pointer"
+                >
+                  <option value="">Branch: Live</option>
+                  {scenarios.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      Scenario: {s.title}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setForkTitle("");
+                  setForkReason("");
+                  setForkModalOpen(true);
+                }}
+                className="inline-flex items-center gap-1.5 rounded-xl border border-indigo-200 bg-indigo-50 px-3 py-1.5 text-xs font-medium text-indigo-800 hover:bg-indigo-100"
+              >
+                <GitBranch className="h-3.5 w-3.5" />
+                Fork Scenario
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setSchemaDrawerOpen(true)}
+                className="inline-flex items-center gap-1.5 rounded-xl border border-stone-200 bg-white px-3 py-1.5 text-xs font-medium text-stone-700 hover:bg-stone-50"
+              >
+                <SlidersHorizontal className="h-3.5 w-3.5" />
+                Columns ({activeDb.properties.length})
+              </button>
+
+              {/* Quick Mode Switcher */}
+              <div className="inline-flex rounded-xl border border-stone-200 bg-stone-50 p-1 text-xs">
+                <button
+                  type="button"
+                  onClick={() => setMode("table")}
+                  className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1 font-medium ${
+                    mode === "table" ? "bg-white text-stone-900 shadow-2xs" : "text-stone-500"
+                  }`}
+                >
+                  <Table2 className="h-3.5 w-3.5" />
+                  Table
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMode("board")}
+                  className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1 font-medium ${
+                    mode === "board" ? "bg-white text-stone-900 shadow-2xs" : "text-stone-500"
+                  }`}
+                >
+                  <Columns className="h-3.5 w-3.5" />
+                  Board
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMode("calendar")}
+                  className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1 font-medium ${
+                    mode === "calendar" ? "bg-white text-stone-900 shadow-2xs" : "text-stone-500"
+                  }`}
+                >
+                  <CalIcon className="h-3.5 w-3.5" />
+                  Calendar
+                </button>
+              </div>
+            </div>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="inline-flex rounded-xl border border-stone-200 bg-stone-50 p-1 text-xs">
+
+          {/* Saved Views Tab Strip */}
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-stone-100 pt-3">
+            <div className="flex flex-wrap items-center gap-1.5">
+              {views.map((v) => {
+                const isActive = activeViewId === v.id;
+                if (renamingViewId === v.id) {
+                  return (
+                    <div
+                      key={v.id}
+                      className="inline-flex items-center gap-1 rounded-lg border border-blue-300 bg-blue-50 px-2 py-1 text-xs"
+                    >
+                      <input
+                        autoFocus
+                        value={renameViewName}
+                        onChange={(e) => setRenameViewName(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") void handleRenameViewSubmit(v);
+                          if (e.key === "Escape") setRenamingViewId(null);
+                        }}
+                        className="w-28 bg-white rounded border border-blue-200 px-1.5 py-0.5 text-xs outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => void handleRenameViewSubmit(v)}
+                        className="text-emerald-700 hover:text-emerald-900"
+                      >
+                        <Check className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setRenamingViewId(null)}
+                        className="text-stone-400 hover:text-stone-700"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  );
+                }
+                return (
+                  <button
+                    key={v.id}
+                    type="button"
+                    onClick={() => applySavedView(v)}
+                    className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition ${
+                      isActive
+                        ? "border-stone-900 bg-stone-900 text-white"
+                        : "border-stone-200 bg-stone-50 text-stone-600 hover:bg-stone-100 hover:text-stone-900"
+                    }`}
+                  >
+                    {viewKindIcon(v.kind)}
+                    <span>{v.name}</span>
+                  </button>
+                );
+              })}
+
               <button
                 type="button"
-                onClick={() => setMode("table")}
-                className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 font-medium ${
-                  mode === "table" ? "bg-white text-stone-900 shadow-2xs" : "text-stone-500"
-                }`}
+                onClick={() => {
+                  setNewViewName("");
+                  setNewViewGroupBy(groupableProps[0]?.id ?? "");
+                  setNewViewDateProp(dateProps[0]?.id ?? "");
+                  setNewViewOpen((prev) => !prev);
+                }}
+                className="inline-flex items-center gap-1 rounded-lg border border-dashed border-stone-300 px-2.5 py-1.5 text-xs font-medium text-stone-500 hover:border-stone-400 hover:text-stone-800"
               >
-                <Table2 className="h-3.5 w-3.5" />
-                Table
-              </button>
-              <button
-                type="button"
-                onClick={() => setMode("board")}
-                className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 font-medium ${
-                  mode === "board" ? "bg-white text-stone-900 shadow-2xs" : "text-stone-500"
-                }`}
-              >
-                <Columns className="h-3.5 w-3.5" />
-                Board
-              </button>
-              <button
-                type="button"
-                onClick={() => setMode("calendar")}
-                className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 font-medium ${
-                  mode === "calendar" ? "bg-white text-stone-900 shadow-2xs" : "text-stone-500"
-                }`}
-              >
-                <CalIcon className="h-3.5 w-3.5" />
-                Calendar
+                <Plus className="h-3.5 w-3.5" />
+                New View
               </button>
             </div>
-            <button
-              type="button"
-              onClick={() => void handleSaveCurrentView()}
-              className="rounded-lg border border-stone-200 px-3 py-1.5 text-xs font-medium text-stone-700 hover:bg-stone-50"
-            >
-              Save View
-            </button>
+
+            {activeView && (
+              <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void handleSaveCurrentView()}
+                  className="inline-flex items-center gap-1 rounded-lg border border-stone-200 px-2.5 py-1 text-stone-700 hover:bg-stone-50"
+                  title="Save active filter/sort/layout to this view"
+                >
+                  <Save className="h-3 w-3" />
+                  Save View
+                </button>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => {
+                    setRenamingViewId(activeView.id);
+                    setRenameViewName(activeView.name);
+                  }}
+                  className="inline-flex items-center gap-1 rounded-lg border border-stone-200 px-2.5 py-1 text-stone-700 hover:bg-stone-50"
+                  title="Rename active view"
+                >
+                  <Pencil className="h-3 w-3" />
+                  Rename
+                </button>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void handleDuplicateView(activeView)}
+                  className="inline-flex items-center gap-1 rounded-lg border border-stone-200 px-2.5 py-1 text-stone-700 hover:bg-stone-50"
+                  title="Duplicate view"
+                >
+                  <Copy className="h-3 w-3" />
+                  Duplicate
+                </button>
+                <button
+                  type="button"
+                  disabled={busy || views.length <= 1}
+                  onClick={() => void handleDeleteView(activeView)}
+                  className="inline-flex items-center gap-1 rounded-lg border border-stone-200 px-2.5 py-1 text-stone-500 hover:border-red-200 hover:bg-red-50 hover:text-red-700 disabled:opacity-40"
+                  title={views.length <= 1 ? "At least one view must remain" : "Delete view"}
+                >
+                  <Trash2 className="h-3 w-3" />
+                </button>
+              </div>
+            )}
           </div>
+
+          {newViewOpen && (
+            <div className="rounded-xl border border-stone-200 bg-stone-50 p-3 flex flex-wrap items-center gap-2 text-xs">
+              <Layers className="h-3.5 w-3.5 text-stone-500" />
+              <input
+                value={newViewName}
+                onChange={(e) => setNewViewName(e.target.value)}
+                placeholder="View name (e.g. Q4 Board)"
+                className="rounded-md border border-stone-200 bg-white px-2.5 py-1.5 w-44 outline-none"
+              />
+              <select
+                value={newViewType}
+                onChange={(e) => setNewViewType(e.target.value as "table" | "board" | "calendar")}
+                className="rounded-md border border-stone-200 bg-white px-2.5 py-1.5"
+              >
+                <option value="table">Table View</option>
+                <option value="board">Kanban Board</option>
+                <option value="calendar">Calendar View</option>
+              </select>
+              {newViewType === "board" && (
+                <select
+                  value={newViewGroupBy}
+                  onChange={(e) => setNewViewGroupBy(e.target.value)}
+                  className="rounded-md border border-stone-200 bg-white px-2.5 py-1.5"
+                >
+                  <option value="">Group by column...</option>
+                  {groupableProps.map((gp) => (
+                    <option key={gp.id} value={gp.id}>
+                      {gp.name}
+                    </option>
+                  ))}
+                </select>
+              )}
+              {newViewType === "calendar" && (
+                <select
+                  value={newViewDateProp}
+                  onChange={(e) => setNewViewDateProp(e.target.value)}
+                  className="rounded-md border border-stone-200 bg-white px-2.5 py-1.5"
+                >
+                  <option value="">Date column...</option>
+                  {dateProps.map((dp) => (
+                    <option key={dp.id} value={dp.id}>
+                      {dp.name}
+                    </option>
+                  ))}
+                </select>
+              )}
+              <button
+                type="button"
+                disabled={
+                  busy ||
+                  !newViewName.trim() ||
+                  (newViewType === "board" && !newViewGroupBy) ||
+                  (newViewType === "calendar" && !newViewDateProp)
+                }
+                onClick={() => {
+                  const kind: DbViewKind =
+                    newViewType === "board"
+                      ? {
+                          board_view: {
+                            group_by_prop_id: newViewGroupBy,
+                            card_prop_ids: activeDb.properties.slice(0, 3).map((p) => p.id),
+                            hide_empty_groups: false,
+                          },
+                        }
+                      : newViewType === "calendar"
+                        ? {
+                            calendar_view: {
+                              date_prop_id: newViewDateProp,
+                              card_prop_ids: activeDb.properties.slice(0, 2).map((p) => p.id),
+                            },
+                          }
+                        : {
+                            table_view: {
+                              visible_prop_ids: activeDb.properties.map((p) => p.id),
+                              column_widths: {},
+                            },
+                          };
+                  void handleCreateView(newViewName, kind);
+                }}
+                className="rounded-lg bg-stone-900 px-3 py-1.5 font-medium text-white hover:bg-stone-800 disabled:opacity-50"
+              >
+                Create View
+              </button>
+              <button
+                type="button"
+                onClick={() => setNewViewOpen(false)}
+                className="text-stone-500 hover:text-stone-800 px-2"
+              >
+                Cancel
+              </button>
+            </div>
+          )}
         </div>
+
+        {/* Active Scenario Delta Ribbon */}
+        {activeScenario && scenarioData && (
+          <ScenarioDeltaRibbon
+            scenarioData={scenarioData}
+            busy={busy}
+            onExitToLive={() => {
+              setActiveScenario(null);
+              setScenarioData(null);
+              void runQuery(activeViewId, { scenarioOverride: null });
+            }}
+            onMerge={handleMergeScenario}
+            onDiscard={handleDiscardScenario}
+          />
+        )}
 
         {/* Filter & Sort Query Bar */}
         <div className="rounded-xl border border-stone-200 bg-white p-3.5 flex flex-wrap items-center gap-2 text-xs">
-          <Filter className="h-3.5 w-3.5 text-stone-400" />
+          <span className="font-medium text-stone-500">Filter</span>
           <select
             value={filterProp}
             onChange={(e) => setFilterProp(e.target.value)}
             className="rounded-md border border-stone-200 px-2 py-1.5 bg-white"
           >
             <option value="">All columns</option>
-            {database.properties.map((p) => (
+            {activeDb.properties.map((p) => (
               <option key={p.id} value={p.id}>
                 {p.name}
               </option>
@@ -448,14 +1125,20 @@ export default function DatabaseView({
             <option value="neq">not equals</option>
             <option value="contains">contains</option>
             <option value="gt">greater than</option>
+            <option value="gte">greater or eq</option>
             <option value="lt">less than</option>
+            <option value="lte">less or eq</option>
+            <option value="is_empty">is empty</option>
+            <option value="is_not_empty">is not empty</option>
           </select>
-          <input
-            value={filterVal}
-            onChange={(e) => setFilterVal(e.target.value)}
-            placeholder="Filter value..."
-            className="rounded-md border border-stone-200 px-2.5 py-1.5 w-36 outline-none"
-          />
+          {filterOp !== "is_empty" && filterOp !== "is_not_empty" && (
+            <input
+              value={filterVal}
+              onChange={(e) => setFilterVal(e.target.value)}
+              placeholder="Filter value..."
+              className="rounded-md border border-stone-200 px-2.5 py-1.5 w-36 outline-none"
+            />
+          )}
           <span className="text-stone-300 px-1">|</span>
           <select
             value={sortProp}
@@ -463,7 +1146,7 @@ export default function DatabaseView({
             className="rounded-md border border-stone-200 px-2 py-1.5 bg-white"
           >
             <option value="">Default order</option>
-            {database.properties.map((p) => (
+            {activeDb.properties.map((p) => (
               <option key={p.id} value={p.id}>
                 Sort: {p.name}
               </option>
@@ -480,7 +1163,7 @@ export default function DatabaseView({
           <button
             type="button"
             disabled={busy}
-            onClick={() => void runQuery(null)}
+            onClick={() => void runQuery(activeViewId)}
             className="ml-auto rounded-lg bg-stone-900 px-3 py-1.5 font-medium text-white hover:bg-stone-800 disabled:opacity-50"
           >
             Run Query
@@ -493,180 +1176,166 @@ export default function DatabaseView({
           </div>
         )}
 
-        {/* Views */}
+        {/* TABLE VIEW */}
         {mode === "table" && (
-          <div className="rounded-2xl border border-stone-200 bg-white overflow-x-auto">
-            <table className="w-full text-left text-sm">
-              <thead className="border-b border-stone-200 bg-stone-50/70 text-xs text-stone-500">
-                <tr>
-                  {database.properties.map((p) => (
-                    <th key={p.id} className="px-4 py-3 font-medium">
-                      {p.name}
-                    </th>
-                  ))}
-                  <th className="px-4 py-3 font-medium text-right">Page</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-stone-100">
-                {rows.map((er) => {
-                  const rowTitle = getRowTitle(er, database.properties);
-                  return (
-                    <tr key={er.row.id} className="hover:bg-stone-50/70">
-                      {database.properties.map((p) => {
-                        const opts = getSelectOptions(p);
-                        const curCell = getEffectiveCell(er, p.id);
-                        const curOptId =
-                          curCell && typeof curCell === "object" && "select_val" in curCell
-                            ? curCell.select_val.option_id
-                            : "";
-                        const selectedOpt = curOptId ? opts.find((o) => o.id === curOptId) : undefined;
-                        const pillCls = selectedOpt
-                          ? SELECT_COLOR_CLASSES[selectedOpt.color]
-                          : "border-stone-200 bg-white text-stone-700";
-
-                        return (
-                          <td key={p.id} className="px-4 py-2.5 whitespace-nowrap">
-                            {p.kind === "title" ? (
-                              <Link
-                                href={`/p/${er.row.page_id}`}
-                                className="font-medium text-stone-900 hover:text-blue-700 hover:underline"
-                              >
-                                {rowTitle}
-                              </Link>
-                            ) : opts.length > 0 && typeof p.kind === "object" && "select" in p.kind ? (
-                              <select
-                                value={curOptId}
-                                disabled={busy}
-                                onChange={(e) =>
-                                  void handleUpdateRowCell(
-                                    er,
-                                    p.id,
-                                    e.target.value
-                                      ? { select_val: { option_id: e.target.value } }
-                                      : "empty"
-                                  )
-                                }
-                                className={`rounded-full border px-2.5 py-0.5 text-xs font-medium outline-none cursor-pointer ${pillCls}`}
-                              >
-                                <option value="">—</option>
-                                {opts.map((o) => (
-                                  <option key={o.id} value={o.id}>
-                                    {o.label}
-                                  </option>
-                                ))}
-                              </select>
-                            ) : opts.length > 0 &&
-                              typeof p.kind === "object" &&
-                              "multi_select" in p.kind ? (
-                              <div className="flex flex-wrap gap-1">
-                                {curCell &&
-                                typeof curCell === "object" &&
-                                "multi_select_val" in curCell &&
-                                curCell.multi_select_val.option_ids.length > 0 ? (
-                                  curCell.multi_select_val.option_ids.map((id) => {
-                                    const opt = opts.find((o) => o.id === id);
-                                    const cls = opt
-                                      ? SELECT_COLOR_CLASSES[opt.color]
-                                      : SELECT_COLOR_CLASSES.gray;
-                                    return (
-                                      <span
-                                        key={id}
-                                        className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${cls}`}
-                                      >
-                                        {opt?.label ?? id}
-                                      </span>
-                                    );
-                                  })
-                                ) : (
-                                  <span className="text-stone-400">—</span>
-                                )}
-                              </div>
-                            ) : p.kind === "checkbox" ? (
-                              <label className="inline-flex items-center gap-2 cursor-pointer">
-                                <input
-                                  type="checkbox"
-                                  disabled={busy}
-                                  checked={
-                                    typeof curCell === "object" && "bool_val" in curCell
-                                      ? curCell.bool_val
-                                      : false
-                                  }
-                                  onClick={(e) => e.stopPropagation()}
-                                  onChange={(e) =>
-                                    void handleUpdateRowCell(er, p.id, {
-                                      bool_val: e.target.checked,
-                                    })
-                                  }
-                                  className="h-4 w-4 rounded border-stone-300 text-stone-900 focus:ring-stone-500"
-                                />
-                              </label>
-                            ) : p.kind === "url" &&
-                              curCell &&
-                              typeof curCell === "object" &&
-                              "url_val" in curCell &&
-                              isSafeHttpUrl(curCell.url_val) ? (
-                              <a
-                                href={curCell.url_val}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="text-xs text-blue-600 hover:underline"
-                              >
-                                {curCell.url_val}
-                              </a>
-                            ) : typeof p.kind === "object" &&
-                              ("number" in p.kind || "rollup" in p.kind) ? (
-                              <span className="font-mono text-xs tabular-nums text-stone-800">
-                                {renderCellDisplay(curCell, p)}
+          <div className="space-y-3">
+            <div className="rounded-2xl border border-stone-200 bg-white overflow-x-auto">
+              <table className="w-full text-left text-sm">
+                <thead className="border-b border-stone-200 bg-stone-50/70 text-xs text-stone-500">
+                  <tr>
+                    {activeScenario && <th className="px-3 py-3 font-medium w-16">State</th>}
+                    {activeDb.properties.map((p) => (
+                      <th key={p.id} className="px-4 py-3 font-medium whitespace-nowrap">
+                        {p.name}
+                      </th>
+                    ))}
+                    <th className="px-3 py-3 font-medium text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-stone-100">
+                  {rows.map((er) => {
+                    const rowChange = activeScenario
+                      ? scenarioData?.row_changes[er.row.id]
+                      : undefined;
+                    return (
+                      <tr
+                        key={er.row.id}
+                        className={
+                          rowChange === "added"
+                            ? "bg-emerald-50/40 hover:bg-emerald-50/70"
+                            : rowChange === "modified"
+                              ? "bg-amber-50/40 hover:bg-amber-50/70"
+                              : "hover:bg-stone-50/70"
+                        }
+                      >
+                        {activeScenario && (
+                          <td className="px-3 py-2.5 whitespace-nowrap">
+                            {rowChange === "added" ? (
+                              <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold uppercase text-emerald-800">
+                                New
+                              </span>
+                            ) : rowChange === "modified" ? (
+                              <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold uppercase text-amber-800">
+                                Edited
                               </span>
                             ) : (
-                              <span className="text-stone-800">{renderCellDisplay(curCell, p)}</span>
+                              <span className="text-[10px] text-stone-400">—</span>
                             )}
                           </td>
-                        );
-                      })}
-                      <td className="px-4 py-2.5 text-right whitespace-nowrap">
-                        <Link
-                          href={`/p/${er.row.page_id}`}
-                          className="inline-flex items-center gap-1 text-xs text-blue-600 hover:underline"
-                        >
-                          Open
-                          <ExternalLink className="h-3 w-3" />
-                        </Link>
+                        )}
+                        {activeDb.properties.map((p) => (
+                          <td key={p.id} className="px-4 py-2.5 whitespace-nowrap">
+                            <InlineCellEditor
+                              er={er}
+                              prop={p}
+                              database={activeDb}
+                              databases={databases}
+                              principals={principals}
+                              relationTargets={relationTargets}
+                              disabled={busy}
+                              onCommit={(val) => handleUpdateRowCell(er, p.id, val)}
+                            />
+                          </td>
+                        ))}
+                        <td className="px-3 py-2.5 text-right whitespace-nowrap">
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => void handleDeleteRow(er)}
+                            className="rounded p-1 text-stone-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-40"
+                            title="Delete row"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {rows.length === 0 && (
+                    <tr>
+                      <td
+                        colSpan={activeDb.properties.length + (activeScenario ? 2 : 1)}
+                        className="px-4 py-6 text-center text-xs text-stone-400"
+                      >
+                        No matching rows yet.
                       </td>
                     </tr>
-                  );
-                })}
-                {rows.length === 0 && (
-                  <tr>
-                    <td
-                      colSpan={database.properties.length + 1}
-                      className="px-4 py-6 text-center text-xs text-stone-400"
-                    >
-                      No matching rows yet.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            {activeScenario && scenarioData && scenarioData.removed_rows.length > 0 && (
+              <details className="rounded-xl border border-rose-200 bg-rose-50/50 px-4 py-2.5 text-xs">
+                <summary className="cursor-pointer font-medium text-rose-800">
+                  Removed in Scenario ({scenarioData.removed_rows.length})
+                </summary>
+                <div className="mt-2 space-y-1">
+                  {scenarioData.removed_rows.map((er) => (
+                    <div key={er.row.id} className="flex items-center justify-between text-rose-700 line-through">
+                      <span>{getRowTitle(er, activeDb.properties)}</span>
+                      <span className="font-mono text-[11px]">{er.row.id}</span>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            )}
           </div>
         )}
 
+        {/* DRAG-AND-DROP KANBAN BOARD VIEW */}
         {mode === "board" && (
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            {!selectProp && (
+            {!boardGroupProp && (
               <div className="col-span-full rounded-xl border border-stone-200 bg-white p-6 text-sm text-stone-500">
-                Add a Select property to group rows in Kanban Board view.
+                Add a Select or Checkbox property in Columns to group rows in Kanban Board view.
               </div>
             )}
-            {selectProp &&
+            {boardGroupProp &&
               boardColumns.map((col) => {
-                const summaryProps = database.properties
-                  .filter((p) => p.kind !== "title" && p.id !== selectProp.id)
+                const summaryProps = activeDb.properties
+                  .filter((p) => p.kind !== "title" && p.id !== boardGroupProp.id)
                   .slice(0, 3);
+                const colNumFmt =
+                  firstNumberProp &&
+                  typeof firstNumberProp.kind === "object" &&
+                  "number" in firstNumberProp.kind
+                    ? firstNumberProp.kind.number.format
+                    : "plain";
+                const colSum = firstNumberProp
+                  ? col.items.reduce((acc, er) => {
+                      const c = getEffectiveCell(er, firstNumberProp.id);
+                      const v =
+                        typeof c === "object" && "number_val" in c ? Number(c.number_val) : 0;
+                      return acc + (Number.isFinite(v) ? v : 0);
+                    }, 0)
+                  : null;
+                const isDragOver = dragOverColKey === col.id;
+
                 return (
                   <div
-                    key={col.id || "none"}
-                    className="rounded-2xl border border-stone-200 bg-stone-50/70 p-3 space-y-2.5"
+                    key={col.id}
+                    onDragOver={(e) => {
+                      e.preventDefault();
+                      if (dragOverColKey !== col.id) setDragOverColKey(col.id);
+                    }}
+                    onDragLeave={() => {
+                      if (dragOverColKey === col.id) setDragOverColKey(null);
+                    }}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      setDragOverColKey(null);
+                      const droppedId = e.dataTransfer.getData("text/plain") || draggingRowId;
+                      setDraggingRowId(null);
+                      if (!droppedId) return;
+                      const droppedRow = rows.find((r) => r.row.id === droppedId);
+                      if (droppedRow) moveRowToBoardCol(droppedRow, col.id);
+                    }}
+                    className={`rounded-2xl border p-3 space-y-2.5 transition ${
+                      isDragOver
+                        ? "border-indigo-400 bg-indigo-50/40 ring-2 ring-indigo-200"
+                        : "border-stone-200 bg-stone-50/70"
+                    }`}
                   >
                     <div className="flex items-center justify-between px-1 text-xs font-semibold text-stone-700">
                       <span
@@ -674,93 +1343,108 @@ export default function DatabaseView({
                       >
                         {col.label}
                       </span>
-                      <span className="rounded-full bg-stone-200 px-2 py-0.5 text-[10px] text-stone-700">
-                        {col.items.length}
-                      </span>
+                      <div className="flex items-center gap-1.5">
+                        {colSum !== null && col.items.length > 0 && (
+                          <span className="font-mono text-[10px] text-stone-500">
+                            {formatNumberCell(colSum.toFixed(2), colNumFmt)}
+                          </span>
+                        )}
+                        <span className="rounded-full bg-stone-200 px-2 py-0.5 text-[10px] text-stone-700">
+                          {col.items.length}
+                        </span>
+                      </div>
                     </div>
-                    <div className="space-y-2">
-                      {col.items.map((er) => (
-                        <div
-                          key={er.row.id}
-                          className="rounded-xl border border-stone-200 bg-white p-3.5 shadow-2xs space-y-2.5"
-                        >
-                          <Link
-                            href={`/p/${er.row.page_id}`}
-                            className="text-sm font-medium text-stone-900 hover:text-blue-700 hover:underline block"
+
+                    <div className="space-y-2 min-h-[48px]">
+                      {col.items.map((er) => {
+                        const rowChange = activeScenario
+                          ? scenarioData?.row_changes[er.row.id]
+                          : undefined;
+                        return (
+                          <div
+                            key={er.row.id}
+                            draggable={!busy}
+                            onDragStart={(e) => {
+                              setDraggingRowId(er.row.id);
+                              e.dataTransfer.setData("text/plain", er.row.id);
+                              e.dataTransfer.effectAllowed = "move";
+                            }}
+                            onDragEnd={() => {
+                              setDraggingRowId(null);
+                              setDragOverColKey(null);
+                            }}
+                            className={`rounded-xl border bg-white p-3.5 shadow-2xs space-y-2.5 cursor-grab active:cursor-grabbing ${
+                              draggingRowId === er.row.id ? "opacity-50" : "border-stone-200"
+                            }`}
                           >
-                            {getRowTitle(er, database.properties)}
-                          </Link>
-
-                          {summaryProps.length > 0 && (
-                            <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
-                              {summaryProps.map((sp) => {
-                                const c = getEffectiveCell(er, sp.id);
-                                if (!c || c === "empty") return null;
-                                if (typeof c === "object" && "select_val" in c) {
-                                  const opt = getSelectOptions(sp).find(
-                                    (o) => o.id === c.select_val.option_id
-                                  );
-                                  const cls = opt
-                                    ? SELECT_COLOR_CLASSES[opt.color]
-                                    : SELECT_COLOR_CLASSES.gray;
-                                  return (
-                                    <span
-                                      key={sp.id}
-                                      className={`rounded-full border px-2 py-0.5 text-[10px] font-medium ${cls}`}
-                                    >
-                                      {opt?.label ?? c.select_val.option_id}
-                                    </span>
-                                  );
-                                }
-                                if (typeof c === "object" && "bool_val" in c) {
-                                  return (
-                                    <span
-                                      key={sp.id}
-                                      className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                                        c.bool_val
-                                          ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
-                                          : "bg-stone-100 text-stone-500 border border-stone-200"
-                                      }`}
-                                    >
-                                      {c.bool_val ? `✓ ${sp.name}` : `○ ${sp.name}`}
-                                    </span>
-                                  );
-                                }
-                                return (
-                                  <span
-                                    key={sp.id}
-                                    className="rounded bg-stone-100 px-1.5 py-0.5 text-[10px] text-stone-600"
-                                  >
-                                    {sp.name}: {renderCellDisplay(c, sp)}
-                                  </span>
-                                );
-                              })}
-                            </div>
-                          )}
-
-                          <div className="flex flex-wrap gap-1 pt-0.5">
-                            {getSelectOptions(selectProp).map((opt) => (
-                              <button
-                                key={opt.id}
-                                type="button"
-                                disabled={busy || col.id === opt.id}
-                                onClick={() =>
-                                  void handleUpdateRowCell(er, selectProp.id, {
-                                    select_val: { option_id: opt.id },
-                                  })
-                                }
-                                className={`rounded px-2 py-0.5 text-[10px] border transition ${
-                                  col.id === opt.id
-                                    ? `${SELECT_COLOR_CLASSES[opt.color]} font-semibold`
-                                    : "border-stone-200 text-stone-500 hover:bg-stone-50"
-                                }`}
+                            <div className="flex items-start justify-between gap-2">
+                              <Link
+                                href={`/p/${er.row.page_id}`}
+                                className="text-sm font-medium text-stone-900 hover:text-blue-700 hover:underline block"
                               >
-                                {opt.label}
-                              </button>
-                            ))}
+                                {getRowTitle(er, activeDb.properties)}
+                              </Link>
+                              {rowChange && (
+                                <span
+                                  className={`rounded-full px-1.5 py-0.5 text-[9px] font-semibold uppercase ${
+                                    rowChange === "added"
+                                      ? "bg-emerald-100 text-emerald-800"
+                                      : "bg-amber-100 text-amber-800"
+                                  }`}
+                                >
+                                  {rowChange}
+                                </span>
+                              )}
+                            </div>
+
+                            {summaryProps.length > 0 && (
+                              <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                                {summaryProps.map((sp) => {
+                                  const c = getEffectiveCell(er, sp.id);
+                                  if (!c || c === "empty") return null;
+                                  return (
+                                    <span
+                                      key={sp.id}
+                                      className="rounded bg-stone-100 px-1.5 py-0.5 text-[10px] text-stone-600"
+                                    >
+                                      {sp.name}:{" "}
+                                      {renderCellDisplay(
+                                        c,
+                                        sp,
+                                        principals,
+                                        typeof sp.kind === "object" && "relation" in sp.kind
+                                          ? relationTargets[sp.kind.relation.target_db_id]
+                                          : undefined
+                                      )}
+                                    </span>
+                                  );
+                                })}
+                              </div>
+                            )}
+
+                            {/* Accessible click-to-move buttons */}
+                            <div className="flex flex-wrap gap-1 pt-0.5">
+                              {boardColumns
+                                .filter((targetCol) => targetCol.id !== "__none__")
+                                .map((targetCol) => (
+                                  <button
+                                    key={targetCol.id}
+                                    type="button"
+                                    disabled={busy || col.id === targetCol.id}
+                                    onClick={() => moveRowToBoardCol(er, targetCol.id)}
+                                    className={`rounded px-2 py-0.5 text-[10px] border transition ${
+                                      col.id === targetCol.id
+                                        ? `${SELECT_COLOR_CLASSES[targetCol.color]} font-semibold`
+                                        : "border-stone-200 text-stone-500 hover:bg-stone-50"
+                                    }`}
+                                  >
+                                    {targetCol.label}
+                                  </button>
+                                ))}
+                            </div>
                           </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   </div>
                 );
@@ -768,11 +1452,12 @@ export default function DatabaseView({
           </div>
         )}
 
+        {/* CALENDAR VIEW */}
         {mode === "calendar" && (
           <div className="space-y-3">
             {!dateProp && (
               <div className="rounded-xl border border-stone-200 bg-white p-6 text-sm text-stone-500">
-                Add a Date property to view items in Calendar mode.
+                Add a Date property in Columns to view items in Calendar mode.
               </div>
             )}
             {dateProp &&
@@ -784,13 +1469,27 @@ export default function DatabaseView({
                   <div className="text-xs font-mono font-semibold text-blue-700">{dateKey}</div>
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
                     {items.map((er) => (
-                      <Link
+                      <div
                         key={er.row.id}
-                        href={`/p/${er.row.page_id}`}
-                        className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs font-medium text-stone-900 hover:bg-stone-100"
+                        className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 flex items-center justify-between gap-2 text-xs"
                       >
-                        {getRowTitle(er, database.properties)}
-                      </Link>
+                        <Link
+                          href={`/p/${er.row.page_id}`}
+                          className="font-medium text-stone-900 hover:text-blue-700 hover:underline truncate"
+                        >
+                          {getRowTitle(er, activeDb.properties)}
+                        </Link>
+                        <InlineCellEditor
+                          er={er}
+                          prop={dateProp}
+                          database={activeDb}
+                          databases={databases}
+                          principals={principals}
+                          relationTargets={relationTargets}
+                          disabled={busy}
+                          onCommit={(val) => handleUpdateRowCell(er, dateProp.id, val)}
+                        />
+                      </div>
                     ))}
                   </div>
                 </div>
@@ -807,24 +1506,39 @@ export default function DatabaseView({
             required
             value={newTitle}
             onChange={(e) => setNewTitle(e.target.value)}
-            placeholder="New row title..."
+            placeholder={
+              activeScenario
+                ? `Add row to Scenario '${activeScenario.title}'...`
+                : "New row title..."
+            }
             className="flex-1 min-w-[180px] rounded-lg border border-stone-200 px-3 py-2 text-xs outline-none focus:border-stone-500"
           />
-          {selectProp && (
+          {firstSelectProp && (
             <select
-              value={newCellDrafts[selectProp.id] ?? ""}
+              value={newCellDrafts[firstSelectProp.id] ?? ""}
               onChange={(e) =>
-                setNewCellDrafts((prev) => ({ ...prev, [selectProp.id]: e.target.value }))
+                setNewCellDrafts((prev) => ({ ...prev, [firstSelectProp.id]: e.target.value }))
               }
               className="rounded-lg border border-stone-200 px-2.5 py-2 text-xs bg-white"
             >
-              <option value="">Status...</option>
-              {getSelectOptions(selectProp).map((o) => (
+              <option value="">{firstSelectProp.name}...</option>
+              {getSelectOptions(firstSelectProp).map((o) => (
                 <option key={o.id} value={o.id}>
                   {o.label}
                 </option>
               ))}
             </select>
+          )}
+          {firstNumberProp && (
+            <input
+              inputMode="decimal"
+              value={newCellDrafts[firstNumberProp.id] ?? ""}
+              onChange={(e) =>
+                setNewCellDrafts((prev) => ({ ...prev, [firstNumberProp.id]: e.target.value }))
+              }
+              placeholder={`${firstNumberProp.name}...`}
+              className="w-28 rounded-lg border border-stone-200 px-2.5 py-2 font-mono text-xs outline-none focus:border-stone-500"
+            />
           )}
           {dateProp && (
             <input
@@ -842,10 +1556,90 @@ export default function DatabaseView({
             className="inline-flex items-center gap-1 rounded-lg bg-stone-900 px-4 py-2 text-xs font-medium text-white hover:bg-stone-800 disabled:opacity-50"
           >
             <Plus className="h-3.5 w-3.5" />
-            Add Row
+            {activeScenario ? "Stage Row" : "Add Row"}
           </button>
         </form>
       </div>
+
+      {/* Schema Builder Drawer */}
+      <SchemaBuilderDrawer
+        open={schemaDrawerOpen}
+        onClose={() => setSchemaDrawerOpen(false)}
+        database={activeDb}
+        databases={databases}
+        isScenario={activeScenario !== null}
+        busy={busy}
+        onSaveSchema={handleSaveSchema}
+      />
+
+      {/* Fork Scenario Modal */}
+      {forkModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-950/35 p-4 backdrop-blur-[1px]">
+          <form
+            onSubmit={handleForkScenario}
+            className="w-full max-w-md rounded-2xl border border-stone-200 bg-white p-6 shadow-2xl space-y-4"
+          >
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <GitBranch className="h-4 w-4 text-indigo-600" />
+                <h2 className="text-base font-semibold text-stone-950">
+                  Fork What-If Scenario
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => setForkModalOpen(false)}
+                className="rounded p-1 text-stone-400 hover:text-stone-700"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <p className="text-xs text-stone-500">
+              Creates an isolated <code className="font-mono">Modb.World</code> branch so you can
+              model cell/schema changes and inspect live exact-Decimal deltas before merging.
+            </p>
+            <div className="space-y-3 text-xs">
+              <div>
+                <label className="block font-medium text-stone-700 mb-1">Scenario Title</label>
+                <input
+                  required
+                  autoFocus
+                  value={forkTitle}
+                  onChange={(e) => setForkTitle(e.target.value)}
+                  placeholder="e.g. Q4 Budget +15% Infrastructure"
+                  className="w-full rounded-lg border border-stone-200 px-3 py-2 outline-none focus:border-indigo-500"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-stone-700 mb-1">Reason / Hypothesis</label>
+                <textarea
+                  rows={2}
+                  value={forkReason}
+                  onChange={(e) => setForkReason(e.target.value)}
+                  placeholder="Why are you branching this database?"
+                  className="w-full rounded-lg border border-stone-200 px-3 py-2 outline-none focus:border-indigo-500"
+                />
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setForkModalOpen(false)}
+                className="rounded-lg border border-stone-200 px-3 py-1.5 text-xs font-medium text-stone-700 hover:bg-stone-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={busy || !forkTitle.trim()}
+                className="rounded-lg bg-indigo-600 px-4 py-1.5 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
+              >
+                {busy ? "Forking..." : "Create Scenario Branch"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </WorkspaceLayout>
   );
 }

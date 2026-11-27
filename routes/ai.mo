@@ -672,6 +672,8 @@ fn draft_blocks(
     world_id: world_id,
     collection_id: page.collection_id,
     target_page_id: page.id,
+    target_database_id: None,
+    branch_kind: "proposal",
     title: "AI Draft: #{page.title}",
     reason: "AI inline draft: #{inst}",
     author_id: auth.principal.id,

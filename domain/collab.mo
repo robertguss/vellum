@@ -4,12 +4,16 @@
 module Domain.Collab
 expose ProposalMeta(..),
 WorldPatchArgs(..),
+WorldMutation(..),
+WorldBranchArgs(..),
+DecimalDelta(..),
 WebhookSub(..),
 WebhookJobPayload(..),
 claim_resource_for_page,
 claim_resource_for_block,
 claim_resource_for_row,
 webhook_matches_event?
+use Domain.DatabaseModel{CellValue, PropertyDef}
 use Domain.Types{BlockOp, Provenance}
 use Json
 
@@ -19,6 +23,8 @@ struct ProposalMeta
   world_id: Text
   collection_id: Text
   target_page_id: Text
+  target_database_id: Option(Text)
+  branch_kind: Text
   title: Text
   reason: Text
   author_id: Text
@@ -40,6 +46,61 @@ struct WorldPatchArgs
   provenance: Provenance
   expected_versions: Map(Text, Int)
   updated_at: Time
+end
+
+## Unified multi-resource speculative mutation recorded inside `Modb.World` branches.
+enum WorldMutation
+  PatchPageBlocks(
+    page_id: Text,
+    ops: List(BlockOp),
+    new_ids: List(Text),
+    provenance: Provenance,
+    expected_versions: Map(Text, Int)
+  )
+  CreateDbRow(
+    database_id: Text,
+    row_id: Text,
+    page_id: Text,
+    cells: Map(Text, CellValue),
+    markdown: Option(Text),
+    block_prefix: Text,
+    provenance: Provenance
+  )
+  UpdateDbRow(
+    database_id: Text,
+    row_id: Text,
+    cells: Map(Text, CellValue),
+    expected_version: Option(Int),
+    provenance: Provenance
+  )
+  DeleteDbRow(database_id: Text, row_id: Text)
+  UpdateDbSchema(
+    database_id: Text,
+    title: Option(Text),
+    description: Option(Text),
+    properties: Option(List(PropertyDef)),
+    expected_version: Option(Int)
+  )
+end
+
+## JSON-serializable envelope wrapping a `WorldMutation` inside `Modb.World` `CallStep`s.
+struct WorldBranchArgs
+  mutation: WorldMutation
+  updated_at: Time
+end
+
+## Exact-Decimal summary comparing a numeric or rollup column between Live and Scenario state.
+struct DecimalDelta
+  database_id: Text
+  database_title: Text
+  prop_id: Text
+  prop_name: Text
+  format: Text
+  is_rollup: Bool
+  live_total: Text
+  scenario_total: Text
+  delta: Text
+  changed: Bool
 end
 
 ## Outbound webhook subscription record stored in `vlm_webhooks`.

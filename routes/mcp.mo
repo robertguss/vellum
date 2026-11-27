@@ -609,6 +609,8 @@ fn handle_tool_call(
       world_id: world_id,
       collection_id: pg.collection_id,
       target_page_id: pg.id,
+      target_database_id: None,
+      branch_kind: "proposal",
       title: title,
       reason: reason,
       author_id: auth.principal.id,
