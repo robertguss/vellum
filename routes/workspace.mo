@@ -7,6 +7,11 @@ VerifyPageInput(..),
 CreateCommentInput(..),
 PresignAttachmentInput(..),
 MintAgentTokenInput(..),
+CreateBlueprintInput(..),
+UpdateBlueprintInput(..),
+SetPageMetaInput(..),
+SyncPageMarkdownInput(..),
+ResolveMetricsInput(..),
 home,
 show_collection,
 create_collection,
@@ -25,6 +30,13 @@ revoke_grant,
 audit_index,
 proposals_page,
 admin_page,
+list_blueprints,
+create_blueprint,
+update_blueprint,
+set_page_blueprint_meta,
+sync_page_markdown,
+resolve_metrics,
+show_block_context,
 drain_jobs
 use Api
 use Arvo.Flash
@@ -37,8 +49,9 @@ use Arvo.Webhooks
 use Crypto
 use Db
 use Domain.Blocks
+use Domain.Blueprints{BlueprintDef, PageBlueprintMeta}
 use Domain.Collab{WebhookJobPayload}
-use Domain.DatabaseModel{DatabaseDef}
+use Domain.DatabaseModel{CellValue, DatabaseDef, EnrichedRow, PropertyDef, PropertyKind, RollupAgg}
 use Domain.Policy
 use Domain.Types{
   AppError,
@@ -47,6 +60,7 @@ use Domain.Types{
   AuthContext,
   AuthorKind,
   Block,
+  BlockKind,
   BlockOp,
   Collection,
   CollectionWritePolicy,
@@ -62,6 +76,7 @@ use Modb{Store, WriteTx}
 use Modb.Grants
 use Modb.Ledger
 use Modb.Table
+use Modb.World
 use Routes.Ai
 use Routes.Auth
 
@@ -124,6 +139,746 @@ struct MintAgentTokenInput
   allowed_collections: Option(List(Text))
   max_calls: Int
   ttl_days: Int
+end
+
+## JSON payload for `POST /api/blueprints`.
+struct CreateBlueprintInput
+  slug: Text
+  name: Text
+  description: Option(Text)
+  icon: Option(Text)
+  fields: List(PropertyDef)
+  default_template_markdown: Option(Text)
+end
+
+## JSON payload for `PUT /api/blueprints/:id`.
+struct UpdateBlueprintInput
+  slug: Option(Text)
+  name: Option(Text)
+  description: Option(Text)
+  icon: Option(Text)
+  fields: Option(List(PropertyDef))
+  default_template_markdown: Option(Text)
+  expected_version: Option(Int)
+end
+
+## JSON payload for `PUT /api/pages/:id/meta`.
+struct SetPageMetaInput
+  blueprint_id: Option(Text)
+  values: Option(Map(Text, CellValue))
+  apply_template_if_empty: Option(Bool)
+  reason: Option(Text)
+end
+
+## JSON payload for `PUT /api/pages/:id/markdown`.
+struct SyncPageMarkdownInput
+  markdown: Text
+  expected_page_version: Int
+  reason: Option(Text)
+end
+
+## JSON payload for `POST /api/metrics/resolve`.
+struct ResolveMetricsInput
+  tokens: List(Text)
+  scenario_id: Option(Text)
+end
+
+struct CachedDbMetricsData
+  def: DatabaseDef
+  rows: List(EnrichedRow)
+end
+
+fn zero_pad4_int(n: Int) : Text
+  s = n.to_text
+  if s.byte_count >= 4: s else: "#{"0".repeat(4 - s.byte_count)}#{s}"
+end
+
+fn prop_is_relation_target(kind: PropertyKind) : Option(Text)
+  case kind
+    Relation(target_db_id: tdb_id, inverse_prop_id: _): Some(tdb_id)
+    Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
+      options: _
+    ) | Checkbox | Person | Url | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): None
+  end
+end
+
+fn validate_blueprint_relations_tx(tx: WriteTx, auth: AuthContext, bp: BlueprintDef) : Result(
+  Unit,
+  AppError
+)
+  for f in bp.fields
+    case prop_is_relation_target(f.kind)
+      Some(tdb_id):
+        tdb = case try Table.tx_get(tx, Db.databases_table(), tdb_id).map_error(Db.map_table_error)
+          Some(d): d
+          None: return Error(
+            BadInput(reason: "relation field '#{f.id}' references missing database '#{tdb_id}'")
+          )
+        end
+        try Policy.require_collection_access(auth, "read", tdb.collection_id)
+      None: Unit
+    end
+  end
+  Ok(Unit)
+end
+
+fn validate_meta_relations_tx(
+  tx: WriteTx,
+  auth: AuthContext,
+  bp: BlueprintDef,
+  values: Map(Text, CellValue)
+) : Result(Unit, AppError)
+  for f in bp.fields
+    case prop_is_relation_target(f.kind)
+      Some(tdb_id):
+        case values.get(f.id)
+          Some(RelationVal(row_ids: rids)) if not rids.empty?:
+            tdb = case try Table.tx_get(tx, Db.databases_table(), tdb_id).map_error(
+              Db.map_table_error
+            )
+              Some(d): d
+              None: return Error(
+                BadInput(reason: "relation field '#{f.id}' references missing database '#{tdb_id}'")
+              )
+            end
+            try Policy.require_collection_access(auth, "read", tdb.collection_id)
+            for rid in rids
+              case try Table.tx_get(tx, Db.db_rows_table(), rid).map_error(Db.map_table_error)
+                Some(tr) if tr.database_id == tdb_id and tr.archived_at == None: Unit
+                Some(_) | None: return Error(
+                  BadInput(
+                    reason: "relation field '#{f.id}' references missing row '#{rid}' in '#{tdb_id}'"
+                  )
+                )
+              end
+            end
+          Some(_) | None: Unit
+        end
+      None: Unit
+    end
+  end
+  Ok(Unit)
+end
+
+fn strip_optional_frontmatter(raw: Text) : Text
+  lines = raw.lines
+  return raw if lines.size < 3
+  first = (lines.first or "").trim
+  return raw if first != "---"
+  var i = 1
+  var valid_keys = false
+  while i < lines.size
+    line = lines.get(i) or ""
+    t = line.trim
+    if t == "---"
+      if valid_keys
+        return lines.drop(i + 1).join("\n")
+      else
+        return raw
+      end
+    end
+    if not t.empty? and not t.starts_with?("#")
+      if line.starts_with?(" ") or line.starts_with?("\t") or t.contains?(":")
+        valid_keys = true
+      else
+        return raw
+      end
+    end
+    i += 1
+  end
+  raw
+end
+
+fn reconcile_markdown_blocks(
+  page_id: Text,
+  existing_blocks: List(Block),
+  raw_markdown: Text,
+  prov: Provenance,
+  id_prefix: Text
+) : List(Block)
+  body = strip_optional_frontmatter(raw_markdown)
+  parsed = Blocks.parse_markdown_blocks(page_id, body, prov, "tmp_#{id_prefix}")
+  return [] if parsed.empty?
+
+  sorted_old = Blocks.sort_blocks(existing_blocks)
+  var old_by_id = {}
+  var old_idx_by_id = {}
+  var oi = 0
+  for ob in sorted_old
+    old_by_id = old_by_id.set(ob.id, ob)
+    old_idx_by_id = old_idx_by_id.set(ob.id, oi)
+    oi += 1
+  end
+
+  # Deduplicate anchor IDs and mint fresh IDs for any block not already owned by `page_id`.
+  var seen_ids = {}
+  var new_seq = 0
+  var staged = []
+  var in_order? = true
+  var last_old_idx = -1
+  var last_old_rank = None
+
+  for p in parsed
+    matched_opt = if seen_ids.get(p.id) == None
+      case old_by_id.get(p.id)
+        Some(ob):
+          seen_ids = seen_ids.set(ob.id, true)
+          idx = old_idx_by_id.get(ob.id) or 0
+          rank_ok = case last_old_rank
+            Some(pr): ob.rank > pr
+            None: true
+          end
+          if idx <= last_old_idx or not rank_ok
+            in_order? = false
+          else
+            last_old_idx = idx
+            last_old_rank = Some(ob.rank)
+          end
+          Some(ob)
+        None: None
+      end
+    else
+      None
+    end
+
+    case matched_opt
+      Some(ob): staged = staged.append((Some(ob), p.kind, p.markdown))
+      None:
+        new_seq += 1
+        fresh_id = "blk_#{id_prefix}_#{zero_pad4_int(new_seq)}"
+        nb = Block(
+          id: fresh_id,
+          page_id: page_id,
+          parent_block_id: None,
+          rank: p.rank,
+          kind: p.kind,
+          markdown: p.markdown,
+          provenance: prov,
+          version: 1
+        )
+        staged = staged.append((None, nb.kind, nb.markdown))
+    end
+  end
+
+  if in_order?
+    # Assign preserved ranks directly and interpolate ranks for newly inserted spans via rank_between.
+    var out = []
+    var prev_rank = None
+    var fresh_idx = 0
+    var i = 0
+    n = staged.size
+    while i < n
+      entry = staged.get(i) or (None, Paragraph, "")
+      case entry.0
+        Some(ob):
+          updated = if ob.kind == entry.1 and ob.markdown == entry.2
+            ob
+          else
+            Block(
+              id: ob.id,
+              page_id: page_id,
+              parent_block_id: ob.parent_block_id,
+              rank: ob.rank,
+              kind: entry.1,
+              markdown: entry.2,
+              provenance: prov,
+              version: ob.version + 1
+            )
+          end
+          prev_rank = Some(ob.rank)
+          out = out.append(updated)
+          i += 1
+        None:
+          # Find the next preserved block rank after this run of new blocks.
+          var j = i + 1
+          var next_rank = None
+          while j < n
+            nxt = staged.get(j) or (None, Paragraph, "")
+            case nxt.0
+              Some(ob2):
+                next_rank = Some(ob2.rank)
+                break
+              None: j += 1
+            end
+          end
+          var k = i
+          var cur_left = prev_rank
+          while k < j
+            new_e = staged.get(k) or (None, Paragraph, "")
+            fresh_idx += 1
+            fid = "blk_#{id_prefix}_#{zero_pad4_int(fresh_idx)}"
+            r = Blocks.rank_between(cur_left, next_rank)
+            cur_left = Some(r)
+            out = out.append(
+              Block(
+                id: fid,
+                page_id: page_id,
+                parent_block_id: None,
+                rank: r,
+                kind: new_e.1,
+                markdown: new_e.2,
+                provenance: prov,
+                version: 1
+              )
+            )
+            k += 1
+          end
+          prev_rank = cur_left
+          i = j
+      end
+    end
+    out
+  else
+    # Reordered case: assign clean monotonic ranks; preserve version/provenance only if unchanged at same rank.
+    var out = []
+    var fresh_idx = 0
+    var pos = 0
+    for entry in staged
+      pos += 1
+      new_rank = "i#{zero_pad4_int(pos)}"
+      case entry.0
+        Some(ob):
+          if ob.kind == entry.1 and ob.markdown == entry.2 and ob.rank == new_rank
+            out = out.append(ob)
+          else
+            out = out.append(
+              Block(
+                id: ob.id,
+                page_id: page_id,
+                parent_block_id: ob.parent_block_id,
+                rank: new_rank,
+                kind: entry.1,
+                markdown: entry.2,
+                provenance: prov,
+                version: ob.version + 1
+              )
+            )
+          end
+        None:
+          fresh_idx += 1
+          fid = "blk_#{id_prefix}_#{zero_pad4_int(fresh_idx)}"
+          out = out.append(
+            Block(
+              id: fid,
+              page_id: page_id,
+              parent_block_id: None,
+              rank: new_rank,
+              kind: entry.1,
+              markdown: entry.2,
+              provenance: prov,
+              version: 1
+            )
+          )
+      end
+    end
+    out
+  end
+end
+
+fn load_live_db_cached(
+  store: Store,
+  auth: AuthContext,
+  cache: Map(Text, Option(CachedDbMetricsData)),
+  db_id: Text
+) : Result((Map(Text, Option(CachedDbMetricsData)), Option(CachedDbMetricsData)), AppError)
+  case cache.get(db_id)
+    Some(hit): return Ok((cache, hit))
+    None: Unit
+  end
+  res = case try Table.get(store, Db.databases_table(), db_id).map_error(Db.map_table_error)
+    None: None
+    Some(def):
+      if not Policy.collection_permitted?(auth, def.collection_id)
+        None
+      else
+        pairs = try Table.lookup(store, Db.db_rows_table(), Db.db_rows_by_database(), def.id)
+          .map_error(Db.map_table_error)
+        var active = []
+        for (_rid, r) in pairs
+          if r.archived_at == None
+            active = active.append(r)
+          end
+        end
+        enr = try Db.enrich_rows_with_rollups(store, def, active)
+        Some(CachedDbMetricsData(def: def, rows: enr))
+      end
+  end
+  Ok((cache.set(db_id, res), res))
+end
+
+fn load_scen_db_cached(
+  spec_tx: WriteTx,
+  auth: AuthContext,
+  cache: Map(Text, Option(CachedDbMetricsData)),
+  db_id: Text
+) : Result((Map(Text, Option(CachedDbMetricsData)), Option(CachedDbMetricsData)), AppError)
+  case cache.get(db_id)
+    Some(hit): return Ok((cache, hit))
+    None: Unit
+  end
+  res = case try Table.tx_get(spec_tx, Db.databases_table(), db_id).map_error(Db.map_table_error)
+    None: None
+    Some(def):
+      if not Policy.collection_permitted?(auth, def.collection_id)
+        None
+      else
+        pairs = try Table.tx_lookup(
+          spec_tx,
+          Db.db_rows_table(),
+          Db.db_rows_by_database(),
+          def.id
+        ).map_error(Db.map_table_error)
+        var active = []
+        for (_rid, r) in pairs
+          if r.archived_at == None
+            active = active.append(r)
+          end
+        end
+        enr = try Db.tx_enrich_rows_with_rollups(spec_tx, def, active)
+        Some(CachedDbMetricsData(def: def, rows: enr))
+      end
+  end
+  Ok((cache.set(db_id, res), res))
+end
+
+fn eval_metric_agg(agg: Text, cells: List(CellValue)) : Result((Option(Text), Option(Decimal)), Text)
+  low = agg.trim.ascii_lowercase
+  case low
+    "sum" | "count" | "count_values" | "min" | "max":
+      op = case low
+        "sum": SumValues
+        "count": CountAll
+        "count_values": CountValues
+        "min": MinValue
+        _: MaxValue
+      end
+      case DatabaseModel.compute_rollup(op, cells)
+        NumberVal(d): Ok((Some(d.to_text), Some(d)))
+        DateVal(start: dt, end_date: _): Ok((Some(dt.to_iso), None))
+        Empty | TextVal(_) | SelectVal(option_id: _) | MultiSelectVal(option_ids: _) | BoolVal(_) | PrincipalVal(
+          _
+        ) | UrlVal(_) | RelationVal(row_ids: _): Ok((None, None))
+      end
+    "avg":
+      var sum_d = 0.0
+      var count_n = 0
+      for c in cells
+        case c
+          NumberVal(d):
+            sum_d += d
+            count_n += 1
+          Empty | TextVal(_) | DateVal(start: _, end_date: _) | SelectVal(option_id: _) | MultiSelectVal(
+            option_ids: _
+          ) | BoolVal(_) | PrincipalVal(_) | UrlVal(_) | RelationVal(row_ids: _): Unit
+        end
+      end
+      if count_n == 0
+        Ok((None, None))
+      else
+        avg_d = (sum_d / count_n.to_decimal).round(4)
+        Ok((Some(avg_d.to_text), Some(avg_d)))
+      end
+    _: Error("unsupported metric aggregation '#{agg}'")
+  end
+end
+
+fn metric_format_of_prop(kind: PropertyKind) : Text
+  case kind
+    Number(format: f): f
+    Title | RichText | DateProp(include_time: _) | Select(options: _) | MultiSelect(options: _) | Checkbox | Person | Url | Relation(
+      target_db_id: _,
+      inverse_prop_id: _
+    ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): "plain"
+  end
+end
+
+fn find_prop_in_def(def: DatabaseDef, prop_id: Text) : Option(PropertyDef)
+  for p in def.properties
+    if p.id == prop_id
+      return Some(p)
+    end
+  end
+  None
+end
+
+fn forbidden_metric_json(
+  tok: Text,
+  db_id: Text,
+  prop_id: Text,
+  agg: Text,
+  status_str: Text
+) : Json
+  Json.Object({
+    "token": Json.String(tok),
+    "database_id": Json.String(db_id),
+    "property_id": Json.String(prop_id),
+    "agg": Json.String(agg),
+    "status": Json.String(status_str),
+    "value": Json.Null,
+    "live_value": Json.Null,
+    "scenario_value": Json.Null,
+    "delta": Json.Null,
+    "format": Json.String("plain"),
+    "database_title": Json.Null,
+    "property_name": Json.Null,
+    "row_count": Json.int(0)
+  })
+end
+
+fn resolve_metrics_in_store(
+  store: Store,
+  auth: AuthContext,
+  tokens: List(Text),
+  scenario_id: Option(Text)
+) : Result(Json, AppError)
+  if auth.principal.suspended
+    return Error(Forbidden(reason: "principal '#{auth.principal.handle}' is suspended"))
+  end
+  metric_ok = Policy.action_permitted?(auth, "query_db") or Policy.action_permitted?(auth, "read")
+  if not metric_ok
+    return Error(Forbidden(reason: "grant '#{auth.grant_id}' requires 'read' or 'query_db'"))
+  end
+
+  spec_tx_opt = case scenario_id
+    Some(sid_raw) if not sid_raw.trim.empty?:
+      sid = sid_raw.trim
+      pm = case try Table.get(store, Db.proposals_table(), sid).map_error(Db.map_table_error)
+        Some(p): p
+        None: return Error(Missing(entity: "proposal", id: sid))
+      end
+      try Policy.require_collection_access(auth, "read", pm.collection_id)
+      if pm.status != "open"
+        return Error(Conflict(reason: "scenario '#{sid}' is '#{pm.status}', not 'open'"))
+      end
+      world = case try World.get_world(store, pm.world_id).map_error(Db.map_world_error)
+        Some(w): w
+        None: return Error(Missing(entity: "world", id: pm.world_id))
+      end
+      (_base_tx, spec_tx) = try Db.materialize_world_tx(store, world)
+      Some(spec_tx)
+    Some(_) | None: None
+  end
+
+  var live_cache = {}
+  var scen_cache = {}
+  var out_map = {}
+  var seen_tokens = {}
+
+  for raw_tok in tokens
+    continue if seen_tokens.get(raw_tok) != None
+    seen_tokens = seen_tokens.set(raw_tok, true)
+    parsed_refs = Blocks.extract_metric_refs(raw_tok)
+    valid_ref_opt = case parsed_refs.first
+      Some(mr) if parsed_refs.size == 1 and mr.raw_token == raw_tok.trim: Some(mr)
+      Some(_) | None: None
+    end
+    m = case valid_ref_opt
+      Some(x): x
+      None:
+        out_map = out_map.set(raw_tok, forbidden_metric_json(raw_tok, "", "", "", "invalid_token"))
+        continue
+    end
+
+    (next_lc, live_opt) = try load_live_db_cached(store, auth, live_cache, m.database_id)
+    live_cache = next_lc
+    live_data = case live_opt
+      Some(ld): ld
+      None:
+        out_map = out_map.set(
+          raw_tok,
+          forbidden_metric_json(raw_tok, m.database_id, m.property_id, m.agg, "forbidden")
+        )
+        continue
+    end
+
+    prop = case find_prop_in_def(live_data.def, m.property_id)
+      Some(p): p
+      None:
+        out_map = out_map.set(
+          raw_tok,
+          Json.Object({
+            "token": Json.String(raw_tok),
+            "database_id": Json.String(m.database_id),
+            "property_id": Json.String(m.property_id),
+            "agg": Json.String(m.agg),
+            "status": Json.String("missing_property"),
+            "value": Json.Null,
+            "live_value": Json.Null,
+            "scenario_value": Json.Null,
+            "delta": Json.Null,
+            "format": Json.String("plain"),
+            "database_title": Json.String(live_data.def.title),
+            "property_name": Json.Null,
+            "row_count": Json.int(live_data.rows.size)
+          })
+        )
+        continue
+    end
+
+    fmt = metric_format_of_prop(prop.kind)
+    live_cells = live_data.rows.map(fn(er) DatabaseModel.effective_cell(er, prop.id) end)
+    (live_str_opt, live_dec_opt) = case eval_metric_agg(m.agg, live_cells)
+      Ok(pair): pair
+      Error(_msg):
+        out_map = out_map.set(
+          raw_tok,
+          Json.Object({
+            "token": Json.String(raw_tok),
+            "database_id": Json.String(m.database_id),
+            "property_id": Json.String(m.property_id),
+            "agg": Json.String(m.agg),
+            "status": Json.String("invalid_agg"),
+            "value": Json.Null,
+            "live_value": Json.Null,
+            "scenario_value": Json.Null,
+            "delta": Json.Null,
+            "format": Json.String(fmt),
+            "database_title": Json.String(live_data.def.title),
+            "property_name": Json.String(prop.name),
+            "row_count": Json.int(live_data.rows.size)
+          })
+        )
+        continue
+    end
+
+    live_json = case live_str_opt
+      Some(s): Json.String(s)
+      None: Json.Null
+    end
+
+    (val_json, scen_json, delta_json, row_cnt) = case spec_tx_opt
+      None: (live_json, Json.Null, Json.Null, live_data.rows.size)
+      Some(spec_tx):
+        (next_sc, scen_opt) = try load_scen_db_cached(spec_tx, auth, scen_cache, m.database_id)
+        scen_cache = next_sc
+        case scen_opt
+          None: (live_json, Json.Null, Json.Null, live_data.rows.size)
+          Some(sdata):
+            scen_cells = sdata.rows.map(fn(er) DatabaseModel.effective_cell(er, prop.id) end)
+            case eval_metric_agg(m.agg, scen_cells)
+              Ok((s_str_opt, s_dec_opt)):
+                sj = case s_str_opt
+                  Some(s): Json.String(s)
+                  None: Json.Null
+                end
+                dj = case (live_dec_opt, s_dec_opt)
+                  (Some(ld), Some(sd)): Json.String((sd - ld).to_text)
+                  _: Json.Null
+                end
+                (sj, sj, dj, sdata.rows.size)
+              Error(_): (live_json, Json.Null, Json.Null, sdata.rows.size)
+            end
+        end
+    end
+
+    out_map = out_map.set(
+      raw_tok,
+      Json.Object({
+        "token": Json.String(raw_tok),
+        "database_id": Json.String(m.database_id),
+        "property_id": Json.String(m.property_id),
+        "agg": Json.String(m.agg),
+        "status": Json.String("ok"),
+        "value": val_json,
+        "live_value": live_json,
+        "scenario_value": scen_json,
+        "delta": delta_json,
+        "format": Json.String(fmt),
+        "database_title": Json.String(live_data.def.title),
+        "property_name": Json.String(prop.name),
+        "row_count": Json.int(row_cnt)
+      })
+    )
+  end
+
+  Ok(Json.Object(out_map))
+end
+
+fn load_active_principals_json(store: Store) : Result(Json, AppError)
+  pr_rows = try Table.scan(store, Db.principals_table(), None, None, 200).map_error(
+    Db.map_table_error
+  )
+  var list_out = []
+  for (_pid, pr) in pr_rows
+    if not pr.suspended
+      list_out = list_out.append(
+        Json.Object({
+          "id": Json.String(pr.id),
+          "handle": Json.String(pr.handle),
+          "display_name": Json.String(pr.display_name),
+          "kind": pr.kind.to_json,
+          "role": pr.role.to_json
+        })
+      )
+    end
+  end
+  Ok(Json.Array(list_out))
+end
+
+fn load_blueprint_relation_targets(
+  store: Store,
+  auth: AuthContext,
+  blueprints: List(BlueprintDef),
+  dbs: List(DatabaseDef)
+) : Result(Json, AppError)
+  var db_by_id = {}
+  for d in dbs
+    db_by_id = db_by_id.set(d.id, d)
+  end
+  var rel_map = {}
+  var seen_targets = {}
+  for bp in blueprints
+    for f in bp.fields
+      case prop_is_relation_target(f.kind)
+        Some(tdb_id):
+          if seen_targets.get(tdb_id) == None
+            seen_targets = seen_targets.set(tdb_id, true)
+            case db_by_id.get(tdb_id)
+              Some(tdb) if Policy.collection_permitted?(auth, tdb.collection_id):
+                r_pairs = try Table.lookup(
+                  store,
+                  Db.db_rows_table(),
+                  Db.db_rows_by_database(),
+                  tdb.id
+                ).map_error(Db.map_table_error)
+                var opts = []
+                for (_rid, tr) in r_pairs
+                  if tr.archived_at == None
+                    opts = opts.append(
+                      Json.Object({
+                        "row_id": Json.String(tr.id),
+                        "page_id": Json.String(tr.page_id),
+                        "title": Json.String(DatabaseModel.extract_row_title(tdb, tr.cells))
+                      })
+                    )
+                  end
+                end
+                rel_map = rel_map.set(tdb_id, Json.Array(opts))
+              Some(_) | None: Unit
+            end
+          end
+        None: Unit
+      end
+    end
+  end
+  Ok(Json.Object(rel_map))
+end
+
+fn filter_audit_for_page(entries: List(Ledger.AuditEntry), page_id: Text, max_items: Int) : List(
+  AuditFeedItem
+)
+  var matched = []
+  for e in entries
+    if e.summary.contains?(page_id) or e.reason.contains?(page_id)
+      matched = matched.append(audit_entry_to_feed(e))
+    end
+  end
+  n = matched.size
+  if n <= max_items
+    matched
+  else
+    matched.drop(n - max_items)
+  end
 end
 
 fn json_ok(status: Int, body: Json) : Api.Response
@@ -514,12 +1269,65 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
         .map_error(Db.map_table_error)
       c_list = try permitted_collections(store, a)
       d_list = try permitted_databases(store, a)
-      Ok((c_list, d_list, col, page, blks, cmt_rows.map(fn(x) x.1 end), att_rows.map(fn(x) x.1 end)))
+
+      bp_rows = try Table.scan(store, Db.blueprints_table(), None, None, 200).map_error(
+        Db.map_table_error
+      )
+      bps = bp_rows.map(fn(x) x.1 end)
+      page_meta_opt = try Table.get(store, Db.page_meta_table(), page.id).map_error(
+        Db.map_table_error
+      )
+      page_bp_opt = case page_meta_opt
+        Some(pm): try Table.get(store, Db.blueprints_table(), pm.blueprint_id).map_error(
+          Db.map_table_error
+        )
+        None: None
+      end
+
+      prop_rows = try Table.lookup(store, Db.proposals_table(), Db.proposals_by_page(), page.id)
+        .map_error(Db.map_table_error)
+      var page_props = []
+      for (_pid, pr) in prop_rows
+        if Policy.collection_permitted?(a, pr.collection_id)
+          page_props = page_props.append(pr)
+        end
+      end
+
+      all_prop_rows = try Table.scan(store, Db.proposals_table(), None, None, 200).map_error(
+        Db.map_table_error
+      )
+      var scenarios = []
+      for (_spid, spr) in all_prop_rows
+        if spr.status == "open" and spr.branch_kind == "scenario" and Policy.collection_permitted?(
+          a,
+          spr.collection_id
+        )
+          scenarios = scenarios.append(spr)
+        end
+      end
+
+      principals_json = try load_active_principals_json(store)
+      rel_targets_json = try load_blueprint_relation_targets(store, a, bps, d_list)
+      metric_tokens = Blocks.blocks_metric_refs(blks).map(fn(m) m.raw_token end)
+      metrics_json = try resolve_metrics_in_store(store, a, metric_tokens, None)
+      audit_entries = try Ledger.audit_tail_store(store, 200).map_error(Db.map_ledger_error)
+      page_audit = filter_audit_for_page(audit_entries, page.id, 25)
+
+      Ok((
+        (c_list, d_list, col, page, blks, cmt_rows.map(fn(x) x.1 end), att_rows.map(fn(x) x.1 end)),
+        (bps, page_bp_opt, page_meta_opt, page_props, scenarios, page_audit),
+        (principals_json, rel_targets_json, metrics_json)
+      ))
     end
   )
 
-  (cols, dbs, col, page, blocks, comments, attachments) = page_bundle
+  (
+    (cols, dbs, col, page, blocks, comments, attachments),
+    (blueprints, page_bp_opt, page_meta_opt, page_proposals, open_scenarios, page_audit),
+    (principals_json, rel_targets_json, resolved_metrics_json)
+  ) = page_bundle
   anchored_md = Blocks.to_anchored_markdown(blocks)
+  yaml_fm = Blueprints.to_yaml_frontmatter(page, page_bp_opt, page_meta_opt, anchored_md)
   if Auth.wants_json?(req)
     return Ok(
       json_ok(
@@ -529,8 +1337,18 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
           "collection": col.to_json,
           "blocks": blocks.to_json,
           "anchored_markdown": Json.String(anchored_md),
+          "yaml_frontmatter": Json.String(yaml_fm),
           "comments": comments.to_json,
-          "attachments": attachments.to_json
+          "attachments": attachments.to_json,
+          "blueprints": blueprints.to_json,
+          "page_blueprint": page_bp_opt.to_json,
+          "page_meta": page_meta_opt.to_json,
+          "page_proposals": page_proposals.to_json,
+          "principals": principals_json,
+          "relation_targets": rel_targets_json,
+          "resolved_metrics": resolved_metrics_json,
+          "open_scenarios": open_scenarios.to_json,
+          "page_audit": page_audit.to_json
         })
       )
     )
@@ -549,8 +1367,18 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
       "page": page.to_json,
       "blocks": blocks.to_json,
       "anchored_markdown": Json.String(anchored_md),
+      "yaml_frontmatter": Json.String(yaml_fm),
       "comments": comments.to_json,
-      "attachments": attachments.to_json
+      "attachments": attachments.to_json,
+      "blueprints": blueprints.to_json,
+      "page_blueprint": page_bp_opt.to_json,
+      "page_meta": page_meta_opt.to_json,
+      "page_proposals": page_proposals.to_json,
+      "principals": principals_json,
+      "relation_targets": rel_targets_json,
+      "resolved_metrics": resolved_metrics_json,
+      "open_scenarios": open_scenarios.to_json,
+      "page_audit": page_audit.to_json
     }
   )
 end
@@ -1772,7 +2600,21 @@ fn drain_jobs(_payload: Json, files: Files, clock: Clock, env: Env, net: Network
                         Some(pg) if pg.archived_at == None:
                           blks = try Db.load_page_blocks(store, pg.id)
                           extra = case pg.kind
-                            Document: None
+                            Document:
+                              case try Table.get(store, Db.page_meta_table(), pg.id).map_error(
+                                Db.map_table_error
+                              )
+                                Some(pm):
+                                  case try Table.get(
+                                    store,
+                                    Db.blueprints_table(),
+                                    pm.blueprint_id
+                                  ).map_error(Db.map_table_error)
+                                    Some(bp): Some(Blueprints.page_meta_plain_text(bp, pm))
+                                    None: None
+                                  end
+                                None: None
+                              end
                             DatabaseRow(database_id: db_id, row_id: row_id):
                               case try Table.get(store, Db.databases_table(), db_id).map_error(
                                 Db.map_table_error
@@ -1886,4 +2728,575 @@ fn drain_jobs(_payload: Json, files: Files, clock: Clock, env: Env, net: Network
     end
   end
   Ok(Unit)
+end
+
+## `GET /api/blueprints` — Lists all Statamic-style Blueprint definitions (`ReadFiles`-only).
+fn list_blueprints(_req: Api.Request, auth: AuthContext, rf: ReadFiles) : Result(
+  Api.Response,
+  AppError
+)
+  if auth.principal.suspended or not Policy.action_permitted?(auth, "read")
+    return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'read'"))
+  end
+  if not rf.exists?(Db.ledger_db_path)
+    return Ok(json_ok(200, Json.Object({"blueprints": Json.Array([])})))
+  end
+  bps = try Ledger.read_locked(
+    rf,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      rows = try Table.scan(Ledger.store(db), Db.blueprints_table(), None, None, 200).map_error(
+        Db.map_table_error
+      )
+      Ok(rows.map(fn(x) x.1 end))
+    end
+  )
+  Ok(json_ok(200, Json.Object({"blueprints": bps.to_json})))
+end
+
+## `POST /api/blueprints` — Creates a new Statamic-style `BlueprintDef` (`manage_schema`).
+fn create_blueprint(
+  req: Api.Request,
+  auth: AuthContext,
+  input: CreateBlueprintInput,
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  if auth.principal.suspended or not Policy.action_permitted?(auth, "manage_schema")
+    return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'manage_schema'"))
+  end
+
+  now = clock.now
+  bp = BlueprintDef(
+    id: "bp_#{Id.ulid(rng, clock)}",
+    slug: input.slug.trim.ascii_lowercase,
+    name: input.name.trim,
+    description: (input.description or "").trim,
+    icon: input.icon,
+    fields: input.fields,
+    default_template_markdown: input.default_template_markdown or "",
+    version: 1
+  )
+  case Blueprints.validate_blueprint_def(bp)
+    Some(msg): return Error(BadInput(reason: msg))
+    None: Unit
+  end
+
+  meta = Ledger.WriteMeta(
+    principal: auth.principal.handle,
+    action: "blueprint.create",
+    reason: "create blueprint '#{bp.slug}'",
+    at: now
+  )
+  audit_payload = Json.Object({"blueprint_id": Json.String(bp.id), "slug": Json.String(bp.slug)})
+  created = try Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    meta,
+    "created blueprint #{bp.id} (#{bp.slug})",
+    audit_payload,
+    Db.map_ledger_error,
+    fn(tx)
+      t1 = try tx_authorize_if_agent(tx, auth, "manage_schema", now)
+      try validate_blueprint_relations_tx(t1, auth, bp)
+      t2 = try Table.put(t1, Db.blueprints_table(), bp.id, bp).map_error(Db.map_table_error)
+      Ok((t2, bp))
+    end
+  )
+  Ok(json_ok(201, created.to_json))
+end
+
+## `PUT /api/blueprints/:id` — Updates an existing `BlueprintDef` (`manage_schema`).
+fn update_blueprint(
+  req: Api.Request,
+  id: Text,
+  auth: AuthContext,
+  input: UpdateBlueprintInput,
+  files: Files,
+  clock: Clock
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  if auth.principal.suspended or not Policy.action_permitted?(auth, "manage_schema")
+    return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'manage_schema'"))
+  end
+
+  now = clock.now
+  meta = Ledger.WriteMeta(
+    principal: auth.principal.handle,
+    action: "blueprint.update",
+    reason: "update blueprint '#{id}'",
+    at: now
+  )
+  audit_payload = Json.Object({"blueprint_id": Json.String(id)})
+
+  updated = try Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    meta,
+    "updated blueprint #{id}",
+    audit_payload,
+    Db.map_ledger_error,
+    fn(tx)
+      t1 = try tx_authorize_if_agent(tx, auth, "manage_schema", now)
+      old_bp = case try Table.tx_get(t1, Db.blueprints_table(), id).map_error(Db.map_table_error)
+        Some(b): b
+        None: return Error(Missing(entity: "blueprint", id: id))
+      end
+      case input.expected_version
+        Some(ev) if ev != old_bp.version: return Error(
+          Conflict(reason: "expected blueprint version #{ev}, found #{old_bp.version}")
+        )
+        Some(_) | None: Unit
+      end
+
+      next_bp = BlueprintDef(
+        id: old_bp.id,
+        slug: (input.slug or old_bp.slug).trim.ascii_lowercase,
+        name: (input.name or old_bp.name).trim,
+        description: (input.description or old_bp.description).trim,
+        icon: case input.icon
+          Some(ic): Some(ic)
+          None: old_bp.icon
+        end,
+        fields: input.fields or old_bp.fields,
+        default_template_markdown: input.default_template_markdown or
+          old_bp.default_template_markdown,
+        version: old_bp.version + 1
+      )
+      case Blueprints.validate_blueprint_def(next_bp)
+        Some(msg): return Error(BadInput(reason: msg))
+        None: Unit
+      end
+      try validate_blueprint_relations_tx(t1, auth, next_bp)
+
+      existing_metas = try Table.tx_lookup(
+        t1,
+        Db.page_meta_table(),
+        Db.page_meta_by_blueprint(),
+        next_bp.id
+      ).map_error(Db.map_table_error)
+      for (_pid, pm) in existing_metas
+        case Blueprints.validate_page_meta(next_bp, pm.values)
+          Some(msg): return Error(
+            BadInput(reason: "existing page '#{pm.page_id}' invalid under updated blueprint: #{msg}")
+          )
+          None: Unit
+        end
+      end
+
+      t2 = try Table.put(t1, Db.blueprints_table(), next_bp.id, next_bp).map_error(
+        Db.map_table_error
+      )
+      Ok((t2, next_bp))
+    end
+  )
+  Ok(json_ok(200, updated.to_json))
+end
+
+## `PUT /api/pages/:id/meta` — Attaches, updates, or detaches a `BlueprintDef` + typed metadata on a page.
+fn set_page_blueprint_meta(
+  req: Api.Request,
+  id: Text,
+  auth: AuthContext,
+  input: SetPageMetaInput,
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  now = clock.now
+  bp_prefix = Id.ulid(rng, clock)
+  reason_opt = case input.reason
+    Some(r) if not r.trim.empty?: Some(r.trim)
+    Some(_) | None: Some("update page blueprint metadata")
+  end
+  prov = make_provenance(auth, reason_opt, now)
+  idx_job = Jobs.prepare(rng, clock, "vellum.page.indexed", Json.Object({"page_id": Json.String(id)}))
+  meta = Ledger.WriteMeta(
+    principal: auth.principal.handle,
+    action: "page.meta_update",
+    reason: reason_opt or "update blueprint metadata on '#{id}'",
+    at: now
+  )
+  audit_payload = Json.Object({
+    "page_id": Json.String(id),
+    "blueprint_id": input.blueprint_id.to_json
+  })
+
+  (next_page, next_blocks, next_bp_opt, next_meta_opt) = try Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    meta,
+    "updated blueprint metadata on #{id}",
+    audit_payload,
+    Db.map_ledger_error,
+    fn(tx)
+      t1 = try tx_authorize_if_agent(tx, auth, "write_direct", now)
+      old_page = case try Table.tx_get(t1, Db.pages_table(), id).map_error(Db.map_table_error)
+        Some(p) if p.archived_at == None: p
+        Some(_) | None: return Error(Missing(entity: "page", id: id))
+      end
+      if old_page.kind != Document
+        return Error(BadInput(reason: "blueprints are only supported on Document pages"))
+      end
+      try Policy.require_collection_access(auth, "write_direct", old_page.collection_id)
+      col = case try Table.tx_get(t1, Db.collections_table(), old_page.collection_id).map_error(
+        Db.map_table_error
+      )
+        Some(c): c
+        None: return Error(Missing(entity: "collection", id: old_page.collection_id))
+      end
+      if not Policy.can_write_page_direct?(auth, col)
+        return Error(
+          Forbidden(
+            reason: "collection '#{col.slug}' write policy requires change proposals for this principal"
+          )
+        )
+      end
+
+      existing_rows = try Table.tx_lookup(t1, Db.blocks_table(), Db.blocks_by_page(), id).map_error(
+        Db.map_table_error
+      )
+      existing_blocks = Blocks.sort_blocks(existing_rows.map(fn(x) x.1 end))
+
+      (t2, out_blocks, bp_opt, pm_opt) = case input.blueprint_id
+        None:
+          cleaned = case try Table.tx_get(t1, Db.page_meta_table(), id).map_error(
+            Db.map_table_error
+          )
+            Some(_): try Table.delete(t1, Db.page_meta_table(), id).map_error(Db.map_table_error)
+            None: t1
+          end
+          (cleaned, existing_blocks, None, None)
+        Some(raw_bid):
+          bid = raw_bid.trim
+          bp = case try Table.tx_get(t1, Db.blueprints_table(), bid).map_error(Db.map_table_error)
+            Some(b): b
+            None: return Error(Missing(entity: "blueprint", id: bid))
+          end
+          vals = input.values or {}
+          case Blueprints.validate_page_meta(bp, vals)
+            Some(msg): return Error(BadInput(reason: msg))
+            None: Unit
+          end
+          try validate_meta_relations_tx(t1, auth, bp, vals)
+          pm = PageBlueprintMeta(page_id: id, blueprint_id: bp.id, values: vals, updated_at: now)
+          t_pm = try Table.put(t1, Db.page_meta_table(), id, pm).map_error(Db.map_table_error)
+          apply_tpl? = input.apply_template_if_empty or false
+          tpl_blocks = if apply_tpl? and existing_blocks.empty? and not bp.default_template_markdown
+            .trim
+            .empty?
+            reconcile_markdown_blocks(id, [], bp.default_template_markdown, prov, bp_prefix)
+          else
+            existing_blocks
+          end
+          (t_pm, tpl_blocks, Some(bp), Some(pm))
+      end
+
+      bumped_page = Page(
+        id: old_page.id,
+        collection_id: old_page.collection_id,
+        parent_page_id: old_page.parent_page_id,
+        title: old_page.title,
+        icon: old_page.icon,
+        cover_attachment_id: old_page.cover_attachment_id,
+        kind: old_page.kind,
+        sort_order: old_page.sort_order,
+        database_id: old_page.database_id,
+        freshness_ttl_days: old_page.freshness_ttl_days,
+        verified_at: old_page.verified_at,
+        verified_by: old_page.verified_by,
+        created_by: old_page.created_by,
+        created_at: old_page.created_at,
+        updated_at: now,
+        archived_at: old_page.archived_at,
+        version: old_page.version + 1
+      )
+      t3 = try Db.tx_save_page_and_blocks(t2, bumped_page, out_blocks)
+      (t4, _jid) = try Jobs.tx_put(t3, idx_job).map_error(Db.map_table_error)
+      Ok((t4, (bumped_page, out_blocks, bp_opt, pm_opt)))
+    end
+  )
+
+  anchored_md = Blocks.to_anchored_markdown(next_blocks)
+  yaml_fm = Blueprints.to_yaml_frontmatter(next_page, next_bp_opt, next_meta_opt, anchored_md)
+  meta_ev = Json.Object({
+    "page_id": Json.String(next_page.id),
+    "collection_id": Json.String(next_page.collection_id),
+    "version": Json.int(next_page.version),
+    "actor": Json.String(auth.principal.handle)
+  })
+  Ok(
+    json_ok(
+      200,
+      Json.Object({
+        "page": next_page.to_json,
+        "blocks": next_blocks.to_json,
+        "page_blueprint": next_bp_opt.to_json,
+        "page_meta": next_meta_opt.to_json,
+        "anchored_markdown": Json.String(anchored_md),
+        "yaml_frontmatter": Json.String(yaml_fm)
+      })
+    ).with_sse_publish_json("page:#{next_page.id}", "page.meta_updated", meta_ev)
+      .with_sse_publish_json("collection:#{next_page.collection_id}", "page.meta_updated", meta_ev)
+  )
+end
+
+## `PUT /api/pages/:id/markdown` — Reconciles anchored Markdown back into canonical blocks while preserving unchanged IDs/provenance.
+fn sync_page_markdown(
+  req: Api.Request,
+  id: Text,
+  auth: AuthContext,
+  input: SyncPageMarkdownInput,
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  now = clock.now
+  id_prefix = Id.ulid(rng, clock)
+  reason_opt = case input.reason
+    Some(r) if not r.trim.empty?: Some(r.trim)
+    Some(_) | None: Some("markdown sync on #{id}")
+  end
+  prov = make_provenance(auth, reason_opt, now)
+  idx_job = Jobs.prepare(rng, clock, "vellum.page.indexed", Json.Object({"page_id": Json.String(id)}))
+  meta = Ledger.WriteMeta(
+    principal: auth.principal.handle,
+    action: "page.sync_markdown",
+    reason: reason_opt or "sync markdown on '#{id}'",
+    at: now
+  )
+  audit_payload = Json.Object({
+    "page_id": Json.String(id),
+    "expected_page_version": Json.int(input.expected_page_version)
+  })
+
+  (next_page, next_blocks, page_bp_opt, page_meta_opt) = try Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    meta,
+    "synced markdown on #{id}",
+    audit_payload,
+    Db.map_ledger_error,
+    fn(tx)
+      t1 = try tx_authorize_if_agent(tx, auth, "write_direct", now)
+      old_page = case try Table.tx_get(t1, Db.pages_table(), id).map_error(Db.map_table_error)
+        Some(p) if p.archived_at == None: p
+        Some(_) | None: return Error(Missing(entity: "page", id: id))
+      end
+      try Policy.require_collection_access(auth, "write_direct", old_page.collection_id)
+      col = case try Table.tx_get(t1, Db.collections_table(), old_page.collection_id).map_error(
+        Db.map_table_error
+      )
+        Some(c): c
+        None: return Error(Missing(entity: "collection", id: old_page.collection_id))
+      end
+      if not Policy.can_write_page_direct?(auth, col)
+        return Error(
+          Forbidden(
+            reason: "collection '#{col.slug}' write policy requires change proposals for this principal"
+          )
+        )
+      end
+      if old_page.version != input.expected_page_version
+        return Error(
+          Conflict(
+            reason: "expected page version #{input.expected_page_version}, found #{old_page.version}"
+          )
+        )
+      end
+
+      existing_rows = try Table.tx_lookup(t1, Db.blocks_table(), Db.blocks_by_page(), id).map_error(
+        Db.map_table_error
+      )
+      existing_blocks = Blocks.sort_blocks(existing_rows.map(fn(x) x.1 end))
+      reconciled = reconcile_markdown_blocks(id, existing_blocks, input.markdown, prov, id_prefix)
+
+      bumped_page = Page(
+        id: old_page.id,
+        collection_id: old_page.collection_id,
+        parent_page_id: old_page.parent_page_id,
+        title: old_page.title,
+        icon: old_page.icon,
+        cover_attachment_id: old_page.cover_attachment_id,
+        kind: old_page.kind,
+        sort_order: old_page.sort_order,
+        database_id: old_page.database_id,
+        freshness_ttl_days: old_page.freshness_ttl_days,
+        verified_at: old_page.verified_at,
+        verified_by: old_page.verified_by,
+        created_by: old_page.created_by,
+        created_at: old_page.created_at,
+        updated_at: now,
+        archived_at: old_page.archived_at,
+        version: old_page.version + 1
+      )
+      t2 = try Db.tx_save_page_and_blocks(t1, bumped_page, reconciled)
+      (t3, _jid) = try Jobs.tx_put(t2, idx_job).map_error(Db.map_table_error)
+      pm_opt = try Table.tx_get(t3, Db.page_meta_table(), id).map_error(Db.map_table_error)
+      bp_opt = case pm_opt
+        Some(pm): try Table.tx_get(t3, Db.blueprints_table(), pm.blueprint_id).map_error(
+          Db.map_table_error
+        )
+        None: None
+      end
+      Ok((t3, (bumped_page, reconciled, bp_opt, pm_opt)))
+    end
+  )
+
+  anchored_md = Blocks.to_anchored_markdown(next_blocks)
+  yaml_fm = Blueprints.to_yaml_frontmatter(next_page, page_bp_opt, page_meta_opt, anchored_md)
+  blocks_ev = Json.Object({
+    "page_id": Json.String(next_page.id),
+    "collection_id": Json.String(next_page.collection_id),
+    "version": Json.int(next_page.version),
+    "actor": Json.String(auth.principal.handle),
+    "reason": Json.String(reason_opt or "sync markdown")
+  })
+  Ok(
+    json_ok(
+      200,
+      Json.Object({
+        "page": next_page.to_json,
+        "blocks": next_blocks.to_json,
+        "anchored_markdown": Json.String(anchored_md),
+        "yaml_frontmatter": Json.String(yaml_fm)
+      })
+    ).with_sse_publish_json("page:#{next_page.id}", "page.blocks_updated", blocks_ev)
+      .with_sse_publish_json("collection:#{next_page.collection_id}", "page.blocks_updated", blocks_ev)
+  )
+end
+
+## `POST /api/metrics/resolve` — Evaluates `{{metric:<db>.<prop>:<agg>}}` tokens (fail-closed per DB ACL, with optional What-If Scenario diff).
+fn resolve_metrics(
+  req: Api.Request,
+  auth: AuthContext,
+  input: ResolveMetricsInput,
+  rf: ReadFiles
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  if auth.principal.suspended
+    return Error(Forbidden(reason: "principal '#{auth.principal.handle}' is suspended"))
+  end
+  metric_ok = Policy.action_permitted?(auth, "query_db") or Policy.action_permitted?(auth, "read")
+  if not metric_ok
+    return Error(Forbidden(reason: "grant '#{auth.grant_id}' requires 'read' or 'query_db'"))
+  end
+  if not rf.exists?(Db.ledger_db_path)
+    return Ok(
+      json_ok(
+        200,
+        Json.Object({"metrics": Json.Object({}), "scenario_id": input.scenario_id.to_json})
+      )
+    )
+  end
+  metrics_json = try Ledger.read_locked(
+    rf,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db) resolve_metrics_in_store(Ledger.store(db), auth, input.tokens, input.scenario_id) end
+  )
+  Ok(
+    json_ok(
+      200,
+      Json.Object({"metrics": metrics_json, "scenario_id": input.scenario_id.to_json})
+    )
+  )
+end
+
+## `GET /api/blocks/:block_id` — Returns a block with parent page context, neighbors, blueprint metadata, and block comments (`ReadFiles`-only, collection-gated).
+fn show_block_context(_req: Api.Request, block_id: Text, auth: AuthContext, rf: ReadFiles) : Result(
+  Api.Response,
+  AppError
+)
+  if auth.principal.suspended or not Policy.action_permitted?(auth, "read")
+    return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'read'"))
+  end
+  if not rf.exists?(Db.ledger_db_path)
+    return Error(Missing(entity: "block", id: block_id))
+  end
+
+  payload = try Ledger.read_locked(
+    rf,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      blk = case try Table.get(store, Db.blocks_table(), block_id).map_error(Db.map_table_error)
+        Some(b): b
+        None: return Error(Missing(entity: "block", id: block_id))
+      end
+      page = case try Table.get(store, Db.pages_table(), blk.page_id).map_error(Db.map_table_error)
+        Some(p) if p.archived_at == None: p
+        Some(_) | None: return Error(Missing(entity: "block", id: block_id))
+      end
+      try Policy.require_collection_access(auth, "read", page.collection_id)
+      col = case try Table.get(store, Db.collections_table(), page.collection_id).map_error(
+        Db.map_table_error
+      )
+        Some(c): c
+        None: return Error(Missing(entity: "collection", id: page.collection_id))
+      end
+      blks = try Db.load_page_blocks(store, page.id)
+      var prev_blk = None
+      var next_blk = None
+      var found_idx = -1
+      var i = 0
+      while i < blks.size
+        case blks.get(i)
+          Some(sb) if sb.id == blk.id:
+            found_idx = i
+            break
+          Some(_) | None: i += 1
+        end
+      end
+      if found_idx > 0
+        prev_blk = blks.get(found_idx - 1)
+      end
+      if found_idx >= 0 and found_idx + 1 < blks.size
+        next_blk = blks.get(found_idx + 1)
+      end
+
+      pm_opt = try Table.get(store, Db.page_meta_table(), page.id).map_error(Db.map_table_error)
+      bp_opt = case pm_opt
+        Some(pm): try Table.get(store, Db.blueprints_table(), pm.blueprint_id).map_error(
+          Db.map_table_error
+        )
+        None: None
+      end
+      cmt_rows = try Table.lookup(store, Db.comments_table(), Db.comments_by_page(), page.id)
+        .map_error(Db.map_table_error)
+      var blk_cmts = []
+      for (_cid, c) in cmt_rows
+        if c.block_id == Some(blk.id)
+          blk_cmts = blk_cmts.append(c)
+        end
+      end
+
+      Ok(
+        Json.Object({
+          "block": blk.to_json,
+          "page": page.to_json,
+          "collection": col.to_json,
+          "prev_block": prev_blk.to_json,
+          "next_block": next_blk.to_json,
+          "page_blueprint": bp_opt.to_json,
+          "page_meta": pm_opt.to_json,
+          "comments": blk_cmts.to_json
+        })
+      )
+    end
+  )
+  Ok(json_ok(200, payload))
 end

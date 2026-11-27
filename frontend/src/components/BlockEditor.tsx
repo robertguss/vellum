@@ -6,12 +6,19 @@ import TaskList from "@tiptap/extension-task-list";
 import StarterKit from "@tiptap/starter-kit";
 import {
   AlertTriangle,
+  Bold,
   Bot,
+  Calculator,
   Check,
+  Code,
+  Database as DbIcon,
   FileText,
   GitPullRequest,
+  GripVertical,
   Info,
+  Italic,
   Lightbulb,
+  Lock,
   Plus,
   Save,
   ShieldAlert,
@@ -21,13 +28,34 @@ import {
 } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
 import { ApiError, apiFetch } from "../lib/api";
-import type { Block, BlockKind, BlockOp, Page, ProposalMeta } from "../lib/types";
+import type {
+  Block,
+  BlockKind,
+  BlockOp,
+  DatabaseDef,
+  DbViewDef,
+  Page,
+  PrincipalSummary,
+  ProposalMeta,
+  RelationTargetOption,
+  ResolvedMetric,
+} from "../lib/types";
+import { formatNumberCell, formatSignedDecimal } from "./database/InlineCellEditor";
+import EmbeddedDatabase from "./EmbeddedDatabase";
 
 interface BlockEditorProps {
   page: Page;
   blocks: Block[];
+  databases?: DatabaseDef[];
+  principals?: PrincipalSummary[];
+  relationTargets?: Record<string, RelationTargetOption[]>;
+  resolvedMetrics?: Record<string, ResolvedMetric>;
+  activeScenarioId?: string | null;
   onBlocksUpdated: (nextBlocks: Block[], anchoredMarkdown: string) => void;
   onProposalCreated?: (proposal: ProposalMeta) => void;
+  onInspectBlock?: (blockId: string) => void;
+  onInspectRow?: (databaseId: string, rowId: string, pageId: string) => void;
+  onMetricInvalidated?: () => void;
 }
 
 function escapeHtml(raw: string): string {
@@ -49,6 +77,7 @@ function blockKindOptionValue(kind: BlockKind): string {
   if (typeof kind === "object" && "callout" in kind) return "callout";
   if (typeof kind === "object" && "code_block" in kind) return "code_block";
   if (typeof kind === "object" && "task_item" in kind) return "task_item";
+  if (typeof kind === "object" && "database_view_embed" in kind) return "database_view_embed";
   return "paragraph";
 }
 
@@ -81,8 +110,78 @@ function isSafeLinkHref(href: string): boolean {
   return /^https?:\/\//i.test(href) || (href.startsWith("/") && !href.startsWith("//"));
 }
 
-function renderInlineMarkdown(text: string): ReactNode[] {
-  const tokenRe = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*|\[[^\]\n]+\]\([^)\s]+\))/g;
+function renderMetricPill(
+  rawTok: string,
+  metric: ResolvedMetric | undefined,
+  key: number
+): ReactNode {
+  if (!metric) {
+    return (
+      <span
+        key={key}
+        className="inline-flex items-center gap-1 rounded-md border border-dashed border-stone-300 bg-stone-50 px-1.5 py-0.5 font-mono text-[11px] text-stone-600 align-baseline"
+      >
+        <Calculator className="h-3 w-3 text-stone-400" />
+        {rawTok}
+      </span>
+    );
+  }
+  if (metric.status === "forbidden") {
+    return (
+      <span
+        key={key}
+        title="You do not have access to the source collection for this metric"
+        className="inline-flex items-center gap-1 rounded-md border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-800 align-baseline"
+      >
+        <Lock className="h-3 w-3" />
+        Restricted metric
+      </span>
+    );
+  }
+  if (metric.status !== "ok" || metric.value === null) {
+    return (
+      <span
+        key={key}
+        title={`${metric.status}: ${rawTok}`}
+        className="inline-flex items-center gap-1 rounded-md border border-stone-200 bg-stone-100 px-2 py-0.5 font-mono text-[11px] text-stone-600 align-baseline"
+      >
+        {rawTok} ({metric.status})
+      </span>
+    );
+  }
+
+  const formattedVal = formatNumberCell(metric.value, metric.format) || metric.value;
+  const hasDelta = metric.delta !== null && metric.delta !== "0";
+  const tip = `${metric.database_title ?? metric.database_id} · ${
+    metric.property_name ?? metric.property_id
+  } (${metric.agg}, ${metric.row_count} rows)`;
+
+  return (
+    <Link
+      key={key}
+      href={`/d/${metric.database_id}`}
+      onClick={(e) => e.stopPropagation()}
+      title={tip}
+      className="inline-flex items-center gap-1.5 rounded-md border border-emerald-200 bg-emerald-50/90 px-2 py-0.5 font-mono text-[0.88em] font-semibold text-emerald-950 hover:bg-emerald-100 transition align-baseline"
+    >
+      <Calculator className="h-3 w-3 text-emerald-700" />
+      <span className="tabular-nums">{formattedVal}</span>
+      {hasDelta && metric.delta && (
+        <span className="rounded bg-indigo-600 px-1 py-0 text-[10px] font-semibold text-white tabular-nums">
+          {formatSignedDecimal(metric.delta, metric.format)}
+        </span>
+      )}
+    </Link>
+  );
+}
+
+function renderInlineMarkdown(
+  text: string,
+  resolvedMetrics: Record<string, ResolvedMetric> = {},
+  onInspectBlock?: (blockId: string) => void
+): ReactNode[] {
+  const tokenRe =
+    /(\{\{metric:[^}\n]+\}\}|\[?blk_[A-Za-z0-9_]+\]?|`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*|\[[^\]\n]+\]\([^)\s]+\))/g;
   const out: ReactNode[] = [];
   let lastIdx = 0;
   let match: RegExpExecArray | null;
@@ -92,7 +191,24 @@ function renderInlineMarkdown(text: string): ReactNode[] {
       out.push(text.slice(lastIdx, match.index));
     }
     const tok = match[0];
-    if (tok.startsWith("`") && tok.endsWith("`")) {
+    if (tok.startsWith("{{metric:") && tok.endsWith("}}")) {
+      out.push(renderMetricPill(tok, resolvedMetrics[tok], keyIdx++));
+    } else if (/^\[?blk_[A-Za-z0-9_]+\]?$/.test(tok)) {
+      const cleanId = tok.replace(/^\[|\]$/g, "");
+      out.push(
+        <button
+          key={keyIdx++}
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onInspectBlock?.(cleanId);
+          }}
+          className="inline-flex items-center gap-1 rounded border border-blue-200 bg-blue-50 px-1.5 py-0 font-mono text-[11px] font-medium text-blue-700 hover:bg-blue-100 align-baseline"
+        >
+          {cleanId}
+        </button>
+      );
+    } else if (tok.startsWith("`") && tok.endsWith("`")) {
       out.push(
         <code
           key={keyIdx++}
@@ -190,21 +306,29 @@ function CalloutBox({
   tone,
   title,
   body,
+  resolvedMetrics,
+  onInspectBlock,
 }: {
   tone: string;
   title?: string;
   body: string;
+  resolvedMetrics: Record<string, ResolvedMetric>;
+  onInspectBlock?: (blockId: string) => void;
 }) {
   const palette = getCalloutPalette(tone);
   const Icon = palette.Icon;
   return (
     <div className={`rounded-r-xl px-4 py-3 text-sm space-y-1 ${palette.container}`}>
-      <div className={`flex items-center gap-2 font-semibold text-xs uppercase tracking-wide ${palette.title}`}>
+      <div
+        className={`flex items-center gap-2 font-semibold text-xs uppercase tracking-wide ${palette.title}`}
+      >
         <Icon className="h-3.5 w-3.5 shrink-0" />
         <span>{title || tone || "Note"}</span>
       </div>
       {body && (
-        <div className="leading-relaxed whitespace-pre-wrap">{renderInlineMarkdown(body)}</div>
+        <div className="leading-relaxed whitespace-pre-wrap">
+          {renderInlineMarkdown(body, resolvedMetrics, onInspectBlock)}
+        </div>
       )}
     </div>
   );
@@ -213,13 +337,44 @@ function CalloutBox({
 function RenderedBlockBody({
   block,
   saving,
+  databases,
+  principals,
+  relationTargets,
+  resolvedMetrics,
+  activeScenarioId,
   onToggleTask,
+  onInspectBlock,
+  onInspectRow,
+  onMetricInvalidated,
 }: {
   block: Block;
   saving: boolean;
+  databases: DatabaseDef[];
+  principals: PrincipalSummary[];
+  relationTargets: Record<string, RelationTargetOption[]>;
+  resolvedMetrics: Record<string, ResolvedMetric>;
+  activeScenarioId: string | null;
   onToggleTask: (b: Block) => void;
+  onInspectBlock?: (blockId: string) => void;
+  onInspectRow?: (databaseId: string, rowId: string, pageId: string) => void;
+  onMetricInvalidated?: () => void;
 }) {
   const { kind, markdown } = block;
+
+  if (typeof kind === "object" && "database_view_embed" in kind) {
+    return (
+      <EmbeddedDatabase
+        databaseId={kind.database_view_embed.database_id}
+        viewId={kind.database_view_embed.view_id}
+        databases={databases}
+        principals={principals}
+        relationTargets={relationTargets}
+        activeScenarioId={activeScenarioId}
+        onInspectRow={onInspectRow}
+        onMetricInvalidated={onMetricInvalidated}
+      />
+    );
+  }
 
   if (typeof kind === "object" && "heading" in kind) {
     const lvl = Math.min(3, Math.max(1, kind.heading.level));
@@ -229,27 +384,35 @@ function RenderedBlockBody({
         : lvl === 2
           ? "text-lg font-semibold tracking-tight text-stone-950 pt-0.5"
           : "text-base font-semibold text-stone-900";
-    if (lvl === 1) return <h1 className={cls}>{renderInlineMarkdown(markdown)}</h1>;
-    if (lvl === 2) return <h2 className={cls}>{renderInlineMarkdown(markdown)}</h2>;
-    return <h3 className={cls}>{renderInlineMarkdown(markdown)}</h3>;
+    if (lvl === 1) {
+      return <h1 className={cls}>{renderInlineMarkdown(markdown, resolvedMetrics, onInspectBlock)}</h1>;
+    }
+    if (lvl === 2) {
+      return <h2 className={cls}>{renderInlineMarkdown(markdown, resolvedMetrics, onInspectBlock)}</h2>;
+    }
+    return <h3 className={cls}>{renderInlineMarkdown(markdown, resolvedMetrics, onInspectBlock)}</h3>;
   }
 
   if (kind === "bullet_list_item") {
     return (
-      <div className="flex items-start gap-2.5 text-sm leading-relaxed text-stone-800 py-0.5">
-        <span className="mt-2 h-1.5 w-1.5 rounded-full bg-stone-500 shrink-0" />
-        <div className="flex-1 whitespace-pre-wrap">{renderInlineMarkdown(markdown)}</div>
+      <div className="flex items-start gap-2.5 text-[15px] leading-relaxed text-stone-800 py-0.5">
+        <span className="mt-2.5 h-1.5 w-1.5 rounded-full bg-stone-500 shrink-0" />
+        <div className="flex-1 whitespace-pre-wrap">
+          {renderInlineMarkdown(markdown, resolvedMetrics, onInspectBlock)}
+        </div>
       </div>
     );
   }
 
   if (typeof kind === "object" && "ordered_list_item" in kind) {
     return (
-      <div className="flex items-start gap-2.5 text-sm leading-relaxed text-stone-800 py-0.5">
-        <span className="font-mono text-xs font-semibold text-stone-500 mt-0.5 shrink-0">
+      <div className="flex items-start gap-2.5 text-[15px] leading-relaxed text-stone-800 py-0.5">
+        <span className="font-mono text-xs font-semibold text-stone-500 mt-1 shrink-0">
           {kind.ordered_list_item.start}.
         </span>
-        <div className="flex-1 whitespace-pre-wrap">{renderInlineMarkdown(markdown)}</div>
+        <div className="flex-1 whitespace-pre-wrap">
+          {renderInlineMarkdown(markdown, resolvedMetrics, onInspectBlock)}
+        </div>
       </div>
     );
   }
@@ -257,7 +420,7 @@ function RenderedBlockBody({
   if (typeof kind === "object" && "task_item" in kind) {
     const checked = kind.task_item.checked;
     return (
-      <div className="flex items-start gap-2.5 text-sm py-0.5">
+      <div className="flex items-start gap-2.5 text-[15px] py-0.5">
         <button
           type="button"
           disabled={saving}
@@ -266,7 +429,7 @@ function RenderedBlockBody({
             e.stopPropagation();
             onToggleTask(block);
           }}
-          className={`mt-0.5 h-4 w-4 rounded border flex items-center justify-center shrink-0 transition ${
+          className={`mt-1 h-4 w-4 rounded border flex items-center justify-center shrink-0 transition ${
             checked
               ? "border-emerald-600 bg-emerald-600 text-white"
               : "border-stone-300 bg-white hover:border-stone-500"
@@ -279,7 +442,7 @@ function RenderedBlockBody({
             checked ? "line-through text-stone-400" : "text-stone-800"
           }`}
         >
-          {renderInlineMarkdown(markdown)}
+          {renderInlineMarkdown(markdown, resolvedMetrics, onInspectBlock)}
         </div>
       </div>
     );
@@ -294,6 +457,8 @@ function RenderedBlockBody({
         tone={kind.callout.tone}
         title={rest ? first : kind.callout.tone}
         body={rest || first}
+        resolvedMetrics={resolvedMetrics}
+        onInspectBlock={onInspectBlock}
       />
     );
   }
@@ -307,11 +472,19 @@ function RenderedBlockBody({
       const tone = alertMatch[1];
       const heading = alertMatch[2].trim();
       const body = lines.slice(1).join("\n").trim();
-      return <CalloutBox tone={tone} title={heading || tone} body={body} />;
+      return (
+        <CalloutBox
+          tone={tone}
+          title={heading || tone}
+          body={body}
+          resolvedMetrics={resolvedMetrics}
+          onInspectBlock={onInspectBlock}
+        />
+      );
     }
     return (
-      <blockquote className="border-l-3 border-stone-300 pl-3.5 py-0.5 text-sm italic leading-relaxed text-stone-600 whitespace-pre-wrap">
-        {renderInlineMarkdown(markdown)}
+      <blockquote className="border-l-3 border-stone-300 pl-3.5 py-0.5 text-[15px] italic leading-relaxed text-stone-600 whitespace-pre-wrap">
+        {renderInlineMarkdown(markdown, resolvedMetrics, onInspectBlock)}
       </blockquote>
     );
   }
@@ -348,9 +521,7 @@ function RenderedBlockBody({
 
   if (typeof kind === "object" && ("image" in kind || "file_embed" in kind)) {
     const label =
-      "image" in kind
-        ? kind.image.caption || kind.image.attachment_id
-        : kind.file_embed.filename;
+      "image" in kind ? kind.image.caption || kind.image.attachment_id : kind.file_embed.filename;
     return (
       <div className="inline-flex items-center gap-2 rounded-lg border border-stone-200 bg-stone-50 px-3 py-1.5 text-xs text-stone-700">
         <FileText className="h-3.5 w-3.5 text-stone-500" />
@@ -360,8 +531,8 @@ function RenderedBlockBody({
   }
 
   return (
-    <div className="text-sm leading-relaxed text-stone-800 whitespace-pre-wrap py-0.5">
-      {renderInlineMarkdown(markdown)}
+    <div className="text-[15px] leading-relaxed text-stone-800 whitespace-pre-wrap py-0.5">
+      {renderInlineMarkdown(markdown, resolvedMetrics, onInspectBlock)}
     </div>
   );
 }
@@ -384,24 +555,60 @@ function blockToHtml(kind: BlockKind, markdown: string): string {
 interface TipTapInlineEditorProps {
   block: Block;
   onChangeText: (text: string) => void;
+  onSlashTrigger: () => void;
 }
 
-function TipTapInlineEditor({ block, onChangeText }: TipTapInlineEditorProps) {
+function TipTapInlineEditor({ block, onChangeText, onSlashTrigger }: TipTapInlineEditorProps) {
   const editor = useEditor({
     extensions: [
       StarterKit,
       TaskList,
       TaskItem.configure({ nested: true }),
-      Placeholder.configure({ placeholder: "Type block content..." }),
+      Placeholder.configure({ placeholder: "Write freely or type '/' for Sets..." }),
     ],
     content: blockToHtml(block.kind, block.markdown),
     onUpdate: ({ editor: ed }) => {
-      onChangeText(ed.getText({ blockSeparator: "\n" }));
+      const txt = ed.getText({ blockSeparator: "\n" });
+      if (txt.trim() === "/") {
+        onSlashTrigger();
+      }
+      onChangeText(txt);
     },
   });
 
   return (
-    <div className="rounded-lg border border-blue-200 bg-white px-3 py-2 text-sm shadow-2xs focus-within:ring-2 focus-within:ring-blue-500/20">
+    <div className="rounded-lg border border-blue-200 bg-white px-3 py-2 text-[15px] shadow-2xs focus-within:ring-2 focus-within:ring-blue-500/20">
+      {editor && (
+        <div className="flex flex-wrap items-center gap-1 pb-1.5 mb-1.5 border-b border-stone-100">
+          <button
+            type="button"
+            onClick={() => editor.chain().focus().toggleBold().run()}
+            className="rounded p-1 text-stone-500 hover:bg-stone-100 hover:text-stone-900"
+            title="Bold"
+          >
+            <Bold className="h-3.5 w-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={() => editor.chain().focus().toggleItalic().run()}
+            className="rounded p-1 text-stone-500 hover:bg-stone-100 hover:text-stone-900"
+            title="Italic"
+          >
+            <Italic className="h-3.5 w-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={() => editor.chain().focus().toggleCode().run()}
+            className="rounded p-1 text-stone-500 hover:bg-stone-100 hover:text-stone-900"
+            title="Code"
+          >
+            <Code className="h-3.5 w-3.5" />
+          </button>
+          <span className="text-[11px] text-stone-400 ml-auto">
+            Type <code className="font-mono">/</code> for Sets &amp; Embeds
+          </span>
+        </div>
+      )}
       <EditorContent editor={editor} />
     </div>
   );
@@ -410,8 +617,16 @@ function TipTapInlineEditor({ block, onChangeText }: TipTapInlineEditorProps) {
 export default function BlockEditor({
   page,
   blocks,
+  databases = [],
+  principals = [],
+  relationTargets = {},
+  resolvedMetrics = {},
+  activeScenarioId = null,
   onBlocksUpdated,
   onProposalCreated,
+  onInspectBlock,
+  onInspectRow,
+  onMetricInvalidated,
 }: BlockEditorProps) {
   const [drafts, setDrafts] = useState<Record<string, { kind: BlockKind; markdown: string }>>({});
   const [activeBlockId, setActiveBlockId] = useState<string | null>(blocks[0]?.id ?? null);
@@ -422,7 +637,24 @@ export default function BlockEditor({
   const [error, setError] = useState<string | null>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
 
-  // Add new block inputs
+  // Drag & Drop state
+  const [draggedId, setDraggedId] = useState<string | null>(null);
+  const [dragOverId, setDragOverId] = useState<string | null>(null);
+
+  // Sets (Slash) Command Palette
+  const [showSetsMenu, setShowSetsMenu] = useState(false);
+  const [setsMode, setSetsMode] = useState<"main" | "db_embed" | "metric_pill">("main");
+  const [insertAfterId, setInsertAfterId] = useState<string | null>(null);
+
+  const [embedDbId, setEmbedDbId] = useState<string>(databases[0]?.id ?? "");
+  const [embedDbViews, setEmbedDbViews] = useState<DbViewDef[]>([]);
+  const [embedViewId, setEmbedViewId] = useState<string>("");
+
+  const [metricDbId, setMetricDbId] = useState<string>(databases[0]?.id ?? "");
+  const [metricPropId, setMetricPropId] = useState<string>("");
+  const [metricAgg, setMetricAgg] = useState<string>("sum");
+
+  // Quick Add new block bar
   const [newMarkdown, setNewMarkdown] = useState("");
   const [newKindVal, setNewKindVal] = useState("paragraph");
 
@@ -440,6 +672,39 @@ export default function BlockEditor({
   }, [blocks]);
 
   useEffect(() => {
+    if (!embedDbId && databases[0]) setEmbedDbId(databases[0].id);
+    if (!metricDbId && databases[0]) setMetricDbId(databases[0].id);
+  }, [databases, embedDbId, metricDbId]);
+
+  useEffect(() => {
+    if (setsMode !== "db_embed" || !embedDbId) return;
+    apiFetch<{ views: DbViewDef[] }>(`/api/databases/${embedDbId}`)
+      .then((res) => {
+        setEmbedDbViews(res.views ?? []);
+        setEmbedViewId(res.views?.[0]?.id ?? "");
+      })
+      .catch(() => {
+        setEmbedDbViews([]);
+        setEmbedViewId("");
+      });
+  }, [setsMode, embedDbId]);
+
+  useEffect(() => {
+    const db = databases.find((d) => d.id === metricDbId);
+    if (!db) return;
+    const numProps = db.properties.filter(
+      (p) =>
+        (typeof p.kind === "object" && ("number" in p.kind || "rollup" in p.kind)) ||
+        metricAgg === "count" ||
+        metricAgg === "count_values"
+    );
+    const first = numProps[0] ?? db.properties[0];
+    if (first && !db.properties.some((p) => p.id === metricPropId)) {
+      setMetricPropId(first.id);
+    }
+  }, [metricDbId, databases, metricPropId, metricAgg]);
+
+  useEffect(() => {
     if (typeof window === "undefined") return;
     const h = window.location.hash.replace(/^#/, "");
     if (h) {
@@ -449,14 +714,37 @@ export default function BlockEditor({
     }
   }, [blocks]);
 
-  async function handleSaveBlock(b: Block) {
-    const edited = drafts[b.id];
-    if (!edited) return;
+  async function patchOps(ops: BlockOp[], expectedVersions: Record<string, number>, msg: string, opReason: string) {
     setSaving(true);
     setError(null);
     setStatusMsg(null);
     try {
-      const ops: BlockOp[] = [
+      const res = await apiFetch<{ blocks: Block[]; anchored_markdown: string }>(
+        `/api/pages/${page.id}/blocks`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({
+            ops,
+            expected_versions: expectedVersions,
+            reason: opReason,
+          }),
+        }
+      );
+      onBlocksUpdated(res.blocks, res.anchored_markdown);
+      setStatusMsg(msg);
+      onMetricInvalidated?.();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to save block changes");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleSaveBlock(b: Block) {
+    const edited = drafts[b.id];
+    if (!edited) return;
+    await patchOps(
+      [
         {
           replace_block: {
             block_id: b.id,
@@ -465,35 +753,18 @@ export default function BlockEditor({
             markdown: edited.markdown,
           },
         },
-      ];
-      const res = await apiFetch<{ blocks: Block[]; anchored_markdown: string }>(
-        `/api/pages/${page.id}/blocks`,
-        {
-          method: "PATCH",
-          body: JSON.stringify({
-            ops,
-            expected_versions: { [b.id]: b.version },
-            reason: reason.trim() || "editor update",
-          }),
-        }
-      );
-      onBlocksUpdated(res.blocks, res.anchored_markdown);
-      setStatusMsg(`Saved block ${b.id}`);
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save block");
-    } finally {
-      setSaving(false);
-    }
+      ],
+      { [b.id]: b.version },
+      `Saved block ${b.id}`,
+      reason.trim() || "editor update"
+    );
   }
 
   async function handleToggleTaskCheckbox(b: Block) {
     if (typeof b.kind !== "object" || !("task_item" in b.kind)) return;
-    setSaving(true);
-    setError(null);
-    setStatusMsg(null);
-    try {
-      const nextChecked = !b.kind.task_item.checked;
-      const ops: BlockOp[] = [
+    const nextChecked = !b.kind.task_item.checked;
+    await patchOps(
+      [
         {
           replace_block: {
             block_id: b.id,
@@ -502,36 +773,19 @@ export default function BlockEditor({
             markdown: b.markdown,
           },
         },
-      ];
-      const res = await apiFetch<{ blocks: Block[]; anchored_markdown: string }>(
-        `/api/pages/${page.id}/blocks`,
-        {
-          method: "PATCH",
-          body: JSON.stringify({
-            ops,
-            expected_versions: { [b.id]: b.version },
-            reason: nextChecked ? `checked task ${b.id}` : `unchecked task ${b.id}`,
-          }),
-        }
-      );
-      onBlocksUpdated(res.blocks, res.anchored_markdown);
-      setStatusMsg(nextChecked ? `Completed task ${b.id}` : `Reopened task ${b.id}`);
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to update task");
-    } finally {
-      setSaving(false);
-    }
+      ],
+      { [b.id]: b.version },
+      nextChecked ? `Completed task ${b.id}` : `Reopened task ${b.id}`,
+      nextChecked ? `checked task ${b.id}` : `unchecked task ${b.id}`
+    );
   }
 
   async function handleInsertBlock(e: React.FormEvent) {
     e.preventDefault();
-    if (!newMarkdown.trim()) return;
-    setSaving(true);
-    setError(null);
-    setStatusMsg(null);
-    try {
-      const lastId = blocks.length > 0 ? blocks[blocks.length - 1].id : null;
-      const ops: BlockOp[] = [
+    if (!newMarkdown.trim() && newKindVal !== "divider") return;
+    const lastId = blocks.length > 0 ? blocks[blocks.length - 1].id : null;
+    await patchOps(
+      [
         {
           insert_block_after: {
             after_block_id: lastId,
@@ -540,59 +794,77 @@ export default function BlockEditor({
             markdown: newMarkdown.trim(),
           },
         },
-      ];
-      const res = await apiFetch<{ blocks: Block[]; anchored_markdown: string }>(
-        `/api/pages/${page.id}/blocks`,
+      ],
+      {},
+      "Inserted new block",
+      reason.trim() || "insert block"
+    );
+    setNewMarkdown("");
+  }
+
+  async function handleInsertSetKind(kind: BlockKind, md: string) {
+    const afterId =
+      insertAfterId ?? (blocks.length > 0 ? blocks[blocks.length - 1].id : null);
+    setShowSetsMenu(false);
+    setSetsMode("main");
+    await patchOps(
+      [
         {
-          method: "PATCH",
-          body: JSON.stringify({
-            ops,
-            expected_versions: {},
-            reason: reason.trim() || "insert block",
-          }),
-        }
-      );
-      setNewMarkdown("");
-      onBlocksUpdated(res.blocks, res.anchored_markdown);
-      setStatusMsg("Inserted new block");
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to insert block");
-    } finally {
-      setSaving(false);
-    }
+          insert_block_after: {
+            after_block_id: afterId,
+            parent_block_id: null,
+            kind,
+            markdown: md,
+          },
+        },
+      ],
+      {},
+      "Inserted set block",
+      reason.trim() || "insert set"
+    );
+  }
+
+  async function handleMoveBlock(sourceId: string, targetId: string) {
+    if (sourceId === targetId) return;
+    const targetIdx = blocks.findIndex((b) => b.id === targetId);
+    const sourceIdx = blocks.findIndex((b) => b.id === sourceId);
+    if (targetIdx < 0 || sourceIdx < 0) return;
+
+    const remaining = blocks.filter((b) => b.id !== sourceId);
+    const newTargetIdx = remaining.findIndex((b) => b.id === targetId);
+    const insertIdx = sourceIdx < targetIdx ? newTargetIdx + 1 : newTargetIdx;
+    const afterBlockId = insertIdx > 0 ? remaining[insertIdx - 1].id : null;
+
+    await patchOps(
+      [
+        {
+          move_block: {
+            block_id: sourceId,
+            new_parent_id: null,
+            after_block_id: afterBlockId,
+          },
+        },
+      ],
+      {},
+      `Moved ${sourceId}`,
+      reason.trim() || `reorder block ${sourceId}`
+    );
   }
 
   async function handleDeleteBlock(b: Block) {
-    setSaving(true);
-    setError(null);
-    setStatusMsg(null);
-    try {
-      const ops: BlockOp[] = [
+    await patchOps(
+      [
         {
           delete_block: {
             block_id: b.id,
             expected_version: b.version,
           },
         },
-      ];
-      const res = await apiFetch<{ blocks: Block[]; anchored_markdown: string }>(
-        `/api/pages/${page.id}/blocks`,
-        {
-          method: "PATCH",
-          body: JSON.stringify({
-            ops,
-            expected_versions: { [b.id]: b.version },
-            reason: reason.trim() || "delete block",
-          }),
-        }
-      );
-      onBlocksUpdated(res.blocks, res.anchored_markdown);
-      setStatusMsg(`Deleted block ${b.id}`);
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to delete block");
-    } finally {
-      setSaving(false);
-    }
+      ],
+      { [b.id]: b.version },
+      `Deleted block ${b.id}`,
+      reason.trim() || "delete block"
+    );
   }
 
   async function handleAiDraft(e: React.FormEvent) {
@@ -623,8 +895,11 @@ export default function BlockEditor({
     }
   }
 
+  const selectedMetricDb = databases.find((d) => d.id === metricDbId);
+
   return (
-    <div className="space-y-4">
+    <div className="max-w-4xl mx-auto space-y-5">
+      {/* Studio Controls Header */}
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-stone-200 bg-white px-4 py-2.5">
         <div className="flex items-center gap-2 text-xs text-stone-600">
           <span className="font-medium text-stone-800">Audit Reason:</span>
@@ -632,20 +907,244 @@ export default function BlockEditor({
             type="text"
             value={reason}
             onChange={(e) => setReason(e.target.value)}
-            className="rounded-md border border-stone-200 px-2.5 py-1 text-xs w-56 outline-none focus:border-stone-500"
+            className="rounded-md border border-stone-200 px-2.5 py-1 text-xs w-52 outline-none focus:border-stone-500"
           />
         </div>
-        <div className="flex items-center gap-3 text-xs">
+        <div className="flex flex-wrap items-center gap-2 text-xs">
           {statusMsg && <span className="text-emerald-700 font-medium">{statusMsg}</span>}
+          <button
+            type="button"
+            onClick={() => {
+              setInsertAfterId(blocks.length > 0 ? blocks[blocks.length - 1].id : null);
+              setSetsMode("main");
+              setShowSetsMenu((v) => !v);
+            }}
+            className="inline-flex items-center gap-1 rounded-md border border-stone-200 bg-stone-50 px-2.5 py-1 font-medium text-stone-700 hover:bg-stone-100"
+          >
+            <Plus className="h-3.5 w-3.5" />
+            Add Set ( / )
+          </button>
           <button
             type="button"
             onClick={() => setRawMode((v) => !v)}
             className="rounded-md border border-stone-200 px-2.5 py-1 text-stone-600 hover:bg-stone-50"
           >
-            {rawMode ? "TipTap Rich Mode" : "Raw Markdown Mode"}
+            {rawMode ? "TipTap Rich Mode" : "Raw Block Mode"}
           </button>
         </div>
       </div>
+
+      {/* Statamic-Style Sets Palette */}
+      {showSetsMenu && (
+        <div className="rounded-2xl border border-stone-300 bg-white p-4 shadow-lg space-y-3">
+          <div className="flex items-center justify-between border-b border-stone-100 pb-2">
+            <div className="text-xs font-semibold text-stone-900">
+              {setsMode === "main"
+                ? "Insert Content Set"
+                : setsMode === "db_embed"
+                  ? "Embed Live Database View"
+                  : "Insert Live Metric Pill"}
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setShowSetsMenu(false);
+                setSetsMode("main");
+              }}
+              className="text-xs text-stone-500 hover:text-stone-900"
+            >
+              Close
+            </button>
+          </div>
+
+          {setsMode === "main" && (
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+              <button
+                type="button"
+                onClick={() => void handleInsertSetKind("paragraph", "New paragraph...")}
+                className="rounded-lg border border-stone-200 px-3 py-2 text-left hover:bg-stone-50"
+              >
+                <div className="font-semibold text-stone-900">Paragraph</div>
+                <div className="text-[11px] text-stone-400">Plain editorial prose</div>
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleInsertSetKind({ heading: { level: 2 } }, "Section Heading")}
+                className="rounded-lg border border-stone-200 px-3 py-2 text-left hover:bg-stone-50"
+              >
+                <div className="font-semibold text-stone-900">Heading 2</div>
+                <div className="text-[11px] text-stone-400">Section divider title</div>
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleInsertSetKind({ task_item: { checked: false } }, "Action item")}
+                className="rounded-lg border border-stone-200 px-3 py-2 text-left hover:bg-stone-50"
+              >
+                <div className="font-semibold text-stone-900">Checklist</div>
+                <div className="text-[11px] text-stone-400">Interactive task box</div>
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  void handleInsertSetKind({ callout: { tone: "info", icon: null } }, "Key takeaway")
+                }
+                className="rounded-lg border border-stone-200 px-3 py-2 text-left hover:bg-stone-50"
+              >
+                <div className="font-semibold text-stone-900">Callout</div>
+                <div className="text-[11px] text-stone-400">Highlighted banner</div>
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleInsertSetKind({ code_block: { language: "mo" } }, "// code")}
+                className="rounded-lg border border-stone-200 px-3 py-2 text-left hover:bg-stone-50"
+              >
+                <div className="font-semibold text-stone-900">Code Block</div>
+                <div className="text-[11px] text-stone-400">Syntax formatted snippet</div>
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleInsertSetKind("divider", "")}
+                className="rounded-lg border border-stone-200 px-3 py-2 text-left hover:bg-stone-50"
+              >
+                <div className="font-semibold text-stone-900">Divider</div>
+                <div className="text-[11px] text-stone-400">Horizontal separator</div>
+              </button>
+              <button
+                type="button"
+                onClick={() => setSetsMode("db_embed")}
+                className="rounded-lg border border-blue-200 bg-blue-50/70 px-3 py-2 text-left hover:bg-blue-100/70"
+              >
+                <div className="flex items-center gap-1 font-semibold text-blue-900">
+                  <DbIcon className="h-3.5 w-3.5" />
+                  Live DB View
+                </div>
+                <div className="text-[11px] text-blue-700">Interactive table/board</div>
+              </button>
+              <button
+                type="button"
+                onClick={() => setSetsMode("metric_pill")}
+                className="rounded-lg border border-emerald-200 bg-emerald-50/70 px-3 py-2 text-left hover:bg-emerald-100/70"
+              >
+                <div className="flex items-center gap-1 font-semibold text-emerald-900">
+                  <Calculator className="h-3.5 w-3.5" />
+                  Live Metric Pill
+                </div>
+                <div className="text-[11px] text-emerald-700">Decimal DB aggregation</div>
+              </button>
+            </div>
+          )}
+
+          {setsMode === "db_embed" && (
+            <div className="space-y-3 text-xs">
+              {databases.length === 0 ? (
+                <p className="text-stone-500">Create a Database first to embed live views here.</p>
+              ) : (
+                <div className="flex flex-wrap items-center gap-2">
+                  <select
+                    value={embedDbId}
+                    onChange={(e) => setEmbedDbId(e.target.value)}
+                    className="rounded-lg border border-stone-200 bg-white px-2.5 py-1.5"
+                  >
+                    {databases.map((d) => (
+                      <option key={d.id} value={d.id}>
+                        {d.title}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    value={embedViewId}
+                    onChange={(e) => setEmbedViewId(e.target.value)}
+                    className="rounded-lg border border-stone-200 bg-white px-2.5 py-1.5"
+                  >
+                    <option value="">Default View</option>
+                    {embedDbViews.map((v) => (
+                      <option key={v.id} value={v.id}>
+                        {v.name}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void handleInsertSetKind(
+                        {
+                          database_view_embed: {
+                            database_id: embedDbId,
+                            view_id: embedViewId || null,
+                          },
+                        },
+                        ""
+                      )
+                    }
+                    className="rounded-lg bg-stone-900 px-3.5 py-1.5 font-medium text-white hover:bg-stone-800"
+                  >
+                    Insert Live Embed
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {setsMode === "metric_pill" && (
+            <div className="space-y-3 text-xs">
+              {databases.length === 0 ? (
+                <p className="text-stone-500">Create a Database first to reference metrics.</p>
+              ) : (
+                <div className="flex flex-wrap items-center gap-2">
+                  <select
+                    value={metricDbId}
+                    onChange={(e) => setMetricDbId(e.target.value)}
+                    className="rounded-lg border border-stone-200 bg-white px-2.5 py-1.5"
+                  >
+                    {databases.map((d) => (
+                      <option key={d.id} value={d.id}>
+                        {d.title}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    value={metricPropId}
+                    onChange={(e) => setMetricPropId(e.target.value)}
+                    className="rounded-lg border border-stone-200 bg-white px-2.5 py-1.5"
+                  >
+                    {(selectedMetricDb?.properties ?? []).map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name} ({p.id})
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    value={metricAgg}
+                    onChange={(e) => setMetricAgg(e.target.value)}
+                    className="rounded-lg border border-stone-200 bg-white px-2.5 py-1.5"
+                  >
+                    <option value="sum">sum</option>
+                    <option value="count">count</option>
+                    <option value="count_values">count_values</option>
+                    <option value="avg">avg</option>
+                    <option value="min">min</option>
+                    <option value="max">max</option>
+                  </select>
+                  <button
+                    type="button"
+                    disabled={!metricDbId || !metricPropId}
+                    onClick={() => {
+                      const tok = `{{metric:${metricDbId}.${metricPropId}:${metricAgg}}}`;
+                      const propName =
+                        selectedMetricDb?.properties.find((p) => p.id === metricPropId)?.name ??
+                        metricPropId;
+                      void handleInsertSetKind("paragraph", `Live ${propName} (${metricAgg}): ${tok}`);
+                    }}
+                    className="rounded-lg bg-emerald-700 px-3.5 py-1.5 font-medium text-white hover:bg-emerald-800 disabled:opacity-50"
+                  >
+                    Insert Metric Block
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {error && (
         <div className="rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-xs text-red-800">
@@ -653,7 +1152,8 @@ export default function BlockEditor({
         </div>
       )}
 
-      <div className="space-y-2.5">
+      {/* Editorial Canvas */}
+      <div className="space-y-3">
         {blocks.map((b) => {
           const isAgent =
             typeof b.provenance.author_kind === "object" &&
@@ -664,43 +1164,83 @@ export default function BlockEditor({
             JSON.stringify(draft.kind) !== JSON.stringify(b.kind);
           const isActive = activeBlockId === b.id;
           const isHighlighted = highlightedId === b.id;
+          const isEmbed = typeof b.kind === "object" && "database_view_embed" in b.kind;
 
           return (
             <div
               key={b.id}
               data-block-id={b.id}
               onClick={() => setActiveBlockId(b.id)}
-              className={`group rounded-xl border p-3.5 transition ${
-                isHighlighted
-                  ? "border-amber-400 bg-amber-50/40 ring-2 ring-amber-200"
-                  : isActive
-                    ? "border-stone-300 bg-white shadow-xs"
-                    : "border-stone-200/80 bg-white/70 hover:border-stone-300"
+              onDragOver={(e) => {
+                e.preventDefault();
+                if (draggedId && draggedId !== b.id) setDragOverId(b.id);
+              }}
+              onDragLeave={() => {
+                if (dragOverId === b.id) setDragOverId(null);
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                setDragOverId(null);
+                if (draggedId && draggedId !== b.id) {
+                  void handleMoveBlock(draggedId, b.id);
+                }
+                setDraggedId(null);
+              }}
+              className={`group rounded-2xl border p-4 transition ${
+                dragOverId === b.id
+                  ? "border-blue-400 ring-2 ring-blue-100 bg-blue-50/20"
+                  : isHighlighted
+                    ? "border-amber-400 bg-amber-50/40 ring-2 ring-amber-200"
+                    : isActive
+                      ? "border-stone-300 bg-white shadow-xs"
+                      : "border-stone-200/75 bg-white/85 hover:border-stone-300"
               }`}
             >
               <div className="flex items-start gap-3">
-                {/* Provenance Gutter */}
-                <div className="w-28 shrink-0 pt-1 space-y-1">
-                  <div
-                    title={
-                      b.provenance.reason
-                        ? `Reason: ${b.provenance.reason}`
-                        : `Author: ${b.provenance.author_id}`
-                    }
-                    className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ${
-                      isAgent
-                        ? "bg-teal-50 text-teal-800 border border-teal-200"
-                        : "bg-stone-100 text-stone-700"
-                    }`}
-                  >
-                    {isAgent ? <Bot className="h-3 w-3" /> : <User className="h-3 w-3" />}
-                    <span>{isAgent ? "Agent" : "Human"}</span>
+                {/* Drag Handle + Provenance Gutter */}
+                <div className="w-32 shrink-0 pt-1 space-y-1">
+                  <div className="flex items-center gap-1">
+                    <span
+                      draggable
+                      onDragStart={() => setDraggedId(b.id)}
+                      onDragEnd={() => {
+                        setDraggedId(null);
+                        setDragOverId(null);
+                      }}
+                      title="Drag to reorder block"
+                      className="cursor-grab text-stone-300 hover:text-stone-600 opacity-0 group-hover:opacity-100 transition"
+                    >
+                      <GripVertical className="h-4 w-4" />
+                    </span>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onInspectBlock?.(b.id);
+                      }}
+                      title={
+                        b.provenance.reason
+                          ? `Inspect ${b.id} (${b.provenance.reason})`
+                          : `Inspect ${b.id}`
+                      }
+                      className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium transition ${
+                        isAgent
+                          ? "bg-teal-50 text-teal-800 border border-teal-200 hover:bg-teal-100"
+                          : "bg-stone-100 text-stone-700 hover:bg-stone-200"
+                      }`}
+                    >
+                      {isAgent ? <Bot className="h-3 w-3" /> : <User className="h-3 w-3" />}
+                      <span>{isAgent ? "Agent" : "Human"}</span>
+                    </button>
                   </div>
-                  <div className="text-[10px] font-mono text-stone-400 truncate">
+                  <div className="text-[10px] font-mono text-stone-400 truncate pl-5">
                     {b.id} · v{b.version}
                   </div>
                   {b.provenance.reason && (
-                    <div className="text-[10px] text-stone-500 truncate" title={b.provenance.reason}>
+                    <div
+                      className="text-[10px] text-stone-400 truncate pl-5"
+                      title={b.provenance.reason}
+                    >
                       {b.provenance.reason}
                     </div>
                   )}
@@ -709,38 +1249,58 @@ export default function BlockEditor({
                 {/* Block Body */}
                 <div className="flex-1 min-w-0 space-y-2">
                   <div className="flex items-center justify-between gap-2">
-                    <select
-                      value={blockKindOptionValue(draft.kind)}
-                      onChange={(e) => {
-                        const val = e.target.value;
-                        const nextKind =
-                          val === "callout" &&
-                          typeof draft.kind === "object" &&
-                          "callout" in draft.kind
-                            ? draft.kind
-                            : optionValueToBlockKind(val);
-                        setDrafts((prev) => ({
-                          ...prev,
-                          [b.id]: { ...draft, kind: nextKind },
-                        }));
-                      }}
-                      className={`rounded border border-stone-200 bg-stone-50 px-2 py-0.5 text-[11px] font-medium text-stone-600 transition ${
-                        isActive ? "opacity-100" : "opacity-0 group-hover:opacity-100"
-                      }`}
-                    >
-                      <option value="paragraph">Paragraph</option>
-                      <option value="h1">Heading 1</option>
-                      <option value="h2">Heading 2</option>
-                      <option value="h3">Heading 3</option>
-                      <option value="bullet_list_item">Bullet Item</option>
-                      <option value="task_item">Task Item</option>
-                      <option value="callout">Callout</option>
-                      <option value="quote">Quote</option>
-                      <option value="code_block">Code Block</option>
-                      <option value="divider">Divider</option>
-                    </select>
+                    {isEmbed ? (
+                      <span className="inline-flex items-center gap-1 rounded-md bg-blue-50 border border-blue-200 px-2 py-0.5 text-[11px] font-medium text-blue-800">
+                        <DbIcon className="h-3 w-3" />
+                        Embedded Database View
+                      </span>
+                    ) : (
+                      <select
+                        value={blockKindOptionValue(draft.kind)}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          const nextKind =
+                            val === "callout" &&
+                            typeof draft.kind === "object" &&
+                            "callout" in draft.kind
+                              ? draft.kind
+                              : optionValueToBlockKind(val);
+                          setDrafts((prev) => ({
+                            ...prev,
+                            [b.id]: { ...draft, kind: nextKind },
+                          }));
+                        }}
+                        className={`rounded border border-stone-200 bg-stone-50 px-2 py-0.5 text-[11px] font-medium text-stone-600 transition ${
+                          isActive ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+                        }`}
+                      >
+                        <option value="paragraph">Paragraph</option>
+                        <option value="h1">Heading 1</option>
+                        <option value="h2">Heading 2</option>
+                        <option value="h3">Heading 3</option>
+                        <option value="bullet_list_item">Bullet Item</option>
+                        <option value="task_item">Task Item</option>
+                        <option value="callout">Callout</option>
+                        <option value="quote">Quote</option>
+                        <option value="code_block">Code Block</option>
+                        <option value="divider">Divider</option>
+                      </select>
+                    )}
 
                     <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setInsertAfterId(b.id);
+                          setSetsMode("main");
+                          setShowSetsMenu(true);
+                        }}
+                        title="Insert Set below this block"
+                        className="rounded p-1 text-stone-400 hover:bg-stone-100 hover:text-stone-700 opacity-0 group-hover:opacity-100 transition"
+                      >
+                        <Plus className="h-3.5 w-3.5" />
+                      </button>
                       {typeof b.kind === "object" && "page_link" in b.kind && (
                         <Link
                           href={`/p/${b.kind.page_link.target_page_id}`}
@@ -749,7 +1309,7 @@ export default function BlockEditor({
                           Open linked page →
                         </Link>
                       )}
-                      {dirty && (
+                      {dirty && !isEmbed && (
                         <button
                           type="button"
                           disabled={saving}
@@ -778,10 +1338,29 @@ export default function BlockEditor({
                     </div>
                   </div>
 
-                  {isActive && !rawMode ? (
+                  {isEmbed ? (
+                    <RenderedBlockBody
+                      block={b}
+                      saving={saving}
+                      databases={databases}
+                      principals={principals}
+                      relationTargets={relationTargets}
+                      resolvedMetrics={resolvedMetrics}
+                      activeScenarioId={activeScenarioId}
+                      onToggleTask={(blk) => void handleToggleTaskCheckbox(blk)}
+                      onInspectBlock={onInspectBlock}
+                      onInspectRow={onInspectRow}
+                      onMetricInvalidated={onMetricInvalidated}
+                    />
+                  ) : isActive && !rawMode ? (
                     <TipTapInlineEditor
                       key={b.id}
                       block={b}
+                      onSlashTrigger={() => {
+                        setInsertAfterId(b.id);
+                        setSetsMode("main");
+                        setShowSetsMenu(true);
+                      }}
                       onChangeText={(txt) =>
                         setDrafts((prev) => ({
                           ...prev,
@@ -805,20 +1384,43 @@ export default function BlockEditor({
                     <RenderedBlockBody
                       block={b}
                       saving={saving}
+                      databases={databases}
+                      principals={principals}
+                      relationTargets={relationTargets}
+                      resolvedMetrics={resolvedMetrics}
+                      activeScenarioId={activeScenarioId}
                       onToggleTask={(blk) => void handleToggleTaskCheckbox(blk)}
+                      onInspectBlock={onInspectBlock}
+                      onInspectRow={onInspectRow}
+                      onMetricInvalidated={onMetricInvalidated}
                     />
                   )}
 
                   {b.provenance.citations.length > 0 && (
                     <div className="flex flex-wrap gap-1.5 pt-1">
-                      {b.provenance.citations.map((cit, i) => (
-                        <span
-                          key={i}
-                          className="inline-flex items-center rounded bg-blue-50 px-2 py-0.5 text-[11px] text-blue-700 border border-blue-100"
-                        >
-                          {cit.label} ({cit.source_ref})
-                        </span>
-                      ))}
+                      {b.provenance.citations.map((cit, i) => {
+                        const citBlkMatch = /^blk_[A-Za-z0-9_]+$/.test(cit.source_ref);
+                        return citBlkMatch && onInspectBlock ? (
+                          <button
+                            key={i}
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onInspectBlock(cit.source_ref);
+                            }}
+                            className="inline-flex items-center rounded bg-blue-50 px-2 py-0.5 text-[11px] text-blue-700 border border-blue-200 hover:bg-blue-100"
+                          >
+                            {cit.label} ({cit.source_ref})
+                          </button>
+                        ) : (
+                          <span
+                            key={i}
+                            className="inline-flex items-center rounded bg-blue-50 px-2 py-0.5 text-[11px] text-blue-700 border border-blue-100"
+                          >
+                            {cit.label} ({cit.source_ref})
+                          </span>
+                        );
+                      })}
                     </div>
                   )}
                 </div>
@@ -830,7 +1432,7 @@ export default function BlockEditor({
 
       {/* Insert New Block */}
       <form
-        onSubmit={handleInsertBlock}
+        onSubmit={(e) => void handleInsertBlock(e)}
         className="rounded-xl border border-dashed border-stone-300 bg-stone-50/70 p-3 flex flex-wrap items-center gap-2"
       >
         <select
@@ -865,7 +1467,7 @@ export default function BlockEditor({
 
       {/* AI Draft as Speculative Proposal */}
       <form
-        onSubmit={handleAiDraft}
+        onSubmit={(e) => void handleAiDraft(e)}
         className="rounded-xl border border-teal-200 bg-teal-50/50 p-4 space-y-2.5"
       >
         <div className="flex items-center gap-2 text-xs font-semibold text-teal-900">

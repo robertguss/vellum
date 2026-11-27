@@ -39,8 +39,13 @@ not_found_ledger?,
 verify_grant_chain_read_only,
 page_embedding_text,
 tx_index_page,
+tx_index_page_with_extra,
 tx_save_page_and_blocks,
 tx_delete_page_and_blocks,
+blueprints_by_slug,
+blueprints_table,
+page_meta_by_blueprint,
+page_meta_table,
 tx_put_page_neural_vector,
 tx_remove_page_vectors,
 neural_vec_populated,
@@ -81,6 +86,7 @@ tx_apply_world_patch,
 world_catalog,
 replay_catalog
 use Domain.Blocks
+use Domain.Blueprints{BlueprintDef, PageBlueprintMeta}
 use Domain.Collab{
   DecimalDelta,
   ProposalMeta,
@@ -293,6 +299,22 @@ fn webhooks_table() : Table.Table(Text, WebhookSub)
   Table.text_key[WebhookSub]("vlm_webhooks").with_index(webhooks_by_workspace())
 end
 
+fn blueprints_by_slug() : Table.Index(Text, BlueprintDef, Text)
+  Table.unique_text_index[Text, BlueprintDef]("vlm_blueprints_by_slug", fn(bp) bp.slug end)
+end
+
+fn blueprints_table() : Table.Table(Text, BlueprintDef)
+  Table.text_key[BlueprintDef]("vlm_blueprints").with_index(blueprints_by_slug())
+end
+
+fn page_meta_by_blueprint() : Table.Index(Text, PageBlueprintMeta, Text)
+  Table.text_index[Text, PageBlueprintMeta]("vlm_page_meta_by_blueprint", fn(pm) pm.blueprint_id end)
+end
+
+fn page_meta_table() : Table.Table(Text, PageBlueprintMeta)
+  Table.text_key[PageBlueprintMeta]("vlm_page_meta").with_index(page_meta_by_blueprint())
+end
+
 ## Converts `Modb.Table` errors to `AppError`.
 fn map_table_error(err: Table.TableError) : AppError
   case err
@@ -483,14 +505,39 @@ fn check_single_db_row(
   Ok(None)
 end
 
+fn check_single_page_meta(
+  tx: WriteTx,
+  bps_tbl: Table.Table(Text, BlueprintDef),
+  pages_tbl: Table.Table(Text, Page),
+  pid: Text,
+  meta: PageBlueprintMeta
+) : Result(Option(Text), Table.TableError)
+  if meta.page_id != pid
+    return Ok(Some("page_meta '#{pid}' has mismatched page_id '#{meta.page_id}'"))
+  end
+  case try Table.tx_get(tx, pages_tbl, pid)
+    Some(p) if p.archived_at == None and p.kind == Document: Unit
+    Some(_) | None: return Ok(
+      Some("page_meta '#{pid}' references missing, archived, or non-Document page")
+    )
+  end
+  bp = case try Table.tx_get(tx, bps_tbl, meta.blueprint_id)
+    Some(b): b
+    None: return Ok(Some("page_meta '#{pid}' references missing blueprint '#{meta.blueprint_id}'"))
+  end
+  Ok(Blueprints.validate_page_meta(bp, meta.values))
+end
+
 ## Declarative `Modb.Ledger` schema enforcing mandatory write reasons, v1 bootstrap,
-## and incremental `$O(\text{touched})$` invariants across collections, pages, blocks, and databases.
+## and incremental `$O(\text{touched})$` invariants across collections, pages, blocks, databases, and blueprints.
 fn vellum_schema() : Ledger.Schema
   cols = collections_table()
   pages = pages_table()
   blocks = blocks_table()
   dbs = databases_table()
   db_rows = db_rows_table()
+  bps = blueprints_table()
+  page_metas = page_meta_table()
   Ledger.schema(1).with_require_reason(true).with_migration(
     Ledger.migration(1, "initialize default workspace and general collection", init_v1_migration)
   ).with_invariant(
@@ -522,8 +569,9 @@ fn vellum_schema() : Ledger.Schema
       "block_valid",
       blocks,
       fn(id, b)
-        bad_heading = case b.kind
+        bad_block = case b.kind
           Heading(level: lvl): lvl < 1 or lvl > 3
+          DatabaseViewEmbed(database_id: db_id, view_id: _): db_id.trim.empty?
           Paragraph | BulletListItem | OrderedListItem(start: _) | TaskItem(checked: _) | Quote | Callout(
             tone: _,
             icon: _
@@ -532,8 +580,8 @@ fn vellum_schema() : Ledger.Schema
             filename: _
           ) | PageLink(target_page_id: _): false
         end
-        if bad_heading or b.version < 1
-          Some("block '#{id}' has invalid heading level or version < 1")
+        if bad_block or b.version < 1
+          Some("block '#{id}' has invalid heading level, empty embed target, or version < 1")
         else
           None
         end
@@ -566,6 +614,39 @@ fn vellum_schema() : Ledger.Schema
           all_rows = try Table.tx_scan(tx, db_rows, None, None, 0)
           for (_rid, row) in all_rows
             case try check_single_db_row(tx, dbs, db_rows, pages, row)
+              Some(detail): return Ok(Some(detail))
+              None: Unit
+            end
+          end
+          Ok(None)
+        end
+      end
+    )
+  ).with_invariant(
+    Ledger.row_invariant("blueprint_valid", bps, fn(_id, bp) Blueprints.validate_blueprint_def(bp) end)
+  ).with_invariant(
+    Ledger.invariant(
+      "page_meta_integrity",
+      fn(tx)
+        if Modb.tx_is_tracked?(tx) and not Modb.tx_bucket_deleted?(tx, page_metas.bucket)
+          for kb in Modb.tx_touched_puts(tx, page_metas.bucket)
+            case try Modb.tx_get(tx, page_metas.bucket, kb).map_error(fn(e) Table.Storage(e) end)
+              Some(raw):
+                meta = try page_metas.decode_value(raw).map_error(
+                  fn(e) Table.DecodeValue(e) end
+                )
+                case try check_single_page_meta(tx, bps, pages, meta.page_id, meta)
+                  Some(detail): return Ok(Some(detail))
+                  None: Unit
+                end
+              None: Unit
+            end
+          end
+          Ok(None)
+        else
+          all_metas = try Table.tx_scan(tx, page_metas, None, None, 0)
+          for (pid, meta) in all_metas
+            case try check_single_page_meta(tx, bps, pages, pid, meta)
               Some(detail): return Ok(Some(detail))
               None: Unit
             end
@@ -649,34 +730,60 @@ fn truncate_text_bytes(s: Text, max_bytes: Int) : Text
   ""
 end
 
-## Indexes `page` and its `blocks` into both `Modb.Fts` and `Modb.Vec` (sketch index) inside `tx`.
-fn tx_index_page(tx: WriteTx, page: Page, blocks: List(Block)) : Result(WriteTx, AppError)
+## Indexes `page`, optional extra plain text (e.g. blueprint fields or DB properties), and `blocks`
+## into both `Modb.Fts` and `Modb.Vec` (sketch index) inside `tx`.
+fn tx_index_page_with_extra(
+  tx: WriteTx,
+  page: Page,
+  blocks: List(Block),
+  extra_text: Option(Text)
+) : Result(WriteTx, AppError)
   body_plain = Blocks.blocks_plain_text(blocks)
+  extra_trimmed = case extra_text
+    Some(e): e.trim
+    None: ""
+  end
+  combined_body = if extra_trimmed.empty?
+    body_plain
+  else if body_plain.trim.empty?
+    extra_trimmed
+  else
+    "#{extra_trimmed}\n#{body_plain}"
+  end
   doc = Fts.DocumentInput(
     doc_id: page.id,
     scope: page.collection_id,
     fields: [
       Fts.FieldInput(name: "title", text: page.title, weight: 3),
-      Fts.FieldInput(name: "body", text: body_plain, weight: 1)
+      Fts.FieldInput(name: "body", text: combined_body, weight: 1)
     ]
   )
   t1 = try Fts.tx_index_document(tx, fts_index(), doc).map_error(map_fts_error)
-  t = page.title.trim
-  body_trimmed = body_plain.trim
-  sketch_raw = if t.empty?
-    body_trimmed
-  else if body_trimmed.empty?
-    t
-  else
-    "#{t}\n#{body_trimmed}"
-  end
-  embed_txt = truncate_text_bytes(sketch_raw, 4096)
+  embed_txt = truncate_text_bytes(page_embedding_text(page, blocks, extra_text), 4096)
   vec_inp = Vec.VectorInput(
     doc_id: page.id,
     scope: page.collection_id,
     values: Vec.text_sketch_embedding(embed_txt, sketch_vec_dims)
   )
   Vec.tx_put_vector(t1, sketch_vec_index(), vec_inp).map_error(map_vec_error)
+end
+
+## Indexes `page`, its attached blueprint metadata (for `Document` pages), and its `blocks`
+## into both `Modb.Fts` and `Modb.Vec` (sketch index) inside `tx`.
+fn tx_index_page(tx: WriteTx, page: Page, blocks: List(Block)) : Result(WriteTx, AppError)
+  extra = if page.kind == Document
+    case try Table.tx_get(tx, page_meta_table(), page.id).map_error(map_table_error)
+      Some(pm):
+        case try Table.tx_get(tx, blueprints_table(), pm.blueprint_id).map_error(map_table_error)
+          Some(bp): Some(Blueprints.page_meta_plain_text(bp, pm))
+          None: None
+        end
+      None: None
+    end
+  else
+    None
+  end
+  tx_index_page_with_extra(tx, page, blocks, extra)
 end
 
 ## Atomically stores (or replaces across dimension/collection changes) a page's neural embedding vector.
@@ -746,7 +853,8 @@ fn tx_save_page_and_blocks(tx: WriteTx, page: Page, blocks: List(Block)) : Resul
   end
 end
 
-## Atomically removes `page_id`, all of its blocks, its FTS entry, and its vector index entries inside `tx`.
+## Atomically removes `page_id`, any attached blueprint metadata, all of its blocks, its FTS entry,
+## and its vector index entries inside `tx`.
 fn tx_delete_page_and_blocks(tx: WriteTx, page_id: Text) : Result(WriteTx, AppError)
   btbl = blocks_table()
   bidx = blocks_by_page()
@@ -754,6 +862,10 @@ fn tx_delete_page_and_blocks(tx: WriteTx, page_id: Text) : Result(WriteTx, AppEr
   var cur = tx
   for (bid, _b) in existing
     cur = try Table.delete(cur, btbl, bid).map_error(map_table_error)
+  end
+  case try Table.tx_get(cur, page_meta_table(), page_id).map_error(map_table_error)
+    Some(_pm): cur = try Table.delete(cur, page_meta_table(), page_id).map_error(map_table_error)
+    None: Unit
   end
   cur = try Table.delete(cur, pages_table(), page_id).map_error(map_table_error)
   cur = try Fts.tx_remove_document(cur, fts_index(), page_id).map_error(map_fts_error)
@@ -2329,7 +2441,7 @@ test "Db relational database composite cell indexes, rollup enrichment, and Ledg
       end
 
       rep = try Ledger.verify_all(db).map_error(map_ledger_error)
-      return Error(BadInput(reason: "expected 5 invariants")) if rep.invariants_checked != 5
+      return Error(BadInput(reason: "expected 7 invariants")) if rep.invariants_checked != 7
       Ok(Unit)
     end
   )
@@ -2683,7 +2795,7 @@ test "Db Modb.Vec hybrid RRF search, neural vector updates/dimension switches, a
       new_other = try Vec.get_doc(store, neural_vec_index(8), pg_other.id).map_error(map_vec_error)
       return Error(BadInput(reason: "expected 8d vector present")) if new_other == None
       rep = try Ledger.verify_all(db).map_error(map_ledger_error)
-      return Error(BadInput(reason: "expected 5 invariants")) if rep.invariants_checked != 5
+      return Error(BadInput(reason: "expected 7 invariants")) if rep.invariants_checked != 7
       Ok(Unit)
     end
   )
@@ -2891,4 +3003,122 @@ test "truncate_text_bytes, diff-only tx_save_page_and_blocks, and large-doc sket
     end
   )
   assert verify is Ok(Unit)
+end
+
+test "blueprints and page_meta integrity, FTS indexing, and delete cleanup"
+  files = Files.in_memory({})
+  schema = vellum_schema()
+  t0 = Time.parse("2026-11-26T12:00:00Z") or stop "t0"
+  meta = Ledger.WriteMeta(principal: "usr_ada", action: "test.bp", reason: "bp test", at: t0)
+  bp = BlueprintDef(
+    id: "bp_rfc",
+    slug: "architecture-rfc",
+    name: "Architecture RFC",
+    description: "Proposal template",
+    icon: Some("file-text"),
+    fields: [
+      PropertyDef(
+        id: "tier",
+        name: "Tier",
+        kind: Select(options: [SelectOption(id: "t1", label: "CriticalTier", color: Red)]),
+        required: true,
+        sort_order: "a"
+      )
+    ],
+    default_template_markdown: "## Summary",
+    version: 1
+  )
+  pg = Page(
+    id: "pg_rfc1",
+    collection_id: default_collection_id,
+    parent_page_id: None,
+    title: "Storage Engine",
+    icon: None,
+    cover_attachment_id: None,
+    kind: Document,
+    sort_order: "i",
+    database_id: None,
+    freshness_ttl_days: None,
+    verified_at: None,
+    verified_by: None,
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+  pm = PageBlueprintMeta(
+    page_id: pg.id,
+    blueprint_id: bp.id,
+    values: {"tier": SelectVal(option_id: "t1")},
+    updated_at: t0
+  )
+
+  ins_res = Ledger.transact_locked(
+    files,
+    ledger_db_path,
+    schema,
+    meta,
+    "save bp and page meta",
+    Json.Null,
+    map_ledger_error,
+    fn(tx)
+      t1 = try Table.put(tx, blueprints_table(), bp.id, bp).map_error(map_table_error)
+      t2 = try Table.put(t1, pages_table(), pg.id, pg).map_error(map_table_error)
+      t3 = try Table.put(t2, page_meta_table(), pm.page_id, pm).map_error(map_table_error)
+      t4 = try tx_save_page_and_blocks(t3, pg, [])
+      Ok((t4, Unit))
+    end
+  )
+  assert ins_res is Ok(Unit)
+
+  # FTS matches structured metadata label "CriticalTier"
+  auth = AuthContext(
+    principal: Principal(
+      id: "usr_ada",
+      kind: Human,
+      handle: "ada",
+      display_name: "Ada",
+      email: Some("ada@example.com"),
+      avatar_url: None,
+      role: Owner,
+      model_id: None,
+      root_grant_id: "gr_root",
+      suspended: false,
+      created_at: t0,
+      last_seen_at: None
+    ),
+    grant_id: "gr_root",
+    session: None,
+    allowed_collections: None,
+    allowed_actions: ["read"]
+  )
+  fts_res = Ledger.read_locked(
+    files.read_only,
+    ledger_db_path,
+    schema,
+    map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      search_pages(store, auth, "CriticalTier", 10, false, None)
+    end
+  )
+  assert fts_res.map(fn(hs) hs.map(fn(h) h.page_id end) end) == Ok([pg.id])
+
+  # Deleting page removes page_meta automatically inside transaction
+  del_res = Ledger.transact_locked(
+    files,
+    ledger_db_path,
+    schema,
+    meta,
+    "delete page cleans meta",
+    Json.Null,
+    map_ledger_error,
+    fn(tx)
+      t1 = try tx_delete_page_and_blocks(tx, pg.id)
+      rem = try Table.tx_get(t1, page_meta_table(), pg.id).map_error(map_table_error)
+      Ok((t1, rem))
+    end
+  )
+  assert del_res == Ok(None)
 end
