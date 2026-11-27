@@ -2713,6 +2713,13 @@ fn delegate_grant(
     end
   )
 
+  del_ev = Json.Object({
+    "grant_id": Json.String(child_grant.id),
+    "parent_grant_id": Json.String(auth.grant_id),
+    "principal_handle": Json.String(child_principal.handle),
+    "max_calls": Json.int(child_grant.max_calls),
+    "actor": Json.String(auth.principal.handle)
+  })
   Ok(
     json_ok(
       201,
@@ -2723,7 +2730,7 @@ fn delegate_grant(
         "token_id": Json.String(tok.id),
         "token_prefix": Json.String(tok.prefix)
       })
-    )
+    ).with_sse_publish_json("grants", "grant.delegated", del_ev)
   )
 end
 
@@ -2867,6 +2874,13 @@ fn events_stream(req: Api.Request, auth: AuthContext, rf: ReadFiles, clock: Cloc
     return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'read'"))
   end
   last_id = Sse.last_event_id(req)
+  grants_scope = req.query_param("scope") == Some("grants")
+  if grants_scope
+    role_ok = auth.principal.role == Owner or auth.principal.role == Admin
+    if not role_ok
+      return Error(Forbidden(reason: "only Owner/Admin may subscribe to live grants SSE stream"))
+    end
+  end
   page_scope = req.query_param("page_id").map(fn(s) s.trim end)
   db_scope = req.query_param("database_id").map(fn(s) s.trim end)
   col_scope = req.query_param("collection_id").map(fn(s) s.trim end)
@@ -2884,7 +2898,7 @@ fn events_stream(req: Api.Request, auth: AuthContext, rf: ReadFiles, clock: Cloc
       Some(cid) if not cid.empty?: return Error(Missing(entity: "collection", id: cid))
       Some(_) | None: Unit
     end
-    empty_topics = ["claims"]
+    empty_topics = if grants_scope: ["claims", "grants"] else: ["claims"]
     connected_ev = Sse.SseEvent(
       id: None,
       event: Some("connected"),
@@ -2895,7 +2909,22 @@ fn events_stream(req: Api.Request, auth: AuthContext, rf: ReadFiles, clock: Cloc
       retry_ms: Some(3000)
     )
     snap_ev = Sse.json_event(None, "claims.snapshot", Json.Object({"claims": Json.Array([])}))
-    return Ok(Sse.response([connected_ev, snap_ev]).with_sse_subscribe(empty_topics, last_id))
+    var empty_evs = [connected_ev, snap_ev]
+    if grants_scope
+      empty_evs = empty_evs.append(
+        Sse.json_event(
+          None,
+          "grants.snapshot",
+          Json.Object({
+            "total_grants": Json.int(0),
+            "active_grants": Json.int(0),
+            "delegated_grants": Json.int(0),
+            "revoked_grants": Json.int(0)
+          })
+        )
+      )
+    end
+    return Ok(Sse.response(empty_evs).with_sse_subscribe(empty_topics, last_id))
   end
 
   cursor = case last_id
@@ -2903,7 +2932,7 @@ fn events_stream(req: Api.Request, auth: AuthContext, rf: ReadFiles, clock: Cloc
     None: 0
   end
   now = clock.now
-  (topics, entries, active_claims) = try Ledger.read_locked(
+  (topics, entries, active_claims, grants_snap_opt) = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -2911,47 +2940,75 @@ fn events_stream(req: Api.Request, auth: AuthContext, rf: ReadFiles, clock: Cloc
     fn(db)
       store = Ledger.store(db)
       var scoped_topics = ["claims"]
-      case page_scope
-        Some(pid) if not pid.empty?:
-          pg = case try Table.get(store, Db.pages_table(), pid).map_error(Db.map_table_error)
-            Some(p) if p.archived_at == None: p
-            Some(_) | None: return Error(Missing(entity: "page", id: pid))
+      var g_snap_opt = None
+      if grants_scope
+        scoped_topics = ["claims", "grants"]
+        all_gs = try Grants.list_all(store).map_error(Db.map_grants_error)
+        var g_act = 0
+        var g_del = 0
+        var g_rev = 0
+        for gg in all_gs
+          if gg.parent_id != None
+            g_del += 1
           end
-          try Policy.require_collection_access(auth, "read", pg.collection_id)
-          scoped_topics = scoped_topics.append("page:#{pg.id}")
-        Some(_) | None:
-          case db_scope
-            Some(did) if not did.empty?:
-              d = case try Table.get(store, Db.databases_table(), did).map_error(
-                Db.map_table_error
-              )
-                Some(def): def
-                None: return Error(Missing(entity: "database", id: did))
-              end
-              try Policy.require_collection_access(auth, "read", d.collection_id)
-              scoped_topics = scoped_topics.append("database:#{d.id}")
-            Some(_) | None:
-              case col_scope
-                Some(cid) if not cid.empty?:
-                  try Policy.require_collection_access(auth, "read", cid)
-                  scoped_topics = scoped_topics.append("collection:#{cid}")
-                Some(_) | None:
-                  cols = try Table.scan(store, Db.collections_table(), None, None, 200).map_error(
-                    Db.map_table_error
-                  )
-                  var added = 0
-                  for (_k, c) in cols
-                    if c.archived_at == None and Policy.collection_permitted?(auth, c.id) and added < 30
-                      scoped_topics = scoped_topics.append("collection:#{c.id}")
-                      added += 1
+          if gg.revoked
+            g_rev += 1
+          else if now <= gg.expires_at
+            g_act += 1
+          end
+        end
+        g_snap_opt = Some(
+          Json.Object({
+            "total_grants": Json.int(all_gs.size),
+            "active_grants": Json.int(g_act),
+            "delegated_grants": Json.int(g_del),
+            "revoked_grants": Json.int(g_rev)
+          })
+        )
+      else
+        case page_scope
+          Some(pid) if not pid.empty?:
+            pg = case try Table.get(store, Db.pages_table(), pid).map_error(Db.map_table_error)
+              Some(p) if p.archived_at == None: p
+              Some(_) | None: return Error(Missing(entity: "page", id: pid))
+            end
+            try Policy.require_collection_access(auth, "read", pg.collection_id)
+            scoped_topics = scoped_topics.append("page:#{pg.id}")
+          Some(_) | None:
+            case db_scope
+              Some(did) if not did.empty?:
+                d = case try Table.get(store, Db.databases_table(), did).map_error(
+                  Db.map_table_error
+                )
+                  Some(def): def
+                  None: return Error(Missing(entity: "database", id: did))
+                end
+                try Policy.require_collection_access(auth, "read", d.collection_id)
+                scoped_topics = scoped_topics.append("database:#{d.id}")
+              Some(_) | None:
+                case col_scope
+                  Some(cid) if not cid.empty?:
+                    try Policy.require_collection_access(auth, "read", cid)
+                    scoped_topics = scoped_topics.append("collection:#{cid}")
+                  Some(_) | None:
+                    cols = try Table.scan(store, Db.collections_table(), None, None, 200).map_error(
+                      Db.map_table_error
+                    )
+                    var added = 0
+                    for (_k, c) in cols
+                      if c.archived_at == None and Policy.collection_permitted?(auth, c.id) and added <
+                        30
+                        scoped_topics = scoped_topics.append("collection:#{c.id}")
+                        added += 1
+                      end
                     end
-                  end
-              end
-          end
+                end
+            end
+        end
       end
       audits = try Ledger.audit_tail_store(store, 50).map_error(Db.map_ledger_error)
       claims = try Claims.list_active(store, now).map_error(Db.map_claims_error)
-      Ok((scoped_topics, audits, claims))
+      Ok((scoped_topics, audits, claims, g_snap_opt))
     end
   )
 
@@ -2965,6 +3022,10 @@ fn events_stream(req: Api.Request, auth: AuthContext, rf: ReadFiles, clock: Cloc
     ),
     Sse.json_event(None, "claims.snapshot", Json.Object({"claims": active_claims.to_json}))
   ]
+  case grants_snap_opt
+    Some(gj): sse_events = sse_events.append(Sse.json_event(None, "grants.snapshot", gj))
+    None: Unit
+  end
   for e in entries
     if e.seq > cursor
       sse_events = sse_events.append(

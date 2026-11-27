@@ -1,9 +1,11 @@
 import { Link } from "@inertiajs/react";
 import {
+  Activity,
   AlertTriangle,
   Bot,
   Download,
   Flame,
+  GitBranch,
   GitCompare,
   GitPullRequest,
   History,
@@ -27,6 +29,8 @@ import type {
   DatabaseDef,
   ErasureStatusResponse,
   GardenReport,
+  GrantTreeResponse,
+  KillAllGrantsResponse,
   PurgeSecretResponse,
   ReplayProposalSummary,
   ReplayStatusResponse,
@@ -48,7 +52,14 @@ export default function AdminConsole({
   webhooks: initialWebhooks = [],
 }: AdminProps) {
   const [tab, setTab] = useState<
-    "agents" | "garden" | "importer" | "replay" | "taint" | "erasure" | "webhooks"
+    | "agents"
+    | "delegation"
+    | "garden"
+    | "importer"
+    | "replay"
+    | "taint"
+    | "erasure"
+    | "webhooks"
   >("agents");
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -107,6 +118,17 @@ export default function AdminConsole({
   const [customReason, setCustomReason] = useState("Incident response secret crypto-purge");
   const [purgeCompact, setPurgeCompact] = useState(true);
 
+  // Sub-Delegation Control Plane (Modb.Grants Hierarchy + Live SSE + Kill Switch)
+  const [grantTree, setGrantTree] = useState<GrantTreeResponse | null>(null);
+  const [grantTreeLoading, setGrantTreeLoading] = useState(false);
+  const [revokingTreeGrantId, setRevokingTreeGrantId] = useState<string | null>(null);
+  const [killAllArmed, setKillAllArmed] = useState(false);
+  const [killAllBusy, setKillAllBusy] = useState(false);
+  const [grantsSseLive, setGrantsSseLive] = useState(false);
+  const [grantEvents, setGrantEvents] = useState<
+    Array<{ id: string; event: string; detail: string; at: string }>
+  >([]);
+
   // Webhooks
   const [webhooks, setWebhooks] = useState<WebhookSubPublic[]>(initialWebhooks);
   const [whUrl, setWhUrl] = useState("");
@@ -124,8 +146,98 @@ export default function AdminConsole({
       void loadTaintStatus();
     } else if (tab === "erasure") {
       void loadErasureStatus();
+    } else if (tab === "delegation") {
+      void loadGrantTree();
+      const es = new EventSource("/api/events?scope=grants");
+      const pushEvent = (event: string, detail: string) => {
+        setGrantEvents((prev) =>
+          [
+            {
+              id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              event,
+              detail,
+              at: new Date().toLocaleTimeString(),
+            },
+            ...prev,
+          ].slice(0, 25)
+        );
+      };
+      es.addEventListener("connected", () => {
+        setGrantsSseLive(true);
+        pushEvent("connected", "Subscribed to claims + grants SSE stream");
+      });
+      es.addEventListener("grants.snapshot", (ev) => {
+        setGrantsSseLive(true);
+        pushEvent("grants.snapshot", (ev as MessageEvent<string>).data);
+      });
+      for (const name of ["grant.minted", "grant.delegated", "grant.revoked", "grants.kill_all"]) {
+        es.addEventListener(name, (ev) => {
+          pushEvent(name, (ev as MessageEvent<string>).data);
+          void loadGrantTree();
+        });
+      }
+      es.onerror = () => {
+        setGrantsSseLive(false);
+      };
+      return () => {
+        es.close();
+        setGrantsSseLive(false);
+      };
     }
   }, [tab]);
+
+  async function loadGrantTree() {
+    setGrantTreeLoading(true);
+    try {
+      const res = await apiFetch<GrantTreeResponse>("/api/admin/grants/tree");
+      setGrantTree(res);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not load Modb.Grants tree");
+    } finally {
+      setGrantTreeLoading(false);
+    }
+  }
+
+  async function handleRevokeTreeGrant(grantId: string) {
+    setRevokingTreeGrantId(grantId);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await apiFetch<{ revoked_grant_id: string; cascaded_count?: number }>(
+        `/api/admin/grants/${encodeURIComponent(grantId)}/revoke`,
+        { method: "POST", body: JSON.stringify({}) }
+      );
+      setNotice(
+        `Revoked grant subtree ${res.revoked_grant_id} (${res.cascaded_count ?? 1} grant(s) disabled).`
+      );
+      await loadGrantTree();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not revoke grant subtree");
+    } finally {
+      setRevokingTreeGrantId(null);
+    }
+  }
+
+  async function handleKillAllAgents() {
+    setKillAllBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await apiFetch<KillAllGrantsResponse>("/api/admin/grants/kill-all", {
+        method: "POST",
+        body: JSON.stringify({ reason: "Admin Console emergency kill switch" }),
+      });
+      setKillAllArmed(false);
+      setNotice(
+        `Emergency Kill Switch executed: revoked ${res.revoked_count} active agent grant(s).`
+      );
+      await loadGrantTree();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Emergency kill switch failed");
+    } finally {
+      setKillAllBusy(false);
+    }
+  }
 
   async function loadErasureStatus() {
     setErasureLoading(true);
@@ -530,6 +642,7 @@ export default function AdminConsole({
             {(
               [
                 ["agents", "Agents & Claims", Bot],
+                ["delegation", "Delegation Tree", GitBranch],
                 ["garden", "Gardening", Leaf],
                 ["importer", "Notion Importer", Upload],
                 ["replay", "Selective Undo", RotateCcw],
@@ -1889,6 +2002,249 @@ export default function AdminConsole({
                       ))}
                     </div>
                   )}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* TAB 8: SUB-DELEGATION CONTROL PLANE */}
+        {tab === "delegation" && (
+          <div className="space-y-6">
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-stone-200 bg-white p-5">
+              <div>
+                <div className="flex items-center gap-2 text-sm font-semibold text-stone-900">
+                  <GitBranch className="h-4 w-4 text-indigo-700" />
+                  Modb.Grants Sub-Delegation Control Plane
+                </div>
+                <p className="text-xs text-stone-500 mt-0.5">
+                  Attenuated parent → child delegation chains, ancestor call-budget conservation
+                  gauges, live SSE lifecycle stream, and cascading instant revocation.
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span
+                  className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 font-medium ${
+                    grantsSseLive
+                      ? "bg-emerald-100 text-emerald-800"
+                      : "bg-stone-100 text-stone-600"
+                  }`}
+                >
+                  <Activity className="h-3 w-3" />
+                  {grantsSseLive ? "Live SSE Connected" : "Connecting SSE..."}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void loadGrantTree()}
+                  disabled={grantTreeLoading}
+                  className="rounded-lg border border-stone-200 px-3 py-1.5 font-medium text-stone-700 hover:bg-stone-50 disabled:opacity-50"
+                >
+                  {grantTreeLoading ? "Refreshing..." : "Refresh Tree"}
+                </button>
+                {!killAllArmed ? (
+                  <button
+                    type="button"
+                    onClick={() => setKillAllArmed(true)}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-red-300 bg-red-50 px-3 py-1.5 font-medium text-red-800 hover:bg-red-100"
+                  >
+                    <Lock className="h-3.5 w-3.5" />
+                    Arm Emergency Kill Switch
+                  </button>
+                ) : (
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      disabled={killAllBusy}
+                      onClick={() => void handleKillAllAgents()}
+                      className="rounded-lg bg-red-700 px-3 py-1.5 font-semibold text-white hover:bg-red-800 disabled:opacity-50"
+                    >
+                      {killAllBusy ? "Revoking All..." : "Confirm Kill All Agents"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setKillAllArmed(false)}
+                      className="rounded-lg border border-stone-200 px-2.5 py-1.5 text-stone-600 hover:bg-stone-50"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {grantTree && (
+              <>
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                  <div className="rounded-2xl border border-stone-200 bg-white p-4">
+                    <div className="text-[11px] uppercase tracking-wider text-stone-500">
+                      Active Grants (Agents)
+                    </div>
+                    <div className="mt-1 text-2xl font-semibold text-stone-950">
+                      {grantTree.summary.active_grants}{" "}
+                      <span className="text-sm font-normal text-stone-500">
+                        ({grantTree.summary.active_agent_grants})
+                      </span>
+                    </div>
+                  </div>
+                  <div className="rounded-2xl border border-indigo-200 bg-indigo-50/40 p-4">
+                    <div className="text-[11px] uppercase tracking-wider text-indigo-800">
+                      Delegated Sub-Grants
+                    </div>
+                    <div className="mt-1 text-2xl font-semibold text-indigo-950">
+                      {grantTree.summary.delegated_grants}
+                    </div>
+                  </div>
+                  <div className="rounded-2xl border border-stone-200 bg-white p-4">
+                    <div className="text-[11px] uppercase tracking-wider text-stone-500">
+                      Agent Call Budget Used
+                    </div>
+                    <div className="mt-1 text-2xl font-semibold text-stone-950">
+                      {grantTree.summary.total_calls_used} / {grantTree.summary.total_call_budget}
+                    </div>
+                  </div>
+                  <div className="rounded-2xl border border-red-200 bg-red-50/40 p-4">
+                    <div className="text-[11px] uppercase tracking-wider text-red-700">
+                      Revoked / Exhausted
+                    </div>
+                    <div className="mt-1 text-2xl font-semibold text-red-900">
+                      {grantTree.summary.revoked_grants} / {grantTree.summary.exhausted_grants}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                  <div className="lg:col-span-2 rounded-2xl border border-stone-200 bg-white p-5 space-y-3">
+                    <div className="text-sm font-semibold text-stone-900">
+                      Grant Hierarchy &amp; Budget Gauges ({grantTree.grants.length})
+                    </div>
+                    {grantTree.grants.length === 0 ? (
+                      <p className="text-xs text-stone-400">No grants recorded yet.</p>
+                    ) : (
+                      <div className="space-y-2.5">
+                        {grantTree.grants.map((g) => {
+                          const isAgent = g.principal_kind === "agent";
+                          const barColor =
+                            g.utilization_pct >= 90
+                              ? "bg-rose-600"
+                              : g.utilization_pct >= 65
+                                ? "bg-amber-500"
+                                : "bg-emerald-600";
+                          return (
+                            <div
+                              key={g.id}
+                              style={{ marginLeft: `${Math.min(g.depth, 6) * 20}px` }}
+                              className="rounded-xl border border-stone-200 bg-stone-50/70 p-3.5 text-xs space-y-2"
+                            >
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  {g.depth > 0 && (
+                                    <span className="font-mono text-stone-400">└─</span>
+                                  )}
+                                  <span className="font-mono font-semibold text-stone-900">
+                                    {g.principal_handle ?? g.principal_id}
+                                  </span>
+                                  <span className="rounded bg-stone-200/80 px-1.5 py-0.5 font-mono text-[10px] text-stone-700">
+                                    {g.id}
+                                  </span>
+                                  <span
+                                    className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase ${
+                                      g.status === "active"
+                                        ? "bg-emerald-100 text-emerald-800"
+                                        : g.status === "revoked"
+                                          ? "bg-red-100 text-red-800"
+                                          : "bg-amber-100 text-amber-900"
+                                    }`}
+                                  >
+                                    {g.status}
+                                    {g.revoked_via && g.revoked_via !== g.id
+                                      ? ` via ${g.revoked_via}`
+                                      : ""}
+                                  </span>
+                                  {g.model_id && (
+                                    <span className="font-mono text-[10px] text-stone-500">
+                                      {g.model_id}
+                                    </span>
+                                  )}
+                                </div>
+                                {isAgent && g.status === "active" && (
+                                  <button
+                                    type="button"
+                                    disabled={revokingTreeGrantId === g.id}
+                                    onClick={() => void handleRevokeTreeGrant(g.id)}
+                                    className="rounded-lg border border-red-300 bg-white px-2.5 py-1 font-medium text-red-700 hover:bg-red-50 disabled:opacity-50"
+                                  >
+                                    {revokingTreeGrantId === g.id
+                                      ? "Revoking..."
+                                      : `Revoke Tree (${g.descendant_count + 1})`}
+                                  </button>
+                                )}
+                              </div>
+
+                              <div className="flex flex-wrap items-center gap-3 text-[11px] text-stone-600">
+                                <span>
+                                  Actions:{" "}
+                                  <code className="font-mono">
+                                    {g.allowed_actions.join(", ")}
+                                  </code>
+                                </span>
+                                {g.allowed_collections && (
+                                  <span>
+                                    Scopes:{" "}
+                                    <code className="font-mono">
+                                      {g.allowed_collections.join(", ")}
+                                    </code>
+                                  </span>
+                                )}
+                              </div>
+
+                              <div className="space-y-1">
+                                <div className="flex justify-between font-mono text-[11px] text-stone-600">
+                                  <span>
+                                    Call Budget: {g.used_calls} / {g.max_calls}
+                                  </span>
+                                  <span>{g.utilization_pct}%</span>
+                                </div>
+                                <div className="h-1.5 w-full rounded-full bg-stone-200 overflow-hidden">
+                                  <div
+                                    className={`h-full ${barColor}`}
+                                    style={{ width: `${g.utilization_pct}%` }}
+                                  />
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="rounded-2xl border border-stone-200 bg-white p-5 space-y-3">
+                    <div className="text-sm font-semibold text-stone-900">
+                      Live Grants SSE Feed ({grantEvents.length})
+                    </div>
+                    {grantEvents.length === 0 ? (
+                      <p className="text-xs text-stone-400">
+                        Waiting for grant lifecycle events...
+                      </p>
+                    ) : (
+                      <div className="space-y-2 max-h-96 overflow-y-auto">
+                        {grantEvents.map((ev) => (
+                          <div
+                            key={ev.id}
+                            className="rounded-lg border border-stone-100 bg-stone-50 p-2.5 text-xs space-y-0.5"
+                          >
+                            <div className="flex justify-between font-mono text-[11px] text-stone-700 font-semibold">
+                              <span>{ev.event}</span>
+                              <span className="text-stone-400 font-normal">{ev.at}</span>
+                            </div>
+                            <div className="font-mono text-[10px] text-stone-500 break-all">
+                              {ev.detail}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </div>
               </>
             )}

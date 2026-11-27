@@ -52,6 +52,8 @@ api
     post "/attachments/:id/commit" Workspace.commit_attachment
     get "/attachments/:id/download" Workspace.download_attachment
     post "/admin/agents" Workspace.mint_agent_token
+    get "/admin/grants/tree" Workspace.grants_tree
+    post "/admin/grants/kill-all" Workspace.kill_all_agent_grants
     post "/admin/grants/:id/revoke" Workspace.revoke_grant
     get "/audit" Workspace.audit_index
 

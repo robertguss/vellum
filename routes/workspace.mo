@@ -42,7 +42,9 @@ validate_meta_relations_tx,
 drain_jobs,
 erasure_status,
 purge_secret,
-download_erasure_receipt
+download_erasure_receipt,
+grants_tree,
+kill_all_agent_grants
 use Api
 use Arvo.Flash
 use Arvo.Id
@@ -70,6 +72,7 @@ use Domain.Packs{LivingSummary}
 use Domain.Policy
 use Domain.TaintBridge
 use Domain.Types{
+  AgentToken,
   AppError,
   Attachment,
   AuditFeedItem,
@@ -2458,6 +2461,13 @@ fn mint_agent_token(
     end
   )
 
+  mint_ev = Json.Object({
+    "grant_id": Json.String(grant.id),
+    "parent_grant_id": grant.parent_id.to_json,
+    "principal_handle": Json.String(principal.handle),
+    "max_calls": Json.int(grant.max_calls),
+    "actor": Json.String(auth.principal.handle)
+  })
   Ok(
     json_ok(
       201,
@@ -2468,11 +2478,11 @@ fn mint_agent_token(
         "token_id": Json.String(tok.id),
         "token_prefix": Json.String(tok.prefix)
       })
-    )
+    ).with_sse_publish_json("grants", "grant.minted", mint_ev)
   )
 end
 
-## `POST /api/admin/grants/:id/revoke` — Cascades revocation across a `Modb.Grants` subtree.
+## `POST /api/admin/grants/:id/revoke` — Cascades revocation across a `Modb.Grants` subtree and revokes bound agent tokens.
 fn revoke_grant(req: Api.Request, id: Text, auth: AuthContext, files: Files, clock: Clock) : Result(
   Api.Response,
   AppError
@@ -2494,7 +2504,7 @@ fn revoke_grant(req: Api.Request, id: Text, auth: AuthContext, files: Files, clo
   )
   audit_payload = Json.Object({"grant_id": Json.String(id)})
 
-  revoked = try Ledger.transact_locked(
+  (revoked, subtree_ids) = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -2502,13 +2512,398 @@ fn revoke_grant(req: Api.Request, id: Text, auth: AuthContext, files: Files, clo
     "revoked grant #{id}",
     audit_payload,
     Db.map_ledger_error,
-    fn(tx) Grants.tx_revoke(tx, id).map_error(Db.map_grants_error) end
+    fn(tx)
+      all_g_rows = try Table.tx_scan(tx, Grants.grants_table(), None, None, 500).map_error(
+        Db.map_table_error
+      )
+      var sub_ids = [id]
+      var q_idx = 0
+      while q_idx < sub_ids.size
+        cur_gid = sub_ids.get(q_idx) or stop "subtree bfs idx"
+        q_idx += 1
+        for (_gid, g) in all_g_rows
+          if g.parent_id == Some(cur_gid) and not sub_ids.contains?(g.id)
+            sub_ids = sub_ids.append(g.id)
+          end
+        end
+      end
+      (t1, rev_g) = try Grants.tx_revoke(tx, id).map_error(Db.map_grants_error)
+      var cur = t1
+      tok_rows = try Table.tx_scan(cur, Db.agent_tokens_table(), None, None, 500).map_error(
+        Db.map_table_error
+      )
+      for (_tid, tok) in tok_rows
+        if sub_ids.contains?(tok.grant_id) and tok.revoked_at == None
+          upd_tok = AgentToken(
+            id: tok.id,
+            principal_id: tok.principal_id,
+            grant_id: tok.grant_id,
+            label: tok.label,
+            prefix: tok.prefix,
+            token_hash: tok.token_hash,
+            created_by: tok.created_by,
+            expires_at: tok.expires_at,
+            revoked_at: Some(now),
+            last_used_at: tok.last_used_at
+          )
+          cur = try Table.put(cur, Db.agent_tokens_table(), upd_tok.id, upd_tok).map_error(
+            Db.map_table_error
+          )
+        end
+      end
+      Ok((cur, (rev_g, sub_ids)))
+    end
   )
+  rev_ev = Json.Object({
+    "grant_id": Json.String(revoked.id),
+    "affected_grant_ids": subtree_ids.to_json,
+    "cascaded_count": Json.int(subtree_ids.size),
+    "actor": Json.String(auth.principal.handle)
+  })
   Ok(
     json_ok(
       200,
-      Json.Object({"revoked_grant_id": Json.String(revoked.id), "revoked": Json.Boolean(true)})
+      Json.Object({
+        "revoked_grant_id": Json.String(revoked.id),
+        "revoked": Json.Boolean(true),
+        "affected_grant_ids": subtree_ids.to_json,
+        "cascaded_count": Json.int(subtree_ids.size)
+      })
+    ).with_sse_publish_json("grants", "grant.revoked", rev_ev)
+  )
+end
+
+fn grant_ancestor_path(grants_by_id: Map(Text, Grants.Grant), g: Grants.Grant) : List(Text)
+  var path = [g.id]
+  var cur_opt = g.parent_id
+  while true
+    case cur_opt
+      None: break
+      Some(pid):
+        break if path.contains?(pid)
+        path = [pid].concat(path)
+        cur_opt = case grants_by_id.get(pid)
+          Some(pg): pg.parent_id
+          None: None
+        end
+    end
+  end
+  path
+end
+
+## `GET /api/admin/grants/tree` — Returns the full `Modb.Grants` sub-delegation hierarchy,
+## cascading revocation/expiry status, call-budget utilization gauges, and token metadata.
+fn grants_tree(auth: AuthContext, rf: ReadFiles, clock: Clock) : Result(Api.Response, AppError)
+  role_ok = auth.principal.role == Owner or auth.principal.role == Admin
+  if not role_ok
+    return Error(Forbidden(reason: "only Owner/Admin may inspect the Modb.Grants hierarchy"))
+  end
+  if not rf.exists?(Db.ledger_db_path)
+    return Ok(
+      json_ok(
+        200,
+        Json.Object({
+          "summary": Json.Object({
+            "total_grants": Json.int(0),
+            "active_grants": Json.int(0),
+            "active_agent_grants": Json.int(0),
+            "delegated_grants": Json.int(0),
+            "revoked_grants": Json.int(0),
+            "expired_grants": Json.int(0),
+            "exhausted_grants": Json.int(0),
+            "total_calls_used": Json.int(0),
+            "total_call_budget": Json.int(0)
+          }),
+          "grants": Json.Array([])
+        })
+      )
     )
+  end
+
+  now = clock.now
+  payload = try Ledger.read_locked(
+    rf,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      all_grants = try Grants.list_all(store).map_error(Db.map_grants_error)
+      p_rows = try Table.scan(store, Db.principals_table(), None, None, 500).map_error(
+        Db.map_table_error
+      )
+      t_rows = try Table.scan(store, Db.agent_tokens_table(), None, None, 500).map_error(
+        Db.map_table_error
+      )
+
+      var grants_by_id = {}
+      for g in all_grants
+        grants_by_id = grants_by_id.set(g.id, g)
+      end
+      var principals_by_id = {}
+      for (pid, p) in p_rows
+        principals_by_id = principals_by_id.set(pid, p)
+      end
+      var tokens_by_grant = {}
+      for (_tid, tok) in t_rows
+        tokens_by_grant = tokens_by_grant.set(tok.grant_id, tok)
+      end
+
+      sorted_grants = all_grants.sort_by(fn(g) grant_ancestor_path(grants_by_id, g).join("/") end)
+      var total_active = 0
+      var total_active_agent = 0
+      var total_delegated = 0
+      var total_revoked = 0
+      var total_expired = 0
+      var total_exhausted = 0
+      var total_used = 0
+      var total_budget = 0
+      var nodes_json = []
+
+      for g in sorted_grants
+        anc_path = grant_ancestor_path(grants_by_id, g)
+        var rev_via = None
+        var expired? = now > g.expires_at
+        for anc_id in anc_path
+          case grants_by_id.get(anc_id)
+            Some(anc):
+              if anc.revoked and rev_via == None
+                rev_via = Some(anc.id)
+              end
+              if now > anc.expires_at
+                expired? = true
+              end
+            None: Unit
+          end
+        end
+        eff_revoked? = rev_via != None
+        exhausted? = g.max_calls > 0 and g.used_calls >= g.max_calls
+        status = if eff_revoked?
+          "revoked"
+        else if expired?
+          "expired"
+        else if exhausted?
+          "exhausted"
+        else
+          "active"
+        end
+        depth = if anc_path.size > 0: anc_path.size - 1 else: 0
+        sub_set = try Grants.grant_subtree_ids(store, g.id).map_error(Db.map_grants_error)
+        desc_cnt = if sub_set.size > 0: sub_set.size - 1 else: 0
+        util_pct = if g.max_calls > 0
+          raw_pct = (g.used_calls * 100) / g.max_calls
+          if raw_pct > 100: 100 else: raw_pct
+        else
+          0
+        end
+
+        p_opt = principals_by_id.get(g.principal)
+        t_opt = tokens_by_grant.get(g.id)
+        is_agent? = case p_opt
+          Some(p): p.kind == Agent
+          None: false
+        end
+
+        if g.parent_id != None
+          total_delegated += 1
+        end
+        if status == "active"
+          total_active += 1
+          if is_agent?
+            total_active_agent += 1
+          end
+        else if status == "revoked"
+          total_revoked += 1
+        else if status == "expired"
+          total_expired += 1
+        else
+          total_exhausted += 1
+        end
+        if is_agent?
+          total_used += g.used_calls
+          total_budget += g.max_calls
+        end
+
+        nodes_json = nodes_json.append(
+          Json.Object({
+            "id": Json.String(g.id),
+            "parent_id": g.parent_id.to_json,
+            "principal_id": Json.String(g.principal),
+            "principal_handle": p_opt.map(fn(p) p.handle end).to_json,
+            "principal_name": p_opt.map(fn(p) p.display_name end).to_json,
+            "principal_kind": p_opt.map(fn(p) p.kind end).to_json,
+            "model_id": case p_opt
+              Some(p): p.model_id.to_json
+              None: Json.Null
+            end,
+            "role": p_opt.map(fn(p) p.role end).to_json,
+            "allowed_actions": g.allowed_actions.to_json,
+            "allowed_collections": g.allowed_views.to_json,
+            "max_calls": Json.int(g.max_calls),
+            "used_calls": Json.int(g.used_calls),
+            "utilization_pct": Json.int(util_pct),
+            "expires_at": g.expires_at.to_json,
+            "revoked": Json.Boolean(eff_revoked?),
+            "revoked_directly": Json.Boolean(g.revoked),
+            "revoked_via": rev_via.to_json,
+            "status": Json.String(status),
+            "depth": Json.int(depth),
+            "descendant_count": Json.int(desc_cnt),
+            "chain": g.chain.to_json,
+            "token_prefix": t_opt.map(fn(t) t.prefix end).to_json,
+            "token_label": t_opt.map(fn(t) t.label end).to_json,
+            "last_used_at": case t_opt
+              Some(t): t.last_used_at.to_json
+              None: Json.Null
+            end
+          })
+        )
+      end
+
+      Ok(
+        Json.Object({
+          "summary": Json.Object({
+            "total_grants": Json.int(sorted_grants.size),
+            "active_grants": Json.int(total_active),
+            "active_agent_grants": Json.int(total_active_agent),
+            "delegated_grants": Json.int(total_delegated),
+            "revoked_grants": Json.int(total_revoked),
+            "expired_grants": Json.int(total_expired),
+            "exhausted_grants": Json.int(total_exhausted),
+            "total_calls_used": Json.int(total_used),
+            "total_call_budget": Json.int(total_budget)
+          }),
+          "grants": Json.Array(nodes_json)
+        })
+      )
+    end
+  )
+  Ok(json_ok(200, payload))
+end
+
+## `POST /api/admin/grants/kill-all` — Emergency kill switch revoking every active Agent `Modb.Grants`
+## and Bearer token atomically while preserving Human Owner/Admin sessions.
+fn kill_all_agent_grants(
+  req: Api.Request,
+  auth: AuthContext,
+  files: Files,
+  clock: Clock
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  role_ok = auth.principal.role == Owner or auth.principal.role == Admin
+  if not role_ok or not Policy.action_permitted?(auth, "manage_grants")
+    return Error(
+      Forbidden(reason: "only Owner/Admin with manage_grants may trigger the agent kill switch")
+    )
+  end
+  raw_reason = if req.body.empty?
+    ""
+  else
+    case Json.parse(req.text or "")
+      Ok(j): (j.text_at("reason") or "").trim
+      Error(_): ""
+    end
+  end
+  clean_reason = if raw_reason.empty?
+    "Emergency kill switch: revoke all active agent grants"
+  else
+    raw_reason
+  end
+
+  if not files.read_only.exists?(Db.ledger_db_path)
+    return Ok(
+      json_ok(
+        200,
+        Json.Object({
+          "revoked_count": Json.int(0),
+          "revoked_grant_ids": Json.Array([]),
+          "reason": Json.String(clean_reason)
+        })
+      )
+    )
+  end
+
+  now = clock.now
+  meta = Ledger.WriteMeta(
+    principal: auth.principal.handle,
+    action: "admin.kill_all_agents",
+    reason: clean_reason,
+    at: now
+  )
+  revoked_ids = try Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    meta,
+    "emergency kill-all agent grants",
+    Json.Object({"reason": Json.String(clean_reason)}),
+    Db.map_ledger_error,
+    fn(tx)
+      p_rows = try Table.tx_scan(tx, Db.principals_table(), None, None, 500).map_error(
+        Db.map_table_error
+      )
+      var agent_pids = Set.empty
+      for (pid, p) in p_rows
+        if p.kind == Agent
+          agent_pids = agent_pids.add(pid)
+        end
+      end
+
+      var cur = tx
+      var revoked_ids = []
+      g_rows = try Table.tx_scan(cur, Grants.grants_table(), None, None, 500).map_error(
+        Db.map_table_error
+      )
+      for (_gid, g) in g_rows
+        if not g.revoked and agent_pids.has?(g.principal)
+          (next_tx, rev_g) = try Grants.tx_revoke(cur, g.id).map_error(Db.map_grants_error)
+          cur = next_tx
+          revoked_ids = revoked_ids.append(rev_g.id)
+        end
+      end
+
+      tok_rows = try Table.tx_scan(cur, Db.agent_tokens_table(), None, None, 500).map_error(
+        Db.map_table_error
+      )
+      for (_tid, tok) in tok_rows
+        if tok.revoked_at == None and
+          (revoked_ids.contains?(tok.grant_id) or agent_pids.has?(tok.principal_id))
+          upd_tok = AgentToken(
+            id: tok.id,
+            principal_id: tok.principal_id,
+            grant_id: tok.grant_id,
+            label: tok.label,
+            prefix: tok.prefix,
+            token_hash: tok.token_hash,
+            created_by: tok.created_by,
+            expires_at: tok.expires_at,
+            revoked_at: Some(now),
+            last_used_at: tok.last_used_at
+          )
+          cur = try Table.put(cur, Db.agent_tokens_table(), upd_tok.id, upd_tok).map_error(
+            Db.map_table_error
+          )
+        end
+      end
+      Ok((cur, revoked_ids))
+    end
+  )
+
+  kill_ev = Json.Object({
+    "revoked_grant_ids": revoked_ids.to_json,
+    "revoked_count": Json.int(revoked_ids.size),
+    "actor": Json.String(auth.principal.handle),
+    "reason": Json.String(clean_reason)
+  })
+  Ok(
+    json_ok(
+      200,
+      Json.Object({
+        "revoked_count": Json.int(revoked_ids.size),
+        "revoked_grant_ids": revoked_ids.to_json,
+        "reason": Json.String(clean_reason)
+      })
+    ).with_sse_publish_json("grants", "grants.kill_all", kill_ev)
   )
 end
 

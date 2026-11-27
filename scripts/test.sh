@@ -61,7 +61,8 @@ mo check tests/stages13.mo
 mo check tests/stages45.mo
 mo check tests/phase1.mo
 mo check tests/phase2.mo
-mo check tests/phase3.mo
+mo check tests/phase3a.mo
+mo check tests/phase3b.mo
 mo check tests/phase4.mo
 
 mo test domain/blocks.mo
@@ -82,7 +83,8 @@ mo test tests/stages13.mo
 mo test tests/stages45.mo
 mo test tests/phase1.mo
 mo test tests/phase2.mo
-mo test tests/phase3.mo
+mo test tests/phase3a.mo
+mo test tests/phase3b.mo
 mo test tests/phase4.mo
 
 echo "All Vellum Stage 1-5 checks, frontend build checks, and tests passed."

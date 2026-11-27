@@ -2697,6 +2697,96 @@ const dlRcptJson = await dlRcptRes.json();
 assert.equal(dlRcptJson.receipt?.id, liveRcptId);
 assert.equal(dlRcptJson.receipt?.compacted, true);
 console.log("✓ Live Phase 4.2 One-Click Modb.Erasure Secret Purge & Downloadable Receipt verified");
+
+// 18. Live Phase 4.3 Sub-Delegation Control Plane (Modb.Grants Tree, Live SSE & Kill Switch)
+const grantsSse = await openLiveSse("/api/events?scope=grants");
+await grantsSse.waitFor((e) => e.event === "connected");
+await grantsSse.waitFor((e) => e.event === "grants.snapshot");
+
+const rootMint = await apiJson("/api/admin/agents", {
+  method: "POST",
+  body: JSON.stringify({
+    handle: "live-p43-root",
+    display_name: "Live P43 Root",
+    model_id: "claude-sonnet-4-6",
+    label: "live-p43-root",
+    allowed_actions: ["read", "propose", "delegate"],
+    allowed_collections: [taintColId],
+    max_calls: 20,
+    ttl_days: 7,
+  }),
+});
+assert.equal(rootMint.res.status, 201, rootMint.text);
+const rootTok = rootMint.json.raw_token;
+const rootGrantId = rootMint.json.grant.id;
+await grantsSse.waitFor((e) => e.event === "grant.minted");
+
+const childDel = await rawFetch(`${BASE}/api/grants/delegate`, {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${rootTok}`,
+  },
+  body: JSON.stringify({
+    handle: "live-p43-child",
+    display_name: "Live P43 Child",
+    model_id: "claude-haiku-4-5",
+    label: "live-p43-child",
+    allowed_actions: ["read", "propose"],
+    allowed_collections: [taintColId],
+    max_calls: 6,
+    ttl_days: 2,
+  }),
+});
+assert.equal(childDel.status, 201);
+const childDelJson = await childDel.json();
+const childTok = childDelJson.raw_token;
+const childGrantId = childDelJson.grant.id;
+await grantsSse.waitFor((e) => e.event === "grant.delegated");
+
+const liveTreeRes = await apiJson("/api/admin/grants/tree");
+assert.equal(liveTreeRes.res.status, 200, liveTreeRes.text);
+assert.ok(
+  (liveTreeRes.json.grants ?? []).some(
+    (g) => g.id === rootGrantId && g.descendant_count >= 1
+  )
+);
+assert.ok(
+  (liveTreeRes.json.grants ?? []).some(
+    (g) => g.id === childGrantId && g.parent_id === rootGrantId && g.status === "active"
+  )
+);
+
+const revChildRes = await apiJson(`/api/admin/grants/${encodeURIComponent(childGrantId)}/revoke`, {
+  method: "POST",
+  body: "{}",
+});
+assert.equal(revChildRes.res.status, 200, revChildRes.text);
+await grantsSse.waitFor((e) => e.event === "grant.revoked");
+
+const deniedChildPage = await rawFetch(`${BASE}/api/pages/${cleanPgId}`, {
+  headers: { Authorization: `Bearer ${childTok}`, Accept: "application/json" },
+});
+assert.ok([401, 403].includes(deniedChildPage.status));
+
+const killAllRes = await apiJson("/api/admin/grants/kill-all", {
+  method: "POST",
+  body: JSON.stringify({ reason: "Live E2E emergency kill switch check" }),
+});
+assert.equal(killAllRes.res.status, 200, killAllRes.text);
+assert.ok((killAllRes.json.revoked_count ?? 0) >= 1);
+await grantsSse.waitFor((e) => e.event === "grants.kill_all");
+
+const deniedRootPage = await rawFetch(`${BASE}/api/pages/${cleanPgId}`, {
+  headers: { Authorization: `Bearer ${rootTok}`, Accept: "application/json" },
+});
+assert.ok([401, 403].includes(deniedRootPage.status));
+
+const finalLiveTree = await apiJson("/api/admin/grants/tree");
+assert.equal(finalLiveTree.res.status, 200, finalLiveTree.text);
+assert.equal(finalLiveTree.json.summary?.active_agent_grants, 0);
+grantsSse.close();
+console.log("✓ Live Phase 4.3 Sub-Delegation Control Plane (Modb.Grants Tree, Live SSE & Kill Switch) verified");
 EOF
 
 echo "All Live Vellum E2E checks against mo serve + Dex + VersityGW S3 passed."
