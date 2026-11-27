@@ -214,7 +214,13 @@ fn build_page_summary(
       DatabaseViewEmbed(database_id: _, view_id: _): embeds += 1
       Paragraph | BulletListItem | OrderedListItem(start: _) | Quote | Callout(tone: _, icon: _) | CodeBlock(
         language: _
-      ) | Divider | Image(attachment_id: _, caption: _) | FileEmbed(attachment_id: _, filename: _) | PageLink(
+      ) | Divider | TableBlock(has_header: _) | Toggle(
+        summary: _,
+        open: _
+      ) | TableOfContents | Image(attachment_id: _, caption: _) | FileEmbed(
+        attachment_id: _,
+        filename: _
+      ) | PageLink(
         target_page_id: _
       ) | AiBrief(prompt: _, source_scope: _, refreshed_at: _): Unit
     end

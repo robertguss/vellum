@@ -2787,6 +2787,71 @@ assert.equal(finalLiveTree.res.status, 200, finalLiveTree.text);
 assert.equal(finalLiveTree.json.summary?.active_agent_grants, 0);
 grantsSse.close();
 console.log("✓ Live Phase 4.3 Sub-Delegation Control Plane (Modb.Grants Tree, Live SSE & Kill Switch) verified");
+
+// 19. Live v3 Milestone 1 Slice 1.1: Native Table, H4, Toggle, TOC & 500 MiB Attachment Presign Limit
+const m11PageRes = await apiJson("/api/pages", {
+  method: "POST",
+  body: JSON.stringify({
+    collection_id: colId,
+    title: "Live M1.1 Block Parity",
+    markdown: [
+      "<!-- toc -->",
+      "",
+      "#### Live Quarter Section",
+      "",
+      "| Service | Latency | Owner |",
+      "| --- | --- | --- |",
+      "| LiveGridZephyr | 85ms | Platform |",
+      "",
+      "<details>",
+      "<summary>Live M1.1 Toggle</summary>",
+      "Inner ToggleTokenBoreal body.",
+      "</details>",
+    ].join("\n"),
+    reason: "verify M1.1 block parity live",
+  }),
+});
+assert.equal(m11PageRes.res.status, 201, m11PageRes.text);
+const m11PgId = m11PageRes.json.page.id;
+const m11Blks = m11PageRes.json.blocks ?? [];
+assert.equal(m11Blks.length, 4);
+assert.equal(m11Blks[0].kind, "table_of_contents");
+assert.equal(m11Blks[1].kind?.heading?.level, 4);
+assert.equal(m11Blks[2].kind?.table_block?.has_header, true);
+assert.equal(m11Blks[3].kind?.toggle?.summary, "Live M1.1 Toggle");
+
+const tblSearchRes = await apiJson("/api/search?q=LiveGridZephyr&mode=bm25");
+assert.equal(tblSearchRes.res.status, 200, tblSearchRes.text);
+assert.ok((tblSearchRes.json.results ?? []).some((r) => r.page_id === m11PgId));
+
+const togSearchRes = await apiJson("/api/search?q=ToggleTokenBoreal&mode=bm25");
+assert.equal(togSearchRes.res.status, 200, togSearchRes.text);
+assert.ok((togSearchRes.json.results ?? []).some((r) => r.page_id === m11PgId));
+
+const bigPresignOk = await apiJson("/api/attachments/presign", {
+  method: "POST",
+  body: JSON.stringify({
+    page_id: m11PgId,
+    filename: "recording-220m.mp4",
+    content_type: "video/mp4",
+    size_bytes: 230686720,
+    sha256_hex: null,
+  }),
+});
+assert.equal(bigPresignOk.res.status, 201, bigPresignOk.text);
+
+const hugePresignErr = await apiJson("/api/attachments/presign", {
+  method: "POST",
+  body: JSON.stringify({
+    page_id: m11PgId,
+    filename: "too-large.mp4",
+    content_type: "video/mp4",
+    size_bytes: 530000000,
+    sha256_hex: null,
+  }),
+});
+assert.equal(hugePresignErr.res.status, 422);
+console.log("✓ Live v3 M1.1 Native Table, H4, Toggle, TOC & 500 MiB Attachment Presign verified");
 EOF
 
 echo "All Live Vellum E2E checks against mo serve + Dex + VersityGW S3 passed."

@@ -52,6 +52,7 @@ function formatBlockKind(kind: BlockKind | null): string {
     if (kind === "bullet_list_item") return "Bullet";
     if (kind === "quote") return "Quote";
     if (kind === "divider") return "Divider";
+    if (kind === "table_of_contents") return "TOC";
     return kind;
   }
   if ("heading" in kind) return `H${kind.heading.level}`;
@@ -59,6 +60,8 @@ function formatBlockKind(kind: BlockKind | null): string {
   if ("task_item" in kind) return kind.task_item.checked ? "Task [x]" : "Task [ ]";
   if ("callout" in kind) return `Callout (${kind.callout.tone})`;
   if ("code_block" in kind) return `Code (${kind.code_block.language || "text"})`;
+  if ("table_block" in kind) return "Table";
+  if ("toggle" in kind) return `Toggle (${kind.toggle.summary})`;
   if ("image" in kind) return "Image";
   if ("file_embed" in kind) return "File";
   if ("page_link" in kind) return "Page Link";

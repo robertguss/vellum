@@ -175,6 +175,9 @@ enum BlockKind
   Callout(tone: Text, icon: Option(Text))
   CodeBlock(language: Text)
   Divider
+  TableBlock(has_header: Bool)
+  Toggle(summary: Text, open: Bool)
+  TableOfContents
   Image(attachment_id: Text, caption: Text)
   FileEmbed(attachment_id: Text, filename: Text)
   PageLink(target_page_id: Text)

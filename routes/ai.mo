@@ -891,7 +891,9 @@ fn scan_garden_report(store: Store, auth_opt: Option(AuthContext), now: Time) : 
             end
           Paragraph | Heading(level: _) | BulletListItem | OrderedListItem(start: _) | TaskItem(
             checked: _
-          ) | Quote | Callout(tone: _, icon: _) | CodeBlock(language: _) | Divider | Image(
+          ) | Quote | Callout(tone: _, icon: _) | CodeBlock(language: _) | Divider | TableBlock(
+            has_header: _
+          ) | Toggle(summary: _, open: _) | TableOfContents | Image(
             attachment_id: _,
             caption: _
           ) | FileEmbed(attachment_id: _, filename: _) | DatabaseViewEmbed(
@@ -1370,7 +1372,9 @@ fn refresh_ai_brief(
         AiBrief(prompt: pr, source_scope: sc, refreshed_at: _): (pr, sc)
         Paragraph | Heading(level: _) | BulletListItem | OrderedListItem(start: _) | TaskItem(
           checked: _
-        ) | Quote | Callout(tone: _, icon: _) | CodeBlock(language: _) | Divider | Image(
+        ) | Quote | Callout(tone: _, icon: _) | CodeBlock(language: _) | Divider | TableBlock(
+          has_header: _
+        ) | Toggle(summary: _, open: _) | TableOfContents | Image(
           attachment_id: _,
           caption: _
         ) | FileEmbed(attachment_id: _, filename: _) | PageLink(target_page_id: _) | DatabaseViewEmbed(

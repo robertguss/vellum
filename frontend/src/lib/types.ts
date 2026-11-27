@@ -100,6 +100,9 @@ export type BlockKind =
   | { callout: { tone: string; icon: string | null } }
   | { code_block: { language: string } }
   | "divider"
+  | { table_block: { has_header: boolean } }
+  | { toggle: { summary: string; open: boolean } }
+  | "table_of_contents"
   | { image: { attachment_id: string; caption: string } }
   | { file_embed: { attachment_id: string; filename: string } }
   | { page_link: { target_page_id: string } }

@@ -10,20 +10,26 @@ import {
   Bot,
   Calculator,
   Check,
+  ChevronDown,
+  ChevronRight,
   Code,
   Database as DbIcon,
+  Download,
   FileText,
+  Film,
   GitPullRequest,
   GripVertical,
   Info,
   Italic,
   Lightbulb,
+  ListTree,
   Lock,
   Plus,
   RefreshCw,
   Save,
   ShieldAlert,
   Sparkles,
+  Table as TableIcon,
   Trash2,
   User,
 } from "lucide-react";
@@ -72,12 +78,15 @@ function blockKindOptionValue(kind: BlockKind): string {
   if (kind === "bullet_list_item") return "bullet_list_item";
   if (kind === "quote") return "quote";
   if (kind === "divider") return "divider";
+  if (kind === "table_of_contents") return "table_of_contents";
   if (typeof kind === "object" && "heading" in kind) {
-    return `h${kind.heading.level}`;
+    return `h${Math.min(6, Math.max(1, kind.heading.level))}`;
   }
   if (typeof kind === "object" && "callout" in kind) return "callout";
   if (typeof kind === "object" && "code_block" in kind) return "code_block";
   if (typeof kind === "object" && "task_item" in kind) return "task_item";
+  if (typeof kind === "object" && "table_block" in kind) return "table_block";
+  if (typeof kind === "object" && "toggle" in kind) return "toggle";
   if (typeof kind === "object" && "database_view_embed" in kind) return "database_view_embed";
   if (typeof kind === "object" && "ai_brief" in kind) return "ai_brief";
   return "paragraph";
@@ -91,6 +100,12 @@ function optionValueToBlockKind(val: string): BlockKind {
       return { heading: { level: 2 } };
     case "h3":
       return { heading: { level: 3 } };
+    case "h4":
+      return { heading: { level: 4 } };
+    case "h5":
+      return { heading: { level: 5 } };
+    case "h6":
+      return { heading: { level: 6 } };
     case "bullet_list_item":
       return "bullet_list_item";
     case "quote":
@@ -101,11 +116,51 @@ function optionValueToBlockKind(val: string): BlockKind {
       return { task_item: { checked: false } };
     case "code_block":
       return { code_block: { language: "mo" } };
+    case "table_block":
+      return { table_block: { has_header: true } };
+    case "toggle":
+      return { toggle: { summary: "Toggle details", open: false } };
+    case "table_of_contents":
+      return "table_of_contents";
     case "divider":
       return "divider";
     default:
       return "paragraph";
   }
+}
+
+function parseGfmTable(markdown: string): { headers: string[]; rows: string[][] } {
+  const rawLines = markdown
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.startsWith("|"));
+  const parseCells = (line: string) =>
+    line
+      .replace(/^\|/, "")
+      .replace(/\|$/, "")
+      .split("|")
+      .map((c) => c.trim());
+  const isSep = (line: string) => {
+    const t = line.trim();
+    return t.includes("|") && t.includes("-") && /^[|\-:\s]+$/.test(t);
+  };
+  if (rawLines.length === 0) {
+    return { headers: ["Column 1", "Column 2"], rows: [["", ""]] };
+  }
+  const headers = parseCells(rawLines[0]);
+  const startRow = rawLines.length > 1 && isSep(rawLines[1]) ? 2 : 1;
+  const rows = rawLines.slice(startRow).map(parseCells);
+  return { headers, rows };
+}
+
+function serializeGfmTable(headers: string[], rows: string[][]): string {
+  const colCount = Math.max(1, headers.length);
+  const pad = (cells: string[]) =>
+    Array.from({ length: colCount }, (_, i) => (cells[i] ?? "").replace(/\|/g, "\\|").trim());
+  const hdrLine = `| ${pad(headers).join(" | ")} |`;
+  const sepLine = `| ${Array.from({ length: colCount }, () => "---").join(" | ")} |`;
+  const bodyLines = rows.map((r) => `| ${pad(r).join(" | ")} |`);
+  return [hdrLine, sepLine, ...bodyLines].join("\n");
 }
 
 function isSafeLinkHref(href: string): boolean {
@@ -297,6 +352,13 @@ function getCalloutPalette(toneRaw: string) {
       Icon: Lightbulb,
     };
   }
+  if (tone === "transcription") {
+    return {
+      container: "border-l-4 border-indigo-500 bg-indigo-50/70 text-indigo-950",
+      title: "text-indigo-900",
+      Icon: FileText,
+    };
+  }
   return {
     container: "border-l-4 border-blue-500 bg-blue-50/75 text-blue-950",
     title: "text-blue-900",
@@ -336,8 +398,135 @@ function CalloutBox({
   );
 }
 
+function TogglePreview({
+  summary,
+  initialOpen,
+  markdown,
+  resolvedMetrics,
+  onInspectBlock,
+}: {
+  summary: string;
+  initialOpen: boolean;
+  markdown: string;
+  resolvedMetrics: Record<string, ResolvedMetric>;
+  onInspectBlock?: (blockId: string) => void;
+}) {
+  const [open, setOpen] = useState(initialOpen);
+  return (
+    <div className="rounded-xl border border-stone-200 bg-stone-50/60 overflow-hidden">
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          setOpen((v) => !v);
+        }}
+        className="w-full flex items-center gap-2 px-3.5 py-2.5 text-left text-sm font-medium text-stone-900 hover:bg-stone-100/80 transition"
+      >
+        {open ? (
+          <ChevronDown className="h-4 w-4 text-stone-500 shrink-0" />
+        ) : (
+          <ChevronRight className="h-4 w-4 text-stone-500 shrink-0" />
+        )}
+        <span className="flex-1">{summary || "Toggle section"}</span>
+      </button>
+      {open && (
+        <div className="border-t border-stone-200/80 bg-white px-4 py-3 text-sm leading-relaxed text-stone-800 whitespace-pre-wrap">
+          {markdown.trim()
+            ? renderInlineMarkdown(markdown, resolvedMetrics, onInspectBlock)
+            : "Empty toggle body."}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TableGridEditor({
+  markdown,
+  onChange,
+}: {
+  markdown: string;
+  onChange: (nextMd: string) => void;
+}) {
+  const parsed = parseGfmTable(markdown);
+  const { headers, rows } = parsed;
+
+  return (
+    <div className="rounded-xl border border-blue-200 bg-white p-3 space-y-2 shadow-2xs overflow-x-auto">
+      <table className="w-full border-collapse text-xs">
+        <thead>
+          <tr className="bg-stone-50">
+            {headers.map((h, ci) => (
+              <th key={ci} className="border border-stone-200 p-1">
+                <input
+                  type="text"
+                  value={h}
+                  onChange={(e) => {
+                    const nextHdrs = headers.map((v, idx) => (idx === ci ? e.target.value : v));
+                    onChange(serializeGfmTable(nextHdrs, rows));
+                  }}
+                  className="w-full bg-transparent px-1.5 py-1 font-semibold text-stone-900 outline-none focus:bg-blue-50/40"
+                />
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r, ri) => (
+            <tr key={ri}>
+              {headers.map((_, ci) => (
+                <td key={ci} className="border border-stone-200 p-1">
+                  <input
+                    type="text"
+                    value={r[ci] ?? ""}
+                    onChange={(e) => {
+                      const nextRows = rows.map((row, rIdx) => {
+                        if (rIdx !== ri) return row;
+                        const copy = Array.from({ length: headers.length }, (_, idx) => row[idx] ?? "");
+                        copy[ci] = e.target.value;
+                        return copy;
+                      });
+                      onChange(serializeGfmTable(headers, nextRows));
+                    }}
+                    className="w-full bg-transparent px-1.5 py-1 text-stone-800 outline-none focus:bg-blue-50/40"
+                  />
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="flex items-center gap-2 text-[11px]">
+        <button
+          type="button"
+          onClick={() =>
+            onChange(serializeGfmTable(headers, [...rows, Array(headers.length).fill("")]))
+          }
+          className="rounded border border-stone-200 bg-stone-50 px-2 py-0.5 font-medium text-stone-700 hover:bg-stone-100"
+        >
+          + Row
+        </button>
+        <button
+          type="button"
+          onClick={() =>
+            onChange(
+              serializeGfmTable(
+                [...headers, `Column ${headers.length + 1}`],
+                rows.map((r) => [...r, ""])
+              )
+            )
+          }
+          className="rounded border border-stone-200 bg-stone-50 px-2 py-0.5 font-medium text-stone-700 hover:bg-stone-100"
+        >
+          + Column
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function RenderedBlockBody({
   block,
+  allBlocks = [],
   saving,
   databases,
   principals,
@@ -350,6 +539,7 @@ function RenderedBlockBody({
   onMetricInvalidated,
 }: {
   block: Block;
+  allBlocks?: Block[];
   saving: boolean;
   databases: DatabaseDef[];
   principals: PrincipalSummary[];
@@ -407,21 +597,113 @@ function RenderedBlockBody({
     );
   }
 
+  if (typeof kind === "object" && "table_block" in kind) {
+    const parsed = parseGfmTable(markdown);
+    return (
+      <div className="overflow-x-auto rounded-xl border border-stone-200 bg-white">
+        <table className="w-full border-collapse text-left text-xs">
+          {kind.table_block.has_header && (
+            <thead className="bg-stone-50 text-stone-700 border-b border-stone-200">
+              <tr>
+                {parsed.headers.map((h, idx) => (
+                  <th key={idx} className="px-3 py-2 font-semibold border-r last:border-r-0 border-stone-200">
+                    {renderInlineMarkdown(h, resolvedMetrics, onInspectBlock)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+          )}
+          <tbody className="divide-y divide-stone-100">
+            {parsed.rows.map((r, rIdx) => (
+              <tr key={rIdx} className="hover:bg-stone-50/70">
+                {parsed.headers.map((_, cIdx) => (
+                  <td
+                    key={cIdx}
+                    className="px-3 py-2 text-stone-800 border-r last:border-r-0 border-stone-100 align-top"
+                  >
+                    {renderInlineMarkdown(r[cIdx] ?? "", resolvedMetrics, onInspectBlock)}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  }
+
+  if (typeof kind === "object" && "toggle" in kind) {
+    return (
+      <TogglePreview
+        summary={kind.toggle.summary}
+        initialOpen={kind.toggle.open}
+        markdown={markdown}
+        resolvedMetrics={resolvedMetrics}
+        onInspectBlock={onInspectBlock}
+      />
+    );
+  }
+
+  if (kind === "table_of_contents") {
+    const headingBlocks = allBlocks.filter(
+      (item): item is Block & { kind: { heading: { level: number } } } =>
+        typeof item.kind === "object" && "heading" in item.kind
+    );
+    return (
+      <div className="rounded-xl border border-stone-200 bg-stone-50/70 p-3.5 space-y-1.5">
+        <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-stone-500">
+          <ListTree className="h-3.5 w-3.5" />
+          Table of Contents
+        </div>
+        {headingBlocks.length === 0 ? (
+          <div className="text-xs text-stone-400">Add heading blocks to populate this outline.</div>
+        ) : (
+          <div className="space-y-1">
+            {headingBlocks.map((hb) => {
+              const lvl = Math.min(6, Math.max(1, hb.kind.heading.level));
+              return (
+                <button
+                  key={hb.id}
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    document
+                      .querySelector(`[data-block-id="${hb.id}"]`)
+                      ?.scrollIntoView({ behavior: "smooth", block: "center" });
+                  }}
+                  style={{ paddingLeft: `${(lvl - 1) * 14}px` }}
+                  className="block w-full text-left text-xs font-medium text-blue-700 hover:underline truncate"
+                >
+                  {hb.markdown || "(untitled heading)"}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  }
+
   if (typeof kind === "object" && "heading" in kind) {
-    const lvl = Math.min(3, Math.max(1, kind.heading.level));
+    const lvl = Math.min(6, Math.max(1, kind.heading.level));
     const cls =
       lvl === 1
         ? "text-2xl font-bold tracking-tight text-stone-950 pt-1"
         : lvl === 2
           ? "text-lg font-semibold tracking-tight text-stone-950 pt-0.5"
-          : "text-base font-semibold text-stone-900";
+          : lvl === 3
+            ? "text-base font-semibold text-stone-900"
+            : "text-sm font-semibold uppercase tracking-wide text-stone-700";
     if (lvl === 1) {
       return <h1 className={cls}>{renderInlineMarkdown(markdown, resolvedMetrics, onInspectBlock)}</h1>;
     }
     if (lvl === 2) {
       return <h2 className={cls}>{renderInlineMarkdown(markdown, resolvedMetrics, onInspectBlock)}</h2>;
     }
-    return <h3 className={cls}>{renderInlineMarkdown(markdown, resolvedMetrics, onInspectBlock)}</h3>;
+    if (lvl === 3) {
+      return <h3 className={cls}>{renderInlineMarkdown(markdown, resolvedMetrics, onInspectBlock)}</h3>;
+    }
+    return <h4 className={cls}>{renderInlineMarkdown(markdown, resolvedMetrics, onInspectBlock)}</h4>;
   }
 
   if (kind === "bullet_list_item") {
@@ -550,13 +832,53 @@ function RenderedBlockBody({
     );
   }
 
-  if (typeof kind === "object" && ("image" in kind || "file_embed" in kind)) {
-    const label =
-      "image" in kind ? kind.image.caption || kind.image.attachment_id : kind.file_embed.filename;
+  if (typeof kind === "object" && "image" in kind) {
+    const src = `/api/attachments/${encodeURIComponent(kind.image.attachment_id)}/download`;
     return (
-      <div className="inline-flex items-center gap-2 rounded-lg border border-stone-200 bg-stone-50 px-3 py-1.5 text-xs text-stone-700">
-        <FileText className="h-3.5 w-3.5 text-stone-500" />
-        <span>{label}</span>
+      <figure className="space-y-1.5">
+        <a href={src} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>
+          <img
+            src={src}
+            alt={kind.image.caption || kind.image.attachment_id}
+            className="max-h-96 rounded-xl border border-stone-200 object-contain bg-stone-50"
+          />
+        </a>
+        {kind.image.caption && (
+          <figcaption className="text-xs text-stone-500">{kind.image.caption}</figcaption>
+        )}
+      </figure>
+    );
+  }
+
+  if (typeof kind === "object" && "file_embed" in kind) {
+    const { attachment_id: aid, filename } = kind.file_embed;
+    const href = `/api/attachments/${encodeURIComponent(aid)}/download`;
+    const isVideo = /\.(mp4|webm|mov|m4v)$/i.test(filename);
+    return (
+      <div className="space-y-2">
+        {isVideo && (
+          <video
+            controls
+            preload="metadata"
+            src={href}
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-h-96 rounded-xl border border-stone-200 bg-black"
+          />
+        )}
+        <a
+          href={href}
+          target="_blank"
+          rel="noreferrer"
+          onClick={(e) => e.stopPropagation()}
+          className="inline-flex items-center gap-2 rounded-lg border border-stone-200 bg-stone-50 px-3 py-1.5 text-xs font-medium text-stone-700 hover:bg-stone-100"
+        >
+          {isVideo ? (
+            <Film className="h-3.5 w-3.5 text-stone-500" />
+          ) : (
+            <Download className="h-3.5 w-3.5 text-stone-500" />
+          )}
+          <span>{filename || aid}</span>
+        </a>
       </div>
     );
   }
@@ -571,7 +893,7 @@ function RenderedBlockBody({
 function blockToHtml(kind: BlockKind, markdown: string): string {
   const safe = escapeHtml(markdown);
   if (typeof kind === "object" && "heading" in kind) {
-    const lvl = Math.min(3, Math.max(1, kind.heading.level));
+    const lvl = Math.min(6, Math.max(1, kind.heading.level));
     return `<h${lvl}>${safe}</h${lvl}>`;
   }
   if (typeof kind === "object" && "code_block" in kind) {
@@ -824,7 +1146,18 @@ export default function BlockEditor({
 
   async function handleInsertBlock(e: React.FormEvent) {
     e.preventDefault();
-    if (!newMarkdown.trim() && newKindVal !== "divider") return;
+    const allowEmpty =
+      newKindVal === "divider" ||
+      newKindVal === "table_of_contents" ||
+      newKindVal === "table_block" ||
+      newKindVal === "toggle";
+    if (!newMarkdown.trim() && !allowEmpty) return;
+    const defaultMd =
+      newKindVal === "table_block"
+        ? "| Column A | Column B |\n| --- | --- |\n| Value 1 | Value 2 |"
+        : newKindVal === "toggle"
+          ? "Hidden details..."
+          : "";
     const lastId = blocks.length > 0 ? blocks[blocks.length - 1].id : null;
     await patchOps(
       [
@@ -833,7 +1166,7 @@ export default function BlockEditor({
             after_block_id: lastId,
             parent_block_id: null,
             kind: optionValueToBlockKind(newKindVal),
-            markdown: newMarkdown.trim(),
+            markdown: newMarkdown.trim() || defaultMd,
           },
         },
       ],
@@ -1048,6 +1381,57 @@ export default function BlockEditor({
               >
                 <div className="font-semibold text-stone-900">Heading 2</div>
                 <div className="text-[11px] text-stone-400">Section divider title</div>
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleInsertSetKind({ heading: { level: 4 } }, "Subsection Title")}
+                className="rounded-lg border border-stone-200 px-3 py-2 text-left hover:bg-stone-50"
+              >
+                <div className="font-semibold text-stone-900">Heading 4</div>
+                <div className="text-[11px] text-stone-400">Compact group label</div>
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  void handleInsertSetKind(
+                    { table_block: { has_header: true } },
+                    "| Column A | Column B |\n| --- | --- |\n| Item 1 | Ready |"
+                  )
+                }
+                className="rounded-lg border border-stone-200 px-3 py-2 text-left hover:bg-stone-50"
+              >
+                <div className="flex items-center gap-1 font-semibold text-stone-900">
+                  <TableIcon className="h-3.5 w-3.5 text-stone-600" />
+                  Table
+                </div>
+                <div className="text-[11px] text-stone-400">GFM structured grid</div>
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  void handleInsertSetKind(
+                    { toggle: { summary: "Collapsible Section", open: false } },
+                    "Details inside toggle..."
+                  )
+                }
+                className="rounded-lg border border-stone-200 px-3 py-2 text-left hover:bg-stone-50"
+              >
+                <div className="flex items-center gap-1 font-semibold text-stone-900">
+                  <ChevronRight className="h-3.5 w-3.5 text-stone-600" />
+                  Toggle
+                </div>
+                <div className="text-[11px] text-stone-400">Expandable notes block</div>
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleInsertSetKind("table_of_contents", "")}
+                className="rounded-lg border border-stone-200 px-3 py-2 text-left hover:bg-stone-50"
+              >
+                <div className="flex items-center gap-1 font-semibold text-stone-900">
+                  <ListTree className="h-3.5 w-3.5 text-stone-600" />
+                  Table of Contents
+                </div>
+                <div className="text-[11px] text-stone-400">Live page heading outline</div>
               </button>
               <button
                 type="button"
@@ -1297,6 +1681,9 @@ export default function BlockEditor({
           const isHighlighted = highlightedId === b.id;
           const isEmbed = typeof b.kind === "object" && "database_view_embed" in b.kind;
           const isAiBrief = typeof b.kind === "object" && "ai_brief" in b.kind;
+          const isToc = b.kind === "table_of_contents";
+          const isTable = typeof draft.kind === "object" && "table_block" in draft.kind;
+          const isToggle = typeof draft.kind === "object" && "toggle" in draft.kind;
 
           return (
             <div
@@ -1431,11 +1818,15 @@ export default function BlockEditor({
                         <option value="h1">Heading 1</option>
                         <option value="h2">Heading 2</option>
                         <option value="h3">Heading 3</option>
+                        <option value="h4">Heading 4</option>
                         <option value="bullet_list_item">Bullet Item</option>
                         <option value="task_item">Task Item</option>
+                        <option value="table_block">Table</option>
+                        <option value="toggle">Toggle</option>
                         <option value="callout">Callout</option>
                         <option value="quote">Quote</option>
                         <option value="code_block">Code Block</option>
+                        <option value="table_of_contents">Table of Contents</option>
                         <option value="divider">Divider</option>
                       </select>
                     )}
@@ -1491,9 +1882,10 @@ export default function BlockEditor({
                     </div>
                   </div>
 
-                  {(isEmbed || (isAiBrief && !rawMode)) ? (
+                  {isEmbed || isToc || (isAiBrief && !rawMode) ? (
                     <RenderedBlockBody
                       block={b}
+                      allBlocks={blocks}
                       saving={saving}
                       databases={databases}
                       principals={principals}
@@ -1505,6 +1897,72 @@ export default function BlockEditor({
                       onInspectRow={onInspectRow}
                       onMetricInvalidated={onMetricInvalidated}
                     />
+                  ) : isActive && isTable && !rawMode ? (
+                    <TableGridEditor
+                      markdown={draft.markdown}
+                      onChange={(nextMd) =>
+                        setDrafts((prev) => ({
+                          ...prev,
+                          [b.id]: { ...draft, markdown: nextMd },
+                        }))
+                      }
+                    />
+                  ) : isActive && isToggle && typeof draft.kind === "object" && "toggle" in draft.kind && !rawMode ? (
+                    <div className="rounded-xl border border-blue-200 bg-white p-3 space-y-2 shadow-2xs">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <input
+                          type="text"
+                          value={draft.kind.toggle.summary}
+                          onChange={(e) => {
+                            const curTog =
+                              typeof draft.kind === "object" && "toggle" in draft.kind
+                                ? draft.kind.toggle
+                                : { summary: "", open: false };
+                            setDrafts((prev) => ({
+                              ...prev,
+                              [b.id]: {
+                                ...draft,
+                                kind: { toggle: { ...curTog, summary: e.target.value } },
+                              },
+                            }));
+                          }}
+                          placeholder="Toggle summary..."
+                          className="flex-1 rounded-md border border-stone-200 px-2.5 py-1 text-sm font-medium outline-none focus:border-blue-500"
+                        />
+                        <label className="inline-flex items-center gap-1.5 text-xs text-stone-600">
+                          <input
+                            type="checkbox"
+                            checked={draft.kind.toggle.open}
+                            onChange={(e) => {
+                              const curTog =
+                                typeof draft.kind === "object" && "toggle" in draft.kind
+                                  ? draft.kind.toggle
+                                  : { summary: "", open: false };
+                              setDrafts((prev) => ({
+                                ...prev,
+                                [b.id]: {
+                                  ...draft,
+                                  kind: { toggle: { ...curTog, open: e.target.checked } },
+                                },
+                              }));
+                            }}
+                          />
+                          Open by default
+                        </label>
+                      </div>
+                      <textarea
+                        rows={3}
+                        value={draft.markdown}
+                        onChange={(e) =>
+                          setDrafts((prev) => ({
+                            ...prev,
+                            [b.id]: { ...draft, markdown: e.target.value },
+                          }))
+                        }
+                        placeholder="Toggle inner markdown..."
+                        className="w-full rounded-lg border border-stone-200 px-3 py-2 text-sm outline-none focus:border-blue-500"
+                      />
+                    </div>
                   ) : isActive && !rawMode ? (
                     <TipTapInlineEditor
                       key={b.id}
@@ -1536,6 +1994,7 @@ export default function BlockEditor({
                   ) : (
                     <RenderedBlockBody
                       block={b}
+                      allBlocks={blocks}
                       saving={saving}
                       databases={databases}
                       principals={principals}
@@ -1595,11 +2054,15 @@ export default function BlockEditor({
         >
           <option value="paragraph">Paragraph</option>
           <option value="h2">Heading 2</option>
+          <option value="h4">Heading 4</option>
           <option value="bullet_list_item">Bullet</option>
           <option value="task_item">Task Item</option>
+          <option value="table_block">Table</option>
+          <option value="toggle">Toggle</option>
           <option value="callout">Callout</option>
           <option value="quote">Quote</option>
           <option value="code_block">Code Block</option>
+          <option value="table_of_contents">Table of Contents</option>
         </select>
         <input
           type="text"
@@ -1610,7 +2073,14 @@ export default function BlockEditor({
         />
         <button
           type="submit"
-          disabled={saving || !newMarkdown.trim()}
+          disabled={
+            saving ||
+            (!newMarkdown.trim() &&
+              newKindVal !== "divider" &&
+              newKindVal !== "table_of_contents" &&
+              newKindVal !== "table_block" &&
+              newKindVal !== "toggle")
+          }
           className="inline-flex items-center gap-1.5 rounded-lg bg-stone-900 px-3.5 py-2 text-xs font-medium text-white hover:bg-stone-800 disabled:opacity-50"
         >
           <Plus className="h-3.5 w-3.5" />

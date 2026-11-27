@@ -688,13 +688,17 @@ fn vellum_schema() : Ledger.Schema
       blocks,
       fn(id, b)
         bad_block = case b.kind
-          Heading(level: lvl): lvl < 1 or lvl > 3
+          Heading(level: lvl): lvl < 1 or lvl > 6
           DatabaseViewEmbed(database_id: db_id, view_id: _): db_id.trim.empty?
           AiBrief(prompt: pr, source_scope: _, refreshed_at: _): pr.trim.empty?
+          Toggle(summary: sum, open: _): sum.trim.empty?
           Paragraph | BulletListItem | OrderedListItem(start: _) | TaskItem(checked: _) | Quote | Callout(
             tone: _,
             icon: _
-          ) | CodeBlock(language: _) | Divider | Image(attachment_id: _, caption: _) | FileEmbed(
+          ) | CodeBlock(language: _) | Divider | TableBlock(has_header: _) | TableOfContents | Image(
+            attachment_id: _,
+            caption: _
+          ) | FileEmbed(
             attachment_id: _,
             filename: _
           ) | PageLink(target_page_id: _): false
@@ -2739,7 +2743,10 @@ fn rlm_collection_views(cat: Views.ViewCatalog, cid: Text) : Views.ViewCatalog
             Paragraph | BulletListItem | OrderedListItem(start: _) | TaskItem(checked: _) | Quote | Callout(
               tone: _,
               icon: _
-            ) | CodeBlock(language: _) | Divider | Image(attachment_id: _, caption: _) | FileEmbed(
+            ) | CodeBlock(language: _) | Divider | TableBlock(has_header: _) | Toggle(
+              summary: _,
+              open: _
+            ) | TableOfContents | Image(attachment_id: _, caption: _) | FileEmbed(
               attachment_id: _,
               filename: _
             ) | PageLink(target_page_id: _) | DatabaseViewEmbed(database_id: _, view_id: _) | AiBrief(
@@ -2965,7 +2972,9 @@ fn block_backlink_kind(ob: Block, target_page_id: Text, target_block_ids: Set(Te
     PageLink(target_page_id: tid): tid == target_page_id
     Paragraph | Heading(level: _) | BulletListItem | OrderedListItem(start: _) | TaskItem(
       checked: _
-    ) | Quote | Callout(tone: _, icon: _) | CodeBlock(language: _) | Divider | Image(
+    ) | Quote | Callout(tone: _, icon: _) | CodeBlock(language: _) | Divider | TableBlock(
+      has_header: _
+    ) | Toggle(summary: _, open: _) | TableOfContents | Image(
       attachment_id: _,
       caption: _
     ) | FileEmbed(attachment_id: _, filename: _) | DatabaseViewEmbed(
