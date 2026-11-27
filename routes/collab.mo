@@ -46,6 +46,7 @@ events_stream,
 taint_status,
 clear_taint_session
 use Api
+use ChatOps
 use Arvo.Id
 use Arvo.Modb.Jobs
 use Arvo.Sse
@@ -84,7 +85,6 @@ use Domain.Types{
   BlockOp,
   Citation,
   CollectionWritePolicy,
-  Page,
   PageKind,
   Principal,
   PrincipalKind,
@@ -271,6 +271,41 @@ fn matching_webhooks_in_store(store: Store, event: Text, collection_id: Option(T
   Ok(out)
 end
 
+fn webhooks_to_lite_json(subs: List(WebhookSub)) : List(Json)
+  subs.map(fn(s)
+    Json.Object({
+      "id": Json.String(s.id),
+      "url": Json.String(s.url),
+      "secret": Json.String(s.secret)
+    })
+  end)
+end
+
+fn prepare_webhook_jobs_json(
+  subs_json: List(Json),
+  event: Text,
+  body_json: Json,
+  taint_session_id: Option(Text),
+  rng: SecureRandom,
+  clock: Clock
+) : List(Jobs.JobRecord)
+  var out = []
+  for s in subs_json
+    del_id = "del_#{Id.ulid(rng, clock)}"
+    payload = WebhookJobPayload(
+      webhook_id: s.text_at("id") or "",
+      delivery_id: del_id,
+      url: s.text_at("url") or "",
+      secret: s.text_at("secret") or "",
+      event: event,
+      body_json: body_json,
+      taint_session_id: taint_session_id
+    )
+    out = out.append(Jobs.prepare(rng, clock, "vellum.webhook.deliver", payload.to_json))
+  end
+  out
+end
+
 fn caller_taint_sid(req: Api.Request, auth: AuthContext) : Option(Text)
   case req.header("X-Taint-Session")
     Some(s) if not s.trim.empty?: Some(s.trim)
@@ -340,25 +375,34 @@ fn list_claims(auth: AuthContext, rf: ReadFiles, clock: Clock) : Result(Api.Resp
     return Ok(json_ok(200, Json.Object({"claims": Json.Array([])})))
   end
   now = clock.now
-  claims = try Ledger.read_locked(
+  claims_json = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
-    fn(db) Claims.list_active(Ledger.store(db), now).map_error(Db.map_claims_error) end
+    fn(db)
+      claims = try Claims.list_active(Ledger.store(db), now).map_error(Db.map_claims_error)
+      Ok(claims.to_json)
+    end
   )
-  Ok(json_ok(200, Json.Object({"claims": claims.to_json})))
+  Ok(json_ok(200, Json.Object({"claims": claims_json})))
 end
 
 ## `POST /api/claims` — Acquires an advisory `Modb.Claims` lease (409 Conflict if held by another principal).
 fn acquire_claim(
   req: Api.Request,
   auth: AuthContext,
-  input: AcquireClaimInput,
   files: Files,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = AcquireClaimInput(
+    resource: try VaultOps.req_text(rj, "resource"),
+    ttl_seconds: try VaultOps.req_int(rj, "ttl_seconds"),
+    world_id: rj.text_at("world_id"),
+    reason: try VaultOps.req_text(rj, "reason")
+  )
   if not Policy.action_permitted?(auth, "claim")
     return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'claim'"))
   end
@@ -383,7 +427,7 @@ fn acquire_claim(
     "ttl_seconds": Json.int(input.ttl_seconds)
   })
 
-  claim = try Ledger.transact_locked(
+  claim_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -403,14 +447,14 @@ fn acquire_claim(
         now,
         expires_at
       ).map_error(Db.map_claims_error)
-      Ok((t2, c))
+      Ok((t2, c.to_json))
     end
   )
   Ok(
-    json_ok(201, claim.to_json).with_sse_publish_json(
+    json_ok(201, claim_json).with_sse_publish_json(
       "claims",
       "claim.acquired",
-      Json.Object({"claim": claim.to_json, "actor": Json.String(auth.principal.handle)})
+      Json.Object({"claim": claim_json, "actor": Json.String(auth.principal.handle)})
     )
   )
 end
@@ -419,11 +463,15 @@ end
 fn heartbeat_claim(
   req: Api.Request,
   auth: AuthContext,
-  input: HeartbeatClaimInput,
   files: Files,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = HeartbeatClaimInput(
+    resource: try VaultOps.req_text(rj, "resource"),
+    ttl_seconds: try VaultOps.req_int(rj, "ttl_seconds")
+  )
   if not Policy.action_permitted?(auth, "claim")
     return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'claim'"))
   end
@@ -440,7 +488,7 @@ fn heartbeat_claim(
     at: now
   )
 
-  claim = try Ledger.transact_locked(
+  claim_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -453,14 +501,14 @@ fn heartbeat_claim(
       (t2, c) = try Claims.tx_heartbeat(t1, res_key, auth.principal.id, now, new_exp).map_error(
         Db.map_claims_error
       )
-      Ok((t2, c))
+      Ok((t2, c.to_json))
     end
   )
   Ok(
-    json_ok(200, claim.to_json).with_sse_publish_json(
+    json_ok(200, claim_json).with_sse_publish_json(
       "claims",
       "claim.heartbeat",
-      Json.Object({"claim": claim.to_json, "actor": Json.String(auth.principal.handle)})
+      Json.Object({"claim": claim_json, "actor": Json.String(auth.principal.handle)})
     )
   )
 end
@@ -469,11 +517,12 @@ end
 fn release_claim(
   req: Api.Request,
   auth: AuthContext,
-  input: ReleaseClaimInput,
   files: Files,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = ReleaseClaimInput(resource: try VaultOps.req_text(rj, "resource"))
   if not Policy.action_permitted?(auth, "claim")
     return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'claim'"))
   end
@@ -523,7 +572,7 @@ fn list_proposals(auth: AuthContext, rf: ReadFiles) : Result(Api.Response, AppEr
   if not rf.exists?(Db.ledger_db_path)
     return Ok(json_ok(200, Json.Object({"proposals": Json.Array([])})))
   end
-  props = try Ledger.read_locked(
+  props_json = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -538,22 +587,27 @@ fn list_proposals(auth: AuthContext, rf: ReadFiles) : Result(Api.Response, AppEr
           out = out.append(pm)
         end
       end
-      Ok(out)
+      Ok(out.to_json)
     end
   )
-  Ok(json_ok(200, Json.Object({"proposals": props.to_json})))
+  Ok(json_ok(200, Json.Object({"proposals": props_json})))
 end
 
 ## `POST /api/proposals` — Opens a speculative `Modb.World` Change Proposal for a page and enqueues webhook events.
 fn open_proposal(
   req: Api.Request,
   auth: AuthContext,
-  input: OpenProposalInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = OpenProposalInput(
+    page_id: try VaultOps.req_text(rj, "page_id"),
+    title: try VaultOps.req_text(rj, "title"),
+    reason: try VaultOps.req_text(rj, "reason")
+  )
   clean_title = input.title.trim
   clean_reason = input.reason.trim
   if clean_title.empty? or clean_reason.empty?
@@ -563,7 +617,7 @@ fn open_proposal(
     return Error(Missing(entity: "page", id: input.page_id))
   end
 
-  (page, matching_subs) = try Ledger.read_locked(
+  pre_json = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -576,9 +630,18 @@ fn open_proposal(
       end
       try Policy.require_collection_access(auth, "propose", pg.collection_id)
       subs = try matching_webhooks_in_store(store, "proposal.opened", Some(pg.collection_id))
-      Ok((pg, subs))
+      Ok(
+        Json.Object({
+          "page_id": Json.String(pg.id),
+          "collection_id": Json.String(pg.collection_id),
+          "subs": Json.Array(webhooks_to_lite_json(subs))
+        })
+      )
     end
   )
+  page_id = pre_json.text_at("page_id") or input.page_id
+  page_collection_id = pre_json.text_at("collection_id") or ""
+  matching_subs_json = pre_json.list_at("subs") or []
 
   now = clock.now
   prop_id = "prop_#{Id.ulid(rng, clock)}"
@@ -596,8 +659,8 @@ fn open_proposal(
   proposal = ProposalMeta(
     id: prop_id,
     world_id: world_id,
-    collection_id: page.collection_id,
-    target_page_id: page.id,
+    collection_id: page_collection_id,
+    target_page_id: page_id,
     target_database_id: None,
     branch_kind: "proposal",
     title: clean_title,
@@ -611,8 +674,8 @@ fn open_proposal(
     decided_by: None,
     decided_at: None
   )
-  hook_jobs = prepare_webhook_jobs(
-    matching_subs,
+  hook_jobs = prepare_webhook_jobs_json(
+    matching_subs_json,
     "proposal.opened",
     Json.Object({"event": Json.String("proposal.opened"), "proposal": proposal.to_json}),
     caller_taint_sid(req, auth),
@@ -629,7 +692,7 @@ fn open_proposal(
   audit_payload = Json.Object({
     "proposal_id": Json.String(prop_id),
     "world_id": Json.String(world_id),
-    "page_id": Json.String(page.id)
+    "page_id": Json.String(page_id)
   })
   saved = try Ledger.transact_locked(
     files,
@@ -706,7 +769,7 @@ fn open_db_scenario(
     return Error(Missing(entity: "database", id: id))
   end
 
-  (def, matching_subs) = try Ledger.read_locked(
+  scen_pre = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -719,9 +782,20 @@ fn open_db_scenario(
       end
       try Policy.require_collection_access(auth, "propose", found_def.collection_id)
       subs = try matching_webhooks_in_store(store, "proposal.opened", Some(found_def.collection_id))
-      Ok((found_def, subs))
+      Ok(
+        Json.Object({
+          "database_id": Json.String(found_def.id),
+          "collection_id": Json.String(found_def.collection_id),
+          "page_id": Json.String(found_def.page_id),
+          "subs": Json.Array(webhooks_to_lite_json(subs))
+        })
+      )
     end
   )
+  def_id = scen_pre.text_at("database_id") or id
+  def_collection_id = scen_pre.text_at("collection_id") or ""
+  def_page_id = scen_pre.text_at("page_id") or ""
+  matching_subs_json = scen_pre.list_at("subs") or []
 
   now = clock.now
   prop_id = "prop_#{Id.ulid(rng, clock)}"
@@ -739,9 +813,9 @@ fn open_db_scenario(
   proposal = ProposalMeta(
     id: prop_id,
     world_id: world_id,
-    collection_id: def.collection_id,
-    target_page_id: def.page_id,
-    target_database_id: Some(def.id),
+    collection_id: def_collection_id,
+    target_page_id: def_page_id,
+    target_database_id: Some(def_id),
     branch_kind: branch_kind,
     title: clean_title,
     reason: clean_reason,
@@ -754,8 +828,8 @@ fn open_db_scenario(
     decided_by: None,
     decided_at: None
   )
-  hook_jobs = prepare_webhook_jobs(
-    matching_subs,
+  hook_jobs = prepare_webhook_jobs_json(
+    matching_subs_json,
     "proposal.opened",
     Json.Object({"event": Json.String("proposal.opened"), "proposal": proposal.to_json}),
     caller_taint_sid(req, auth),
@@ -771,14 +845,14 @@ fn open_db_scenario(
   audit_payload = Json.Object({
     "proposal_id": Json.String(prop_id),
     "world_id": Json.String(world_id),
-    "database_id": Json.String(def.id)
+    "database_id": Json.String(def_id)
   })
   saved = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
     meta,
-    "opened #{branch_kind} #{prop_id} on database #{def.id}",
+    "opened #{branch_kind} #{prop_id} on database #{def_id}",
     audit_payload,
     Db.map_ledger_error,
     fn(tx)
@@ -793,7 +867,7 @@ fn open_db_scenario(
   )
   prop_payload = Json.Object({
     "proposal_id": Json.String(saved.id),
-    "database_id": Json.String(def.id),
+    "database_id": Json.String(def_id),
     "page_id": Json.String(saved.target_page_id),
     "collection_id": Json.String(saved.collection_id),
     "branch_kind": Json.String(saved.branch_kind),
@@ -805,7 +879,7 @@ fn open_db_scenario(
       "collection:#{saved.collection_id}",
       "proposal.opened",
       prop_payload
-    ).with_sse_publish_json("database:#{def.id}", "proposal.opened", prop_payload)
+    ).with_sse_publish_json("database:#{def_id}", "proposal.opened", prop_payload)
   )
 end
 
@@ -814,12 +888,29 @@ fn stage_proposal_ops(
   req: Api.Request,
   id: Text,
   auth: AuthContext,
-  input: StageProposalOpsInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  ops_in = case rj.get("ops")
+    None: return Error(BadInput(reason: "missing 'ops' array"))
+    Some(oj): try Blocks.decode_block_ops_json(oj.to_text.bytes).map_error(fn(e)
+      BadInput(reason: "invalid 'ops': #{e}")
+    end)
+  end
+  exp_in = case rj.get("expected_versions")
+    None | Some(Json.Null): {}
+    Some(ej): try Blocks.decode_version_map_json(ej.to_text.bytes).map_error(fn(e)
+      BadInput(reason: "invalid 'expected_versions': #{e}")
+    end)
+  end
+  input = StageProposalOpsInput(
+    ops: ops_in,
+    expected_versions: exp_in,
+    reason: try VaultOps.req_text(rj, "reason")
+  )
   if input.ops.empty? or input.reason.trim.empty?
     return Error(BadInput(reason: "ops and non-empty reason are required"))
   end
@@ -1135,10 +1226,10 @@ fn query_db_scenario(
   id: Text,
   proposal_id: Text,
   auth: AuthContext,
-  input: Databases.QueryDatabaseInput,
   rf: ReadFiles
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  input = try Databases.parse_query_database_input(req.text)
   from_d = case input.from_date
     Some(s) if not s.trim.empty?:
       case Date.parse_iso(s.trim)
@@ -1862,8 +1953,8 @@ fn accept_proposal(
   reason_override = if req.body.empty?
     None
   else
-    case Json.decode_strict[ProposalDecisionInput](req.body)
-      Ok(d): d.reason
+    case Json.parse(req.text or "")
+      Ok(j): j.text_at("reason")
       Error(_): None
     end
   end
@@ -1874,7 +1965,7 @@ fn accept_proposal(
     "write_direct"
   end
 
-  (pm, col, matching_subs, touched_pages, touched_dbs, touches_schema?, prop_untrusted) = try Ledger.read_locked(
+  acc_pre = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -1965,52 +2056,68 @@ fn accept_proposal(
         None: false
       end
       subs = try matching_webhooks_in_store(store, "proposal.accepted", Some(found.collection_id))
-      Ok((found, c, subs, t_pages, t_dbs, t_schema?, prop_untrusted))
+      Ok(
+        Json.Object({
+          "proposal": found.to_json,
+          "col_slug": Json.String(c.slug),
+          "col_requires_human": Json.Boolean(c.write_policy != DirectWithAudit),
+          "subs": Json.Array(webhooks_to_lite_json(subs)),
+          "touched_pages": t_pages.to_json,
+          "touched_dbs": t_dbs.to_json,
+          "touches_schema": Json.Boolean(t_schema?),
+          "prop_untrusted": Json.Boolean(prop_untrusted)
+        })
+      )
     end
   )
-  if pm.status != "open"
-    return Error(Conflict(reason: "proposal '#{id}' is '#{pm.status}', not 'open'"))
+  pm_obj = acc_pre.get("proposal") or Json.Object({})
+  pm_id = pm_obj.text_at("id") or id
+  pm_status = pm_obj.text_at("status") or ""
+  pm_title = pm_obj.text_at("title") or ""
+  pm_world_id = pm_obj.text_at("world_id") or ""
+  pm_target_page_id = pm_obj.text_at("target_page_id") or ""
+  if pm_status != "open"
+    return Error(Conflict(reason: "proposal '#{id}' is '#{pm_status}', not 'open'"))
   end
-  if col.write_policy != DirectWithAudit and auth.principal.kind != Human
+  col_requires_human? = acc_pre.bool_at("col_requires_human") or false
+  col_slug = acc_pre.text_at("col_slug") or ""
+  if col_requires_human? and auth.principal.kind != Human
     return Error(
       Forbidden(
-        reason: "collection '#{col.slug}' write policy requires a Human reviewer to accept proposals"
+        reason: "collection '#{col_slug}' write policy requires a Human reviewer to accept proposals"
       )
     )
   end
 
   now = clock.now
-  land_reason = reason_override or "accept proposal '#{pm.title}' (#{pm.id})"
+  land_reason = reason_override or "accept proposal '#{pm_title}' (#{pm_id})"
   land_res = try World.land_world_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.world_catalog(),
-    pm.world_id,
+    pm_world_id,
     land_reason,
     now
   ).map_error(map_land_world_error)
 
-  accepted = ProposalMeta(
-    id: pm.id,
-    world_id: pm.world_id,
-    collection_id: pm.collection_id,
-    target_page_id: pm.target_page_id,
-    target_database_id: pm.target_database_id,
-    branch_kind: pm.branch_kind,
-    title: pm.title,
-    reason: pm.reason,
-    author_id: pm.author_id,
-    author_handle: pm.author_handle,
-    grant_id: pm.grant_id,
-    status: "accepted",
-    created_at: pm.created_at,
-    updated_at: now,
-    decided_by: Some(auth.principal.id),
-    decided_at: Some(now)
-  )
+  accepted_preview = case pm_obj
+    Json.Object(pm_m): Json.Object(
+      pm_m.set("status", Json.String("accepted"))
+        .set("updated_at", now.to_json)
+        .set("decided_by", Json.String(auth.principal.id))
+        .set("decided_at", now.to_json)
+    )
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): pm_obj
+  end
 
-  var idx_page_ids = [pm.target_page_id]
+  touched_pages = VaultOps.json_text_list_raw(acc_pre, "touched_pages")
+  touched_dbs = VaultOps.json_text_list_raw(acc_pre, "touched_dbs")
+  touches_schema? = acc_pre.bool_at("touches_schema") or false
+  prop_untrusted = acc_pre.bool_at("prop_untrusted") or false
+  matching_subs_json = acc_pre.list_at("subs") or []
+
+  var idx_page_ids = [pm_target_page_id]
   for pid in touched_pages
     if not idx_page_ids.contains?(pid)
       idx_page_ids = idx_page_ids.append(pid)
@@ -2023,12 +2130,12 @@ fn accept_proposal(
     )
   end
 
-  hook_jobs = prepare_webhook_jobs(
-    matching_subs,
+  hook_jobs = prepare_webhook_jobs_json(
+    matching_subs_json,
     "proposal.accepted",
     Json.Object({
       "event": Json.String("proposal.accepted"),
-      "proposal": accepted.to_json,
+      "proposal": accepted_preview,
       "commit_txid": Json.int(land_res.commit_txid)
     }),
     caller_taint_sid(req, auth),
@@ -2046,14 +2153,36 @@ fn accept_proposal(
     Db.ledger_db_path,
     Db.vellum_schema(),
     meta,
-    "accepted proposal #{accepted.id}",
+    "accepted proposal #{pm_id}",
     Json.Object({
-      "proposal_id": Json.String(accepted.id),
+      "proposal_id": Json.String(pm_id),
       "commit_txid": Json.int(land_res.commit_txid)
     }),
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, accept_act, now)
+      latest_pm = case try Table.tx_get(t1, Db.proposals_table(), id).map_error(Db.map_table_error)
+        Some(p): p
+        None: return Error(Missing(entity: "proposal", id: id))
+      end
+      accepted = ProposalMeta(
+        id: latest_pm.id,
+        world_id: latest_pm.world_id,
+        collection_id: latest_pm.collection_id,
+        target_page_id: latest_pm.target_page_id,
+        target_database_id: latest_pm.target_database_id,
+        branch_kind: latest_pm.branch_kind,
+        title: latest_pm.title,
+        reason: latest_pm.reason,
+        author_id: latest_pm.author_id,
+        author_handle: latest_pm.author_handle,
+        grant_id: latest_pm.grant_id,
+        status: "accepted",
+        created_at: latest_pm.created_at,
+        updated_at: now,
+        decided_by: Some(auth.principal.id),
+        decided_at: Some(now)
+      )
       var cur = try Db.tx_put_proposal(t1, accepted)
       if prop_untrusted
         cur = try TaintBridge.tx_mark_provenance(
@@ -2343,12 +2472,18 @@ end
 fn simulate_replay(
   req: Api.Request,
   auth: AuthContext,
-  input: SimulateReplayInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = SimulateReplayInput(
+    filter_kind: try VaultOps.req_text(rj, "filter_kind"),
+    target: rj.text_at("target"),
+    seq: rj.int_at("seq"),
+    description: try VaultOps.req_text(rj, "description")
+  )
   role_ok = auth.principal.role == Owner or auth.principal.role == Admin
   if not role_ok or not Policy.action_permitted?(auth, "manage_grants")
     return Error(Forbidden(reason: "only Owner/Admin may simulate replay rollbacks"))
@@ -2604,12 +2739,22 @@ end
 fn delegate_grant(
   req: Api.Request,
   auth: AuthContext,
-  input: DelegateGrantInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = DelegateGrantInput(
+    handle: try VaultOps.req_text(rj, "handle"),
+    display_name: try VaultOps.req_text(rj, "display_name"),
+    model_id: rj.text_at("model_id"),
+    label: try VaultOps.req_text(rj, "label"),
+    allowed_actions: VaultOps.json_text_list_raw(rj, "allowed_actions"),
+    allowed_collections: VaultOps.json_text_list_opt(rj, "allowed_collections"),
+    max_calls: try VaultOps.req_int(rj, "max_calls"),
+    ttl_days: try VaultOps.req_int(rj, "ttl_days")
+  )
   del_act = if Policy.action_permitted?(auth, "delegate")
     "delegate"
   else
@@ -2750,7 +2895,7 @@ fn list_webhooks(auth: AuthContext, rf: ReadFiles) : Result(Api.Response, AppErr
   if not rf.exists?(Db.ledger_db_path)
     return Ok(json_ok(200, Json.Object({"webhooks": Json.Array([])})))
   end
-  items = try Ledger.read_locked(
+  hooks_json = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -2760,34 +2905,41 @@ fn list_webhooks(auth: AuthContext, rf: ReadFiles) : Result(Api.Response, AppErr
         Db.map_table_error
       )
       Ok(
-        rows.map(fn(pair)
-          w = pair.1
-          Json.Object({
-            "id": Json.String(w.id),
-            "workspace_id": Json.String(w.workspace_id),
-            "collection_id": w.collection_id.to_json,
-            "url": Json.String(w.url),
-            "events": w.events.to_json,
-            "enabled": Json.Boolean(w.enabled),
-            "created_at": w.created_at.to_json
-          })
-        end)
+        Json.Array(
+          rows.map(fn(pair)
+            w = pair.1
+            Json.Object({
+              "id": Json.String(w.id),
+              "workspace_id": Json.String(w.workspace_id),
+              "collection_id": w.collection_id.to_json,
+              "url": Json.String(w.url),
+              "events": w.events.to_json,
+              "enabled": Json.Boolean(w.enabled),
+              "created_at": w.created_at.to_json
+            })
+          end)
+        )
       )
     end
   )
-  Ok(json_ok(200, Json.Object({"webhooks": Json.Array(items)})))
+  Ok(json_ok(200, Json.Object({"webhooks": hooks_json})))
 end
 
 ## `POST /api/webhooks` — Registers an outbound signed webhook subscription (`Arvo.Webhooks`).
 fn create_webhook(
   req: Api.Request,
   auth: AuthContext,
-  input: CreateWebhookInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = CreateWebhookInput(
+    collection_id: rj.text_at("collection_id"),
+    url: try VaultOps.req_text(rj, "url"),
+    events: VaultOps.json_text_list_raw(rj, "events")
+  )
   role_ok = auth.principal.role == Owner or auth.principal.role == Admin
   if not role_ok or not Policy.action_permitted?(auth, "manage_grants")
     return Error(Forbidden(reason: "only Owner/Admin may register webhooks"))
@@ -2863,7 +3015,7 @@ fn create_webhook(
     reason: "register webhook '#{wh_id}' for #{sub.url}",
     at: now
   )
-  saved = try Ledger.transact_locked(
+  saved_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -2873,21 +3025,19 @@ fn create_webhook(
     Db.map_ledger_error,
     fn(tx)
       t1 = try Table.put(tx, Db.webhooks_table(), sub.id, sub).map_error(Db.map_table_error)
-      Ok((t1, sub))
+      Ok((
+        t1,
+        Json.Object({
+          "id": Json.String(sub.id),
+          "url": Json.String(sub.url),
+          "events": sub.events.to_json,
+          "collection_id": sub.collection_id.to_json,
+          "secret": Json.String(sub.secret)
+        })
+      ))
     end
   )
-  Ok(
-    json_ok(
-      201,
-      Json.Object({
-        "id": Json.String(saved.id),
-        "url": Json.String(saved.url),
-        "events": saved.events.to_json,
-        "collection_id": saved.collection_id.to_json,
-        "secret": Json.String(saved.secret)
-      })
-    )
-  )
+  Ok(json_ok(201, saved_json))
 end
 
 ## `GET /api/events` — Emits live grant-scoped `text/event-stream` SSE stream with `Last-Event-ID` catchup (`ReadFiles`-only).
@@ -2909,6 +3059,26 @@ fn events_stream(req: Api.Request, auth: AuthContext, rf: ReadFiles, clock: Cloc
   page_scope = req.query_param("page_id").map(fn(s) s.trim end)
   db_scope = req.query_param("database_id").map(fn(s) s.trim end)
   col_scope = req.query_param("collection_id").map(fn(s) s.trim end)
+  channel_scope = req.query_param("channel_id").map(fn(s) s.trim end)
+  has_page_scope? = case page_scope
+    Some(s): not s.empty?
+    None: false
+  end
+  has_db_scope? = case db_scope
+    Some(s): not s.empty?
+    None: false
+  end
+  has_col_scope? = case col_scope
+    Some(s): not s.empty?
+    None: false
+  end
+  has_channel_scope? = case channel_scope
+    Some(s): not s.empty?
+    None: false
+  end
+  include_chat_inbox? = req.path.starts_with?("/api/v1/") or has_channel_scope? or (
+    not grants_scope and not has_page_scope? and not has_db_scope? and not has_col_scope?
+  )
 
   if not rf.exists?(Db.ledger_db_path)
     case page_scope
@@ -2923,7 +3093,14 @@ fn events_stream(req: Api.Request, auth: AuthContext, rf: ReadFiles, clock: Cloc
       Some(cid) if not cid.empty?: return Error(Missing(entity: "collection", id: cid))
       Some(_) | None: Unit
     end
-    empty_topics = if grants_scope: ["claims", "grants"] else: ["claims"]
+    case channel_scope
+      Some(chid) if not chid.empty?: return Error(Missing(entity: "chat_channel", id: chid))
+      Some(_) | None: Unit
+    end
+    var empty_topics = if grants_scope: ["claims", "grants"] else: ["claims"]
+    if include_chat_inbox?
+      empty_topics = empty_topics.append("chat:inbox:#{auth.principal.id}")
+    end
     connected_ev = Sse.SseEvent(
       id: None,
       event: Some("connected"),
@@ -2964,10 +3141,12 @@ fn events_stream(req: Api.Request, auth: AuthContext, rf: ReadFiles, clock: Cloc
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
-      var scoped_topics = ["claims"]
+      var scoped_topics = if grants_scope: ["claims", "grants"] else: ["claims"]
+      if include_chat_inbox?
+        scoped_topics = scoped_topics.append("chat:inbox:#{auth.principal.id}")
+      end
       var g_snap_opt = None
       if grants_scope
-        scoped_topics = ["claims", "grants"]
         all_gs = try Grants.list_all(store).map_error(Db.map_grants_error)
         var g_act = 0
         var g_del = 0
@@ -3016,16 +3195,38 @@ fn events_stream(req: Api.Request, auth: AuthContext, rf: ReadFiles, clock: Cloc
                     try Policy.require_collection_access(auth, "read", cid)
                     scoped_topics = scoped_topics.append("collection:#{cid}")
                   Some(_) | None:
-                    cols = try Table.scan(store, Db.collections_table(), None, None, 200).map_error(
-                      Db.map_table_error
-                    )
-                    var added = 0
-                    for (_k, c) in cols
-                      if c.archived_at == None and Policy.collection_permitted?(auth, c.id) and added <
-                        30
-                        scoped_topics = scoped_topics.append("collection:#{c.id}")
-                        added += 1
-                      end
+                    case channel_scope
+                      Some(chid) if not chid.empty?:
+                        ch = case try ChatOps.get_channel(store, chid)
+                          Some(c) if c.text_at("archived_at") == None: c
+                          Some(_) | None: return Error(Missing(entity: "chat_channel", id: chid))
+                        end
+                        try ChatOps.require_channel_access(auth, ch, "read")
+                        scoped_topics = scoped_topics.append("chat:channel:#{chid}")
+                      Some(_) | None:
+                        cols = try Table.scan(store, Db.collections_table(), None, None, 200)
+                          .map_error(Db.map_table_error)
+                        var added = 0
+                        for (_k, c) in cols
+                          if c.archived_at == None and Policy.collection_permitted?(auth, c.id) and
+                            added < 30
+                            scoped_topics = scoped_topics.append("collection:#{c.id}")
+                            added += 1
+                          end
+                        end
+                        chs = try ChatOps.list_all_channels(store)
+                        var ch_added = 0
+                        for ch in chs
+                          if ch.text_at("archived_at") == None and
+                            ChatOps.can_access_channel?(auth, ch, "read") and
+                            ch_added < 30
+                            ch_id = ch.text_at("id") or ""
+                            if not ch_id.empty?
+                              scoped_topics = scoped_topics.append("chat:channel:#{ch_id}")
+                              ch_added += 1
+                            end
+                          end
+                        end
                     end
                 end
             end
@@ -3110,7 +3311,7 @@ fn list_proposal_comments(id: Text, auth: AuthContext, rf: ReadFiles) : Result(
   if not rf.exists?(Db.ledger_db_path)
     return Error(Missing(entity: "proposal", id: id))
   end
-  comments = try Ledger.read_locked(
+  comments_json = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -3128,10 +3329,10 @@ fn list_proposal_comments(id: Text, auth: AuthContext, rf: ReadFiles) : Result(
         Db.proposal_comments_by_proposal(),
         id
       ).map_error(Db.map_table_error)
-      Ok(pairs.map(fn(p) p.1 end).sort_by(fn(c) c.id end))
+      Ok(pairs.map(fn(p) p.1 end).sort_by(fn(c) c.id end).to_json)
     end
   )
-  Ok(json_ok(200, Json.Object({"proposal_id": Json.String(id), "comments": comments.to_json})))
+  Ok(json_ok(200, Json.Object({"proposal_id": Json.String(id), "comments": comments_json})))
 end
 
 ## `POST /api/proposals/:id/comments` — Creates an anchored Patchwork review or steer comment on a proposal.
@@ -3139,12 +3340,19 @@ fn create_proposal_comment(
   req: Api.Request,
   id: Text,
   auth: AuthContext,
-  input: CreateProposalCommentInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = CreateProposalCommentInput(
+    target_kind: rj.text_at("target_kind"),
+    target_ref: rj.text_at("target_ref"),
+    parent_comment_id: rj.text_at("parent_comment_id"),
+    body_markdown: try VaultOps.req_text(rj, "body_markdown"),
+    steer_requested: rj.bool_at("steer_requested")
+  )
   clean_body = input.body_markdown.trim
   if clean_body.empty?
     return Error(BadInput(reason: "comment body_markdown must not be empty"))
@@ -3261,11 +3469,12 @@ fn resolve_proposal_comment(
   id: Text,
   comment_id: Text,
   auth: AuthContext,
-  input: ResolveProposalCommentInput,
   files: Files,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = ResolveProposalCommentInput(resolved: rj.bool_at("resolved"))
   if not files.read_only.exists?(Db.ledger_db_path)
     return Error(Missing(entity: "proposal", id: id))
   end
@@ -3361,11 +3570,18 @@ fn reject_proposal_hunk(
   req: Api.Request,
   id: Text,
   auth: AuthContext,
-  input: RejectProposalHunkInput,
   files: Files,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = RejectProposalHunkInput(
+    target_kind: try VaultOps.req_text(rj, "target_kind"),
+    target_id: try VaultOps.req_text(rj, "target_id"),
+    page_id: rj.text_at("page_id"),
+    database_id: rj.text_at("database_id"),
+    reason: rj.text_at("reason")
+  )
   tk = input.target_kind.trim
   tid = input.target_id.trim
   if tid.empty?
@@ -3385,7 +3601,7 @@ fn reject_proposal_hunk(
   end
   prov = make_provenance(auth, Some(clean_reason), now)
 
-  (pm, comp_mut, sse_page_opt, sse_db_opt) = try Ledger.read_locked(
+  hunk_json = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -3467,7 +3683,18 @@ fn reject_proposal_hunk(
           provenance: prov,
           expected_versions: {}
         )
-        Ok((found, cmut, Some(pid), found.target_database_id))
+        bargs = WorldBranchArgs(mutation: cmut, updated_at: now)
+        Ok(
+          Json.Object({
+            "proposal": found.to_json,
+            "proposal_id": Json.String(found.id),
+            "world_id": Json.String(found.world_id),
+            "collection_id": Json.String(found.collection_id),
+            "bargs": bargs.to_json,
+            "sse_page": Json.String(pid),
+            "sse_db": found.target_database_id.to_json
+          })
+        )
       else
         did = case input.database_id
           Some(d) if not d.trim.empty?: d.trim
@@ -3499,33 +3726,50 @@ fn reject_proposal_hunk(
             BadInput(reason: "cannot reject deleted database row hunk individually")
           )
         end
-        Ok((found, cmut, None, Some(did)))
+        bargs = WorldBranchArgs(mutation: cmut, updated_at: now)
+        Ok(
+          Json.Object({
+            "proposal": found.to_json,
+            "proposal_id": Json.String(found.id),
+            "world_id": Json.String(found.world_id),
+            "collection_id": Json.String(found.collection_id),
+            "bargs": bargs.to_json,
+            "sse_page": Json.Null,
+            "sse_db": Json.String(did)
+          })
+        )
       end
     end
   )
+  pm_json = hunk_json.get("proposal") or Json.Null
+  pm_id = hunk_json.text_at("proposal_id") or id
+  pm_world_id = hunk_json.text_at("world_id") or ""
+  pm_collection_id = hunk_json.text_at("collection_id") or ""
+  bargs_json = hunk_json.get("bargs") or Json.Null
+  sse_page_opt = hunk_json.text_at("sse_page")
+  sse_db_opt = hunk_json.text_at("sse_db")
 
-  bargs = WorldBranchArgs(mutation: comp_mut, updated_at: now)
   step_reply = try World.world_call_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.world_catalog(),
-    pm.world_id,
+    pm_world_id,
     "propose",
-    bargs.to_json,
+    bargs_json,
     clean_reason,
     now
   ).map_error(Db.map_world_error)
 
   upd_ev = Json.Object({
-    "proposal_id": Json.String(pm.id),
+    "proposal_id": Json.String(pm_id),
     "kind": Json.String("reject_hunk"),
     "target_kind": Json.String(tk),
     "target_id": Json.String(tid),
     "actor": Json.String(auth.principal.handle)
   })
-  var resp = json_ok(200, Json.Object({"proposal": pm.to_json, "step_reply": step_reply}))
-    .with_sse_publish_json("collection:#{pm.collection_id}", "proposal.updated", upd_ev)
+  var resp = json_ok(200, Json.Object({"proposal": pm_json, "step_reply": step_reply}))
+    .with_sse_publish_json("collection:#{pm_collection_id}", "proposal.updated", upd_ev)
   case sse_page_opt
     Some(pid) if not pid.trim.empty?:
       resp = resp.with_sse_publish_json("page:#{pid}", "proposal.updated", upd_ev)
@@ -3561,24 +3805,29 @@ fn ensure_github_bridge_auth_locked(
         store = Ledger.store(db)
         p_opt = try Table.get(store, Db.principals_table(), pid).map_error(Db.map_table_error)
         g_opt = try Grants.get(store, gid).map_error(Db.map_grants_error)
-        Ok((p_opt, g_opt))
+        case (p_opt, g_opt)
+          (Some(prn), Some(gr)):
+            if gr.revoked or now > gr.expires_at
+              return Error(
+                Forbidden(reason: "GitHub PR bridge grant '#{gid}' is revoked or expired")
+              )
+            end
+            Ok(Some(prn))
+          (_, _): Ok(None)
+        end
       end
     )
     case existing_opt
-      (Some(prn), Some(gr)):
-        if gr.revoked or now > gr.expires_at
-          return Error(Forbidden(reason: "GitHub PR bridge grant '#{gid}' is revoked or expired"))
-        end
-        return Ok(
-          AuthContext(
-            principal: prn,
-            grant_id: gr.id,
-            session: None,
-            allowed_collections: scopes_opt,
-            allowed_actions: ["read", "propose"]
-          )
+      Some(prn): return Ok(
+        AuthContext(
+          principal: prn,
+          grant_id: gid,
+          session: None,
+          allowed_collections: scopes_opt,
+          allowed_actions: ["read", "propose"]
         )
-      (_, _): Unit
+      )
+      None: Unit
     end
   end
 
@@ -3588,7 +3837,7 @@ fn ensure_github_bridge_auth_locked(
     reason: "initialize proposals-only @github-pr-bridge principal",
     at: now
   )
-  (prn, gr) = try Ledger.transact_locked(
+  prn = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -3637,16 +3886,16 @@ fn ensure_github_bridge_auth_locked(
         )
       end
       t2 = try Db.tx_put_principal(t1, principal)
-      grant = try (try Grants.tx_get(t2, gid).map_error(Db.map_grants_error)).or_fail(
+      _grant = try (try Grants.tx_get(t2, gid).map_error(Db.map_grants_error)).or_fail(
         ServerFailed(reason: "failed loading github bridge grant")
       )
-      Ok((t2, (principal, grant)))
+      Ok((t2, principal))
     end
   )
   Ok(
     AuthContext(
       principal: prn,
-      grant_id: gr.id,
+      grant_id: gid,
       session: None,
       allowed_collections: scopes_opt,
       allowed_actions: ["read", "propose"]
@@ -3691,14 +3940,18 @@ end
 fn stage_pr_proposal_for_page_locked(
   bridge_auth: AuthContext,
   ev: Garden.GithubPrEvent,
-  pg: Page,
-  blks: List(Block),
+  pg_info: Json,
   files: Files,
   rng: SecureRandom,
   clock: Clock,
   env: Env,
   net: Network
-) : Result(ProposalMeta, AppError)
+) : Result(Json, AppError)
+  pg_id = pg_info.text_at("id") or ""
+  pg_col_id = pg_info.text_at("collection_id") or ""
+  pg_title = pg_info.text_at("title") or ""
+  pg_excerpt = pg_info.text_at("excerpt") or ""
+  after_bid_opt = pg_info.text_at("last_block_id")
   now = clock.now
   local_only_ai? = VaultOps.env_ai_local_only?(env)
   allow_llm? = case Ai.ai_config(env)
@@ -3711,7 +3964,7 @@ fn stage_pr_proposal_for_page_locked(
         fn(db)
           VaultOps.ai_allowed_for_collection(
             Ledger.store(db),
-            pg.collection_id,
+            pg_col_id,
             cfg.base_url,
             local_only_ai?
           )
@@ -3721,8 +3974,8 @@ fn stage_pr_proposal_for_page_locked(
   end
   note_md = draft_github_pr_callout(
     ev,
-    pg.title,
-    Blocks.blocks_plain_text(blks.take(4)),
+    pg_title,
+    pg_excerpt,
     allow_llm?,
     env,
     net
@@ -3758,10 +4011,10 @@ fn stage_pr_proposal_for_page_locked(
   new_bid = "blk_#{Id.ulid(rng, clock)}"
   callout_kind = Callout(tone: "NOTE", icon: Some("git-pull-request"))
   wargs = WorldPatchArgs(
-    page_id: pg.id,
+    page_id: pg_id,
     ops: [
       InsertBlockAfter(
-        after_block_id: blks.last.map(fn(b) b.id end),
+        after_block_id: after_bid_opt,
         parent_block_id: None,
         kind: callout_kind,
         markdown: note_md
@@ -3787,11 +4040,11 @@ fn stage_pr_proposal_for_page_locked(
   pm = ProposalMeta(
     id: prop_id,
     world_id: world_id,
-    collection_id: pg.collection_id,
-    target_page_id: pg.id,
+    collection_id: pg_col_id,
+    target_page_id: pg_id,
     target_database_id: None,
     branch_kind: "proposal",
-    title: "PR ##{ev.pr_number}: Sync #{pg.title}",
+    title: "PR ##{ev.pr_number}: Sync #{pg_title}",
     reason: prop_reason,
     author_id: bridge_auth.principal.id,
     author_handle: bridge_auth.principal.handle,
@@ -3816,7 +4069,7 @@ fn stage_pr_proposal_for_page_locked(
     "opened PR ##{ev.pr_number} proposal #{pm.id}",
     Json.Object({
       "proposal_id": Json.String(pm.id),
-      "page_id": Json.String(pg.id),
+      "page_id": Json.String(pg_id),
       "pr_number": Json.int(ev.pr_number)
     }),
     Db.map_ledger_error,
@@ -3833,7 +4086,7 @@ fn stage_pr_proposal_for_page_locked(
         "untrusted",
         now
       )
-      Ok((t3, pm))
+      Ok((t3, pm.to_json))
     end
   )
 end
@@ -3886,7 +4139,7 @@ fn github_pr_webhook(
   bridge_auth = try ensure_github_bridge_auth_locked(files, allowed_cols_opt, now)
   search_q = Garden.build_pr_search_query(ev)
 
-  matches = try Ledger.read_locked(
+  matches_json = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -3911,22 +4164,33 @@ fn github_pr_webhook(
         case try Table.get(store, Db.pages_table(), h.page_id).map_error(Db.map_table_error)
           Some(pg) if pg.archived_at == None and pg.kind == Document:
             blks = try Db.load_page_blocks(store, pg.id)
-            out = out.append((pg, blks))
+            out = out.append(
+              Json.Object({
+                "id": Json.String(pg.id),
+                "collection_id": Json.String(pg.collection_id),
+                "title": Json.String(pg.title),
+                "excerpt": Json.String(Blocks.blocks_plain_text(blks.take(4))),
+                "last_block_id": blks.last.map(fn(b) b.id end).to_json
+              })
+            )
           Some(_) | None: Unit
         end
       end
-      Ok(out)
+      Ok(Json.Array(out))
     end
   )
+  matches = case matches_json
+    Json.Array(xs): xs
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Object(_): []
+  end
 
   var staged_props = []
   var sse_cols = []
-  for (pg, blks) in matches
+  for pg_info in matches
     saved_pm = try stage_pr_proposal_for_page_locked(
       bridge_auth,
       ev,
-      pg,
-      blks,
+      pg_info,
       files,
       rng,
       clock,
@@ -3934,7 +4198,7 @@ fn github_pr_webhook(
       net
     )
     staged_props = staged_props.append(saved_pm)
-    sse_cols = sse_cols.append((saved_pm.collection_id, saved_pm.target_page_id, saved_pm))
+    sse_cols = sse_cols.append(saved_pm)
   end
 
   status = if staged_props.empty?: 200 else: 201
@@ -3946,15 +4210,19 @@ fn github_pr_webhook(
       "pr_number": Json.int(ev.pr_number),
       "repo": Json.String(ev.repo_full_name),
       "matched_pages": Json.int(matches.size),
-      "proposals": staged_props.to_json
+      "proposals": Json.Array(staged_props)
     })
   )
-  for (cid, pid, spm) in sse_cols
+  for spm in sse_cols
+    prop_id_s = spm.text_at("id") or ""
+    pid = spm.text_at("target_page_id") or ""
+    cid = spm.text_at("collection_id") or ""
+    prop_title_s = spm.text_at("title") or ""
     pev = Json.Object({
-      "proposal_id": Json.String(spm.id),
+      "proposal_id": Json.String(prop_id_s),
       "page_id": Json.String(pid),
       "collection_id": Json.String(cid),
-      "title": Json.String(spm.title),
+      "title": Json.String(prop_title_s),
       "actor": Json.String(bridge_auth.principal.handle)
     })
     resp = resp.with_sse_publish_json("page:#{pid}", "proposal.opened", pev)

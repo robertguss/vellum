@@ -17,6 +17,7 @@ use Modb.Grants
 use Modb.Ledger
 use Modb.Table
 use Routes.Auth
+use VaultOps
 
 ## JSON payload for `POST /api/import/notion`.
 struct ImportNotionInput
@@ -54,12 +55,33 @@ end
 fn import_notion(
   req: Api.Request,
   auth: AuthContext,
-  input: ImportNotionInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  col_id = try VaultOps.req_text(rj, "collection_id")
+  var imp_pages = []
+  for pj in rj.list_at("pages") or []
+    imp_pages = imp_pages.append(
+      NotionPageImport(
+        path: try VaultOps.req_text(pj, "path"),
+        title: pj.text_at("title"),
+        markdown: try VaultOps.req_text(pj, "markdown")
+      )
+    )
+  end
+  var imp_dbs = []
+  for dj in rj.list_at("databases") or []
+    imp_dbs = imp_dbs.append(
+      NotionCsvImport(
+        title: try VaultOps.req_text(dj, "title"),
+        csv_text: try VaultOps.req_text(dj, "csv_text")
+      )
+    )
+  end
+  input = ImportNotionInput(collection_id: col_id, pages: imp_pages, databases: imp_dbs)
   try Policy.require_collection_access(auth, "write_direct", input.collection_id)
   if not input.databases.empty?
     try Policy.require_collection_access(auth, "manage_schema", input.collection_id)

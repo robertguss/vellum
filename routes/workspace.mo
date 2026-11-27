@@ -55,6 +55,7 @@ use Arvo.Modb.Jobs
 use Arvo.Modb.Sessions
 use Arvo.S3
 use Arvo.Webhooks
+use ChatOps
 use Crypto
 use Db
 use ErasureOps
@@ -68,7 +69,9 @@ use Domain.DatabaseModel{
   EnrichedRow,
   PropertyDef,
   PropertyKind,
-  RollupAgg
+  RollupAgg,
+  decode_cell_map_json,
+  decode_property_defs_json
 }
 use Domain.Packs{LivingSummary}
 use Domain.Policy
@@ -1138,8 +1141,13 @@ fn home(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: Env) : 
     return Error(Forbidden(reason: "grant '#{a.grant_id}' does not permit 'read'"))
   end
 
-  (cols, dbs, pages, audit_feed) = if not rf.exists?(Db.ledger_db_path)
-    ([], [], [], [])
+  home_json = if not rf.exists?(Db.ledger_db_path)
+    Json.Object({
+      "collections": Json.Array([]),
+      "databases": Json.Array([]),
+      "pages": Json.Array([]),
+      "audit_feed": Json.Array([])
+    })
   else
     try Ledger.read_locked(
       rf,
@@ -1161,20 +1169,31 @@ fn home(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: Env) : 
         end
         entries = try Ledger.audit_tail_store(store, 20).map_error(Db.map_ledger_error)
         feed = entries.map(audit_entry_to_feed)
-        Ok((c_list, d_list, visible_pages, feed))
+        Ok(
+          Json.Object({
+            "collections": c_list.to_json,
+            "databases": d_list.to_json,
+            "pages": visible_pages.to_json,
+            "audit_feed": feed.to_json
+          })
+        )
       end
     )
   end
+  cols_json = home_json.get("collections") or Json.Array([])
+  dbs_json = home_json.get("databases") or Json.Array([])
+  pages_json = home_json.get("pages") or Json.Array([])
+  feed_json = home_json.get("audit_feed") or Json.Array([])
 
   if Auth.wants_json?(req)
     return Ok(
       json_ok(
         200,
         Json.Object({
-          "collections": cols.to_json,
-          "databases": dbs.to_json,
-          "pages": pages.to_json,
-          "audit_feed": audit_feed.to_json
+          "collections": cols_json,
+          "databases": dbs_json,
+          "pages": pages_json,
+          "audit_feed": feed_json
         })
       )
     )
@@ -1187,10 +1206,10 @@ fn home(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: Env) : 
     env,
     "Workspace/Home",
     {
-      "collections": cols.to_json,
-      "databases": dbs.to_json,
-      "pages": pages.to_json,
-      "audit_feed": audit_feed.to_json
+      "collections": cols_json,
+      "databases": dbs_json,
+      "pages": pages_json,
+      "audit_feed": feed_json
     }
   )
 end
@@ -1276,12 +1295,30 @@ end
 fn create_collection(
   req: Api.Request,
   auth: AuthContext,
-  input: CreateCollectionInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  wp_raw = try VaultOps.req_text(rj, "write_policy")
+  wp = if wp_raw == "direct_with_audit"
+    DirectWithAudit
+  else if wp_raw == "proposals_required_for_agents"
+    ProposalsRequiredForAgents
+  else if wp_raw == "proposals_required_for_all"
+    ProposalsRequiredForAll
+  else
+    return Error(BadInput(reason: "invalid write_policy '#{wp_raw}'"))
+  end
+  input = CreateCollectionInput(
+    slug: try VaultOps.req_text(rj, "slug"),
+    name: try VaultOps.req_text(rj, "name"),
+    description: rj.text_at("description"),
+    icon: rj.text_at("icon"),
+    write_policy: wp,
+    freshness_ttl_days: rj.int_at("freshness_ttl_days")
+  )
   if not Policy.action_permitted?(auth, "manage_schema")
     return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'manage_schema'"))
   end
@@ -1640,12 +1677,21 @@ end
 fn create_page(
   req: Api.Request,
   auth: AuthContext,
-  input: CreatePageInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = CreatePageInput(
+    collection_id: try VaultOps.req_text(rj, "collection_id"),
+    parent_page_id: rj.text_at("parent_page_id"),
+    title: try VaultOps.req_text(rj, "title"),
+    markdown: try VaultOps.req_text(rj, "markdown"),
+    icon: rj.text_at("icon"),
+    freshness_ttl_days: rj.int_at("freshness_ttl_days"),
+    reason: rj.text_at("reason")
+  )
   clean_title = input.title.trim
   if clean_title.empty?
     return Error(BadInput(reason: "page title must not be empty"))
@@ -1795,12 +1841,21 @@ fn update_page(
   req: Api.Request,
   id: Text,
   auth: AuthContext,
-  input: UpdatePageInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = UpdatePageInput(
+    title: rj.text_at("title"),
+    parent_page_id: rj.text_at("parent_page_id"),
+    clear_parent: rj.bool_at("clear_parent"),
+    icon: rj.text_at("icon"),
+    cover_attachment_id: rj.text_at("cover_attachment_id"),
+    clear_cover: rj.bool_at("clear_cover"),
+    reason: rj.text_at("reason")
+  )
   case input.title
     Some(t) if t.trim.empty?: return Error(BadInput(reason: "page title must not be empty"))
     Some(_) | None: Unit
@@ -1984,12 +2039,29 @@ fn patch_blocks(
   req: Api.Request,
   id: Text,
   auth: AuthContext,
-  input: PatchBlocksInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  ops_in = case rj.get("ops")
+    None: return Error(BadInput(reason: "missing 'ops' array"))
+    Some(oj): try Blocks.decode_block_ops_json(oj.to_text.bytes).map_error(fn(e)
+      BadInput(reason: "invalid 'ops': #{e}")
+    end)
+  end
+  exp_in = case rj.get("expected_versions")
+    None | Some(Json.Null): {}
+    Some(ej): try Blocks.decode_version_map_json(ej.to_text.bytes).map_error(fn(e)
+      BadInput(reason: "invalid 'expected_versions': #{e}")
+    end)
+  end
+  input = PatchBlocksInput(
+    ops: ops_in,
+    expected_versions: exp_in,
+    reason: rj.text_at("reason")
+  )
   if input.ops.empty?
     return Error(BadInput(reason: "ops must not be empty"))
   end
@@ -2156,10 +2228,8 @@ fn verify_page(req: Api.Request, id: Text, auth: AuthContext, files: Files, cloc
   ttl_override = if req.body.empty?
     None
   else
-    parsed = try Json.decode_strict[VerifyPageInput](req.body).map_error(fn(e)
-      BadInput(reason: "invalid verify payload: #{e.to_text}")
-    end)
-    parsed.freshness_ttl_days
+    rj = try VaultOps.parse_req_json_obj(req.text)
+    rj.int_at("freshness_ttl_days")
   end
 
   action_needed = if Policy.action_permitted?(auth, "publish")
@@ -2271,16 +2341,40 @@ fn search(
     env,
     net
   )
-  Ok(
-    json_ok(
-      200,
-      Json.Object({
-        "results": out.results.to_json,
-        "mode": Json.String(out.mode),
-        "vector_backend": Json.String(out.vector_backend)
-      })
+  chat_hits_opt = if req.query_param("include_chat") == Some("1") and
+    rf.exists?(Db.ledger_db_path)
+    hits_j = try Ledger.read_locked(
+      rf,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      Db.map_ledger_error,
+      fn(db)
+        hits = try ChatOps.search_visible_messages(
+          Ledger.store(db),
+          auth,
+          q,
+          None,
+          col_filter,
+          false,
+          limit
+        )
+        Ok(Json.Array(hits))
+      end
     )
-  )
+    Some(hits_j)
+  else
+    None
+  end
+  base_map = {
+    "results": out.results.to_json,
+    "mode": Json.String(out.mode),
+    "vector_backend": Json.String(out.vector_backend)
+  }
+  final_map = case chat_hits_opt
+    Some(hits_j): base_map.set("chat_results", hits_j)
+    None: base_map
+  end
+  Ok(json_ok(200, Json.Object(final_map)))
 end
 
 ## `POST /api/pages/:id/comments` — Creates a page or block comment.
@@ -2288,12 +2382,17 @@ fn create_comment(
   req: Api.Request,
   id: Text,
   auth: AuthContext,
-  input: CreateCommentInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = CreateCommentInput(
+    block_id: rj.text_at("block_id"),
+    parent_comment_id: rj.text_at("parent_comment_id"),
+    body_markdown: try VaultOps.req_text(rj, "body_markdown")
+  )
   body_md = input.body_markdown.trim
   if body_md.empty?
     return Error(BadInput(reason: "comment body_markdown must not be empty"))
@@ -2356,13 +2455,20 @@ end
 fn presign_attachment(
   req: Api.Request,
   auth: AuthContext,
-  input: PresignAttachmentInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock,
   env: Env
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = PresignAttachmentInput(
+    page_id: try VaultOps.req_text(rj, "page_id"),
+    filename: try VaultOps.req_text(rj, "filename"),
+    content_type: try VaultOps.req_text(rj, "content_type"),
+    size_bytes: try VaultOps.req_int(rj, "size_bytes"),
+    sha256_hex: rj.text_at("sha256_hex")
+  )
   if input.size_bytes < 1 or input.size_bytes > 524288000
     return Error(BadInput(reason: "size_bytes must be between 1 and 524288000 (500 MiB)"))
   end
@@ -2401,7 +2507,11 @@ fn presign_attachment(
     )
   else
     s3_cfg = try Auth.s3_config(env)
-    raw_key = "workspaces/#{Db.default_workspace_id}/pages/#{input.page_id}/#{att_id}/#{clean_name}"
+    raw_key = if input.page_id.starts_with?("ch_")
+      "workspaces/#{Db.default_workspace_id}/chat/#{input.page_id}/#{att_id}/#{clean_name}"
+    else
+      "workspaces/#{Db.default_workspace_id}/pages/#{input.page_id}/#{att_id}/#{clean_name}"
+    end
     s3_key = try S3.sanitize_object_key(raw_key).map_error(map_s3_error)
     put_opts = S3.PresignPutOptions(
       expires_seconds: 900,
@@ -2454,13 +2564,21 @@ fn presign_attachment(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, upload_action, now)
-      page = case try Table.tx_get(t1, Db.pages_table(), input.page_id).map_error(
-        Db.map_table_error
-      )
-        Some(p) if p.archived_at == None: p
-        Some(_) | None: return Error(Missing(entity: "page", id: input.page_id))
+      if input.page_id.starts_with?("ch_")
+        ch = case try ChatOps.tx_get_channel(t1, input.page_id)
+          Some(c) if c.text_at("archived_at") == None: c
+          Some(_) | None: return Error(Missing(entity: "chat_channel", id: input.page_id))
+        end
+        try ChatOps.require_channel_access(auth, ch, upload_action)
+      else
+        page = case try Table.tx_get(t1, Db.pages_table(), input.page_id).map_error(
+          Db.map_table_error
+        )
+          Some(p) if p.archived_at == None: p
+          Some(_) | None: return Error(Missing(entity: "page", id: input.page_id))
+        end
+        try Policy.require_collection_access(auth, upload_action, page.collection_id)
       end
-      try Policy.require_collection_access(auth, upload_action, page.collection_id)
       t2 = try Table.put(t1, Db.attachments_table(), att.id, att).map_error(Db.map_table_error)
       Ok((t2, Unit))
     end
@@ -2511,7 +2629,7 @@ fn upload_local_attachment(
     None: return Error(Forbidden(reason: "application secret key is uninitialized"))
   end
 
-  att = try Ledger.read_locked(
+  att_json = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -2523,20 +2641,26 @@ fn upload_local_attachment(
         Some(x): x
         None: return Error(Missing(entity: "attachment", id: id))
       end
-      Ok(a)
+      Ok(a.to_json)
     end
   )
-  if att.s3_bucket != "local"
+  att_id = att_json.text_at("id") or ""
+  att_s3_bucket = att_json.text_at("s3_bucket") or ""
+  att_status = att_json.text_at("status") or ""
+  att_size_bytes = att_json.int_at("size_bytes") or 0
+  att_sha256_hex = att_json.text_at("sha256_hex") or ""
+  att_s3_key = att_json.text_at("s3_key") or ""
+  if att_s3_bucket != "local"
     return Error(BadInput(reason: "attachment '#{id}' uses S3 object storage, not local upload"))
   end
-  if att.status != "pending"
-    return Error(Conflict(reason: "attachment '#{id}' is '#{att.status}', not 'pending'"))
+  if att_status != "pending"
+    return Error(Conflict(reason: "attachment '#{id}' is '#{att_status}', not 'pending'"))
   end
-  if not Auth.verify_local_attachment_sig(key, att.id, exp_sec, att.size_bytes, att.sha256_hex, sig)
+  if not Auth.verify_local_attachment_sig(key, att_id, exp_sec, att_size_bytes, att_sha256_hex, sig)
     return Error(Forbidden(reason: "invalid local attachment upload signature"))
   end
 
-  try files.make_folder("attachments/#{att.id}").map_error(map_file_error)
+  try files.make_folder("attachments/#{att_id}").map_error(map_file_error)
   case req.query_param("offset")
     Some(raw_off):
       off = case raw_off.trim.to_int
@@ -2546,12 +2670,12 @@ fn upload_local_attachment(
       if req.body.size <= 0 or req.body.size > 16777216
         return Error(BadInput(reason: "chunk size must be between 1 and 16777216 (16 MiB)"))
       end
-      if off + req.body.size > att.size_bytes
+      if off + req.body.size > att_size_bytes
         return Error(
-          BadInput(reason: "chunk offset + size (#{off + req.body.size}) exceeds #{att.size_bytes}")
+          BadInput(reason: "chunk offset + size (#{off + req.body.size}) exceeds #{att_size_bytes}")
         )
       end
-      fh = try files.open(att.s3_key).map_error(map_file_error)
+      fh = try files.open(att_s3_key).map_error(map_file_error)
       try fh.write_at(off, req.body).map_error(map_file_error)
       try fh.sync.map_error(map_file_error)
       cur_sz = try fh.size.map_error(map_file_error)
@@ -2560,7 +2684,7 @@ fn upload_local_attachment(
           200,
           Json.Object({
             "ok": Json.Boolean(true),
-            "attachment_id": Json.String(att.id),
+            "attachment_id": Json.String(att_id),
             "offset": Json.int(off),
             "chunk_bytes": Json.int(req.body.size),
             "file_size": Json.int(cur_sz)
@@ -2568,24 +2692,24 @@ fn upload_local_attachment(
         )
       )
     None:
-      if req.body.size != att.size_bytes or req.body.size > 524288000
+      if req.body.size != att_size_bytes or req.body.size > 524288000
         return Error(
-          BadInput(reason: "expected #{att.size_bytes} bytes, received #{req.body.size} bytes")
+          BadInput(reason: "expected #{att_size_bytes} bytes, received #{req.body.size} bytes")
         )
       end
-      if not att.sha256_hex.empty?
+      if not att_sha256_hex.empty?
         actual_sha = Crypto.sha256(req.body).to_hex.bytes
-        if not Crypto.constant_time_eq?(actual_sha, att.sha256_hex.ascii_lowercase.bytes)
+        if not Crypto.constant_time_eq?(actual_sha, att_sha256_hex.ascii_lowercase.bytes)
           return Error(BadInput(reason: "uploaded attachment SHA-256 digest mismatch"))
         end
       end
-      try files.write_bytes(att.s3_key, req.body).map_error(map_file_error)
+      try files.write_bytes(att_s3_key, req.body).map_error(map_file_error)
       return Ok(
         json_ok(
           200,
           Json.Object({
             "ok": Json.Boolean(true),
-            "attachment_id": Json.String(att.id),
+            "attachment_id": Json.String(att_id),
             "size_bytes": Json.int(req.body.size)
           })
         )
@@ -2641,7 +2765,7 @@ end
 
 ## `POST /api/attachments/:id/commit` — Marks an uploaded S3 or local-disk attachment `"ready"`.
 fn commit_attachment(req: Api.Request, id: Text, auth: AuthContext, files: Files, clock: Clock) : Result(
-  Attachment,
+  Api.Response,
   AppError
 )
   try Auth.require_session_csrf(req, auth)
@@ -2660,28 +2784,32 @@ fn commit_attachment(req: Api.Request, id: Text, auth: AuthContext, files: Files
     Db.map_ledger_error,
     fn(db)
       case try Table.get(Ledger.store(db), Db.attachments_table(), id).map_error(Db.map_table_error)
-        Some(a): Ok(a)
+        Some(a): Ok(a.to_json)
         None: Error(Missing(entity: "attachment", id: id))
       end
     end
   )
-  if pre_att.s3_bucket == "local"
-    if not files.read_only.exists?(pre_att.s3_key)
+  pre_s3_bucket = pre_att.text_at("s3_bucket") or ""
+  pre_s3_key = pre_att.text_at("s3_key") or ""
+  pre_size_bytes = pre_att.int_at("size_bytes") or 0
+  pre_sha256_hex = pre_att.text_at("sha256_hex") or ""
+  if pre_s3_bucket == "local"
+    if not files.read_only.exists?(pre_s3_key)
       return Error(BadInput(reason: "local attachment payload has not been uploaded yet"))
     end
-    lf = try files.read_only.open(pre_att.s3_key).map_error(map_file_error)
+    lf = try files.read_only.open(pre_s3_key).map_error(map_file_error)
     actual_sz = try lf.size.map_error(map_file_error)
-    if actual_sz != pre_att.size_bytes
+    if actual_sz != pre_size_bytes
       return Error(
         BadInput(
-          reason: "local attachment incomplete: expected #{pre_att.size_bytes} bytes, got #{actual_sz} bytes"
+          reason: "local attachment incomplete: expected #{pre_size_bytes} bytes, got #{actual_sz} bytes"
         )
       )
     end
-    if not pre_att.sha256_hex.empty? and pre_att.size_bytes <= 67108864
-      full_bytes = try files.read_only.read_bytes(pre_att.s3_key).map_error(map_file_error)
+    if not pre_sha256_hex.empty? and pre_size_bytes <= 67108864
+      full_bytes = try files.read_only.read_bytes(pre_s3_key).map_error(map_file_error)
       actual_sha = Crypto.sha256(full_bytes).to_hex.bytes
-      if not Crypto.constant_time_eq?(actual_sha, pre_att.sha256_hex.ascii_lowercase.bytes)
+      if not Crypto.constant_time_eq?(actual_sha, pre_sha256_hex.ascii_lowercase.bytes)
         return Error(BadInput(reason: "uploaded attachment SHA-256 digest mismatch"))
       end
     end
@@ -2696,7 +2824,7 @@ fn commit_attachment(req: Api.Request, id: Text, auth: AuthContext, files: Files
   )
   audit_payload = Json.Object({"attachment_id": Json.String(id)})
 
-  Ledger.transact_locked(
+  ready_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -2710,13 +2838,21 @@ fn commit_attachment(req: Api.Request, id: Text, auth: AuthContext, files: Files
         Some(a): a
         None: return Error(Missing(entity: "attachment", id: id))
       end
-      page = case try Table.tx_get(t1, Db.pages_table(), old_att.page_id).map_error(
-        Db.map_table_error
-      )
-        Some(p) if p.archived_at == None: p
-        Some(_) | None: return Error(Missing(entity: "page", id: old_att.page_id))
+      if old_att.page_id.starts_with?("ch_")
+        ch = case try ChatOps.tx_get_channel(t1, old_att.page_id)
+          Some(c) if c.text_at("archived_at") == None: c
+          Some(_) | None: return Error(Missing(entity: "chat_channel", id: old_att.page_id))
+        end
+        try ChatOps.require_channel_access(auth, ch, upload_action)
+      else
+        page = case try Table.tx_get(t1, Db.pages_table(), old_att.page_id).map_error(
+          Db.map_table_error
+        )
+          Some(p) if p.archived_at == None: p
+          Some(_) | None: return Error(Missing(entity: "page", id: old_att.page_id))
+        end
+        try Policy.require_collection_access(auth, upload_action, page.collection_id)
       end
-      try Policy.require_collection_access(auth, upload_action, page.collection_id)
       ready = Attachment(
         id: old_att.id,
         workspace_id: old_att.workspace_id,
@@ -2732,9 +2868,10 @@ fn commit_attachment(req: Api.Request, id: Text, auth: AuthContext, files: Files
         created_at: old_att.created_at
       )
       t2 = try Table.put(t1, Db.attachments_table(), ready.id, ready).map_error(Db.map_table_error)
-      Ok((t2, ready))
+      Ok((t2, ready.to_json))
     end
   )
+  Ok(json_ok(200, ready_json))
 end
 
 ## `GET /api/attachments/:id/download` — Enforces collection grant & redirects (`302`) to S3 or serves local file (plus FERPA read audit when restricted).
@@ -2761,12 +2898,25 @@ fn download_attachment(
         Some(x): x
         None: return Error(Missing(entity: "attachment", id: id))
       end
-      page = case try Table.get(store, Db.pages_table(), a.page_id).map_error(Db.map_table_error)
-        Some(p) if p.archived_at == None: p
-        Some(_) | None: return Error(Missing(entity: "page", id: a.page_id))
+      ferpa_col = if a.page_id.starts_with?("ch_")
+        ch = case try ChatOps.get_channel(store, a.page_id)
+          Some(c) if c.text_at("archived_at") == None: c
+          Some(_) | None: return Error(Missing(entity: "chat_channel", id: a.page_id))
+        end
+        try ChatOps.require_channel_access(auth, ch, "read")
+        case ChatOps.channel_collection_id(ch)
+          Some(cid): if try VaultOps.is_ferpa_restricted(store, cid): Json.String(cid) else: Json.Null
+          None: Json.Null
+        end
+      else
+        page = case try Table.get(store, Db.pages_table(), a.page_id).map_error(Db.map_table_error)
+          Some(p) if p.archived_at == None: p
+          Some(_) | None: return Error(Missing(entity: "page", id: a.page_id))
+        end
+        try Policy.require_collection_access(auth, "read", page.collection_id)
+        is_ferpa? = try VaultOps.is_ferpa_restricted(store, page.collection_id)
+        if is_ferpa?: Json.String(page.collection_id) else: Json.Null
       end
-      try Policy.require_collection_access(auth, "read", page.collection_id)
-      is_ferpa? = try VaultOps.is_ferpa_restricted(store, page.collection_id)
       Ok(
         Json.Object({
           "id": Json.String(a.id),
@@ -2775,7 +2925,7 @@ fn download_attachment(
           "s3_key": Json.String(a.s3_key),
           "content_type": Json.String(a.content_type),
           "filename": Json.String(a.filename),
-          "ferpa_col": if is_ferpa?: Json.String(page.collection_id) else: Json.Null
+          "ferpa_col": ferpa_col
         })
       )
     end
@@ -2867,12 +3017,22 @@ end
 fn mint_agent_token(
   req: Api.Request,
   auth: AuthContext,
-  input: MintAgentTokenInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = MintAgentTokenInput(
+    handle: try VaultOps.req_text(rj, "handle"),
+    display_name: try VaultOps.req_text(rj, "display_name"),
+    model_id: rj.text_at("model_id"),
+    label: try VaultOps.req_text(rj, "label"),
+    allowed_actions: VaultOps.json_text_list_raw(rj, "allowed_actions"),
+    allowed_collections: VaultOps.json_text_list_opt(rj, "allowed_collections"),
+    max_calls: try VaultOps.req_int(rj, "max_calls"),
+    ttl_days: try VaultOps.req_int(rj, "ttl_days")
+  )
   role_ok = auth.principal.role == Owner or auth.principal.role == Admin
   if not role_ok or not Policy.action_permitted?(auth, "manage_grants")
     return Error(
@@ -3331,7 +3491,7 @@ fn kill_all_agent_grants(
     reason: clean_reason,
     at: now
   )
-  revoked_ids = try Ledger.transact_locked(
+  rev_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -3384,9 +3544,10 @@ fn kill_all_agent_grants(
           cur = try Db.tx_put_agent_token(cur, upd_tok)
         end
       end
-      Ok((cur, revoked_ids))
+      Ok((cur, Json.Object({"ids": revoked_ids.to_json})))
     end
   )
+  revoked_ids = VaultOps.json_text_list_raw(rev_json, "ids")
 
   kill_ev = Json.Object({
     "revoked_grant_ids": revoked_ids.to_json,
@@ -3415,17 +3576,17 @@ fn audit_index(req: Api.Request, auth: AuthContext, rf: ReadFiles) : Result(Api.
     return Ok(json_ok(200, Json.Object({"audit_feed": Json.Array([])})))
   end
   limit = parse_limit(req.query_param("limit"), 50, 200)
-  feed = try Ledger.read_locked(
+  feed_json = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
     fn(db)
       entries = try Ledger.audit_tail_store(Ledger.store(db), limit).map_error(Db.map_ledger_error)
-      Ok(entries.map(audit_entry_to_feed))
+      Ok(entries.map(audit_entry_to_feed).to_json)
     end
   )
-  Ok(json_ok(200, Json.Object({"audit_feed": feed.to_json})))
+  Ok(json_ok(200, Json.Object({"audit_feed": feed_json})))
 end
 
 ## `GET /proposals` — Renders the Change Proposals Review Inbox (`ReadFiles`-only).
@@ -3441,8 +3602,8 @@ fn proposals_page(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, en
     return Error(Forbidden(reason: "grant '#{a.grant_id}' does not permit 'read'"))
   end
 
-  (cols, dbs, proposals) = if not rf.exists?(Db.ledger_db_path)
-    ([], [], [])
+  prop_json = if not rf.exists?(Db.ledger_db_path)
+    Json.Object({"collections": Json.Array([]), "databases": Json.Array([]), "proposals": Json.Array([])})
   else
     try Ledger.read_locked(
       rf,
@@ -3462,19 +3623,28 @@ fn proposals_page(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, en
             out = out.append(p)
           end
         end
-        Ok((c_list, d_list, out))
+        Ok(
+          Json.Object({
+            "collections": c_list.to_json,
+            "databases": d_list.to_json,
+            "proposals": out.to_json
+          })
+        )
       end
     )
   end
+  cols_json = prop_json.get("collections") or Json.Array([])
+  dbs_json = prop_json.get("databases") or Json.Array([])
+  props_json = prop_json.get("proposals") or Json.Array([])
 
   if Auth.wants_json?(req)
     return Ok(
       json_ok(
         200,
         Json.Object({
-          "collections": cols.to_json,
-          "databases": dbs.to_json,
-          "proposals": proposals.to_json
+          "collections": cols_json,
+          "databases": dbs_json,
+          "proposals": props_json
         })
       )
     )
@@ -3486,7 +3656,7 @@ fn proposals_page(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, en
     rf,
     env,
     "Workspace/Proposals",
-    {"collections": cols.to_json, "databases": dbs.to_json, "proposals": proposals.to_json}
+    {"collections": cols_json, "databases": dbs_json, "proposals": props_json}
   )
 end
 
@@ -3503,8 +3673,13 @@ fn admin_page(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: E
     return Error(Forbidden(reason: "grant '#{a.grant_id}' does not permit 'read'"))
   end
 
-  (cols, dbs, feed, hooks) = if not rf.exists?(Db.ledger_db_path)
-    ([], [], [], [])
+  admin_json = if not rf.exists?(Db.ledger_db_path)
+    Json.Object({
+      "collections": Json.Array([]),
+      "databases": Json.Array([]),
+      "audit_feed": Json.Array([]),
+      "webhooks": Json.Array([])
+    })
   else
     try Ledger.read_locked(
       rf,
@@ -3538,20 +3713,31 @@ fn admin_page(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: E
         else
           []
         end
-        Ok((c_list, d_list, audit_items, hook_items))
+        Ok(
+          Json.Object({
+            "collections": c_list.to_json,
+            "databases": d_list.to_json,
+            "audit_feed": audit_items.to_json,
+            "webhooks": Json.Array(hook_items)
+          })
+        )
       end
     )
   end
+  cols_json = admin_json.get("collections") or Json.Array([])
+  dbs_json = admin_json.get("databases") or Json.Array([])
+  feed_json = admin_json.get("audit_feed") or Json.Array([])
+  hooks_json = admin_json.get("webhooks") or Json.Array([])
 
   if Auth.wants_json?(req)
     return Ok(
       json_ok(
         200,
         Json.Object({
-          "collections": cols.to_json,
-          "databases": dbs.to_json,
-          "audit_feed": feed.to_json,
-          "webhooks": Json.Array(hooks)
+          "collections": cols_json,
+          "databases": dbs_json,
+          "audit_feed": feed_json,
+          "webhooks": hooks_json
         })
       )
     )
@@ -3564,20 +3750,41 @@ fn admin_page(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: E
     env,
     "Workspace/Admin",
     {
-      "collections": cols.to_json,
-      "databases": dbs.to_json,
-      "audit_feed": feed.to_json,
-      "webhooks": Json.Array(hooks)
+      "collections": cols_json,
+      "databases": dbs_json,
+      "audit_feed": feed_json,
+      "webhooks": hooks_json
     }
   )
 end
 
 fn extract_indexed_page_id(payload_json: Text) : Result(Text, Text)
-  parsed = try Json.decode_strict[Json](payload_json.bytes).map_error(fn(e) e.to_text end)
+  parsed = try Json.parse(payload_json).map_error(fn(e) e.to_text end)
   case parsed.text_at("page_id")
     Some(pid) if not pid.trim.empty?: Ok(pid.trim)
     Some(_) | None: Error("vellum.page.indexed payload missing non-empty 'page_id'")
   end
+end
+
+fn parse_webhook_job_payload(raw: Text) : Result(WebhookJobPayload, Text)
+  j = try Json.parse(raw).map_error(fn(e) e.to_text end)
+  wid = try j.text_at("webhook_id").or_fail("missing webhook_id")
+  did = try j.text_at("delivery_id").or_fail("missing delivery_id")
+  url = try j.text_at("url").or_fail("missing url")
+  sec = try j.text_at("secret").or_fail("missing secret")
+  evt = try j.text_at("event").or_fail("missing event")
+  bj = j.get("body_json") or Json.Null
+  Ok(
+    WebhookJobPayload(
+      webhook_id: wid,
+      delivery_id: did,
+      url: url,
+      secret: sec,
+      event: evt,
+      body_json: bj,
+      taint_session_id: j.text_at("taint_session_id")
+    )
+  )
 end
 
 fn refresh_semantic_summary_if_stale(
@@ -3598,7 +3805,7 @@ fn refresh_semantic_summary_if_stale(
       store = Ledger.store(db)
       pg = case try Table.get(store, Db.pages_table(), pid).map_error(Db.map_table_error)
         Some(p) if p.archived_at == None and p.kind == Document: p
-        Some(_) | None: return Ok(None)
+        Some(_) | None: return Ok(Json.Object({"ready": Json.Boolean(false)}))
       end
       if not try VaultOps.ai_allowed_for_collection(
         store,
@@ -3606,7 +3813,7 @@ fn refresh_semantic_summary_if_stale(
         cfg.base_url,
         local_only_ai?
       )
-        return Ok(None)
+        return Ok(Json.Object({"ready": Json.Boolean(false)}))
       end
       s_opt = try Table.get(store, Db.summaries_table(), Db.page_summary_key(pg.id)).map_error(
         Db.map_table_error
@@ -3615,15 +3822,23 @@ fn refresh_semantic_summary_if_stale(
         Some(sm): sm.semantic_source_version < pg.version or sm.semantic_summary == None
         None: false
       end
-      return Ok(None) if not needs_refresh?
+      return Ok(Json.Object({"ready": Json.Boolean(false)})) if not needs_refresh?
       blks = try Db.load_page_blocks(store, pg.id)
       plain = Blocks.blocks_plain_text(blks)
-      Ok(Some((pg.title, pg.version, plain)))
+      Ok(
+        Json.Object({
+          "ready": Json.Boolean(true),
+          "title": Json.String(pg.title),
+          "version": Json.int(pg.version),
+          "plain": Json.String(plain)
+        })
+      )
     end
   )
   (title, pg_ver, plain) = case prep_res
-    Ok(Some(t)): t
-    Ok(None) | Error(_): return Unit
+    Ok(j) if j.bool_at("ready") == Some(true):
+      (j.text_at("title") or "", j.int_at("version") or 0, j.text_at("plain") or "")
+    Ok(_) | Error(_): return Unit
   end
   sem_txt = case Ai.generate_semantic_summary(cfg, title, plain, net)
     Ok(s) if not s.trim.empty?: s.trim
@@ -3705,14 +3920,14 @@ fn drain_jobs(_payload: Json, files: Files, clock: Clock, env: Env, net: Network
       None: keep_going = false
       Some(job):
         if job.job_name == "vellum.webhook.deliver"
-          case Json.decode_strict[WebhookJobPayload](job.payload_json.bytes)
+          case parse_webhook_job_payload(job.payload_json)
             Error(e): try Jobs.fail_or_retry(
               files,
               Db.ledger_db_path,
               clock,
               job.id,
               job.attempts,
-              e.to_text
+              e
             ).map_error(Db.map_table_error)
             Ok(wp):
               taint_check = case wp.taint_session_id
@@ -3817,7 +4032,7 @@ fn drain_jobs(_payload: Json, files: Files, clock: Clock, env: Env, net: Network
                             ecfg.base_url,
                             local_only_ai?
                           )
-                            return Ok(None)
+                            return Ok(Json.Object({"ready": Json.Boolean(false)}))
                           end
                           blks = try Db.load_page_blocks(store, pg.id)
                           extra = case pg.kind
@@ -3852,11 +4067,11 @@ fn drain_jobs(_payload: Json, files: Files, clock: Clock, env: Env, net: Network
                           end
                           txt = Db.page_embedding_text(pg, blks, extra)
                           if txt.trim.empty?
-                            Ok(None)
+                            Ok(Json.Object({"ready": Json.Boolean(false)}))
                           else
-                            Ok(Some(txt))
+                            Ok(Json.Object({"ready": Json.Boolean(true), "text": Json.String(txt)}))
                           end
-                        Some(_) | None: Ok(None)
+                        Some(_) | None: Ok(Json.Object({"ready": Json.Boolean(false)}))
                       end
                     end
                   )
@@ -3869,7 +4084,7 @@ fn drain_jobs(_payload: Json, files: Files, clock: Clock, env: Env, net: Network
                       job.attempts,
                       le.to_text
                     ).map_error(Db.map_table_error)
-                    Ok(None):
+                    Ok(ej) if ej.bool_at("ready") != Some(true):
                       _rm = try Ledger.transact_locked(
                         files,
                         Db.ledger_db_path,
@@ -3890,7 +4105,8 @@ fn drain_jobs(_payload: Json, files: Files, clock: Clock, env: Env, net: Network
                       )
                       try Jobs.complete(files, Db.ledger_db_path, clock, job.id, job.attempts)
                         .map_error(Db.map_table_error)
-                    Ok(Some(embed_txt)):
+                    Ok(ej):
+                      embed_txt = ej.text_at("text") or ""
                       # Call OpenAI-compatible `/v1/embeddings` strictly OUTSIDE any MoDB ledger lock.
                       case Ai.fetch_embedding(ecfg, embed_txt, net)
                         Error(ee): try Jobs.fail_or_retry(
@@ -3966,7 +4182,7 @@ fn list_blueprints(_req: Api.Request, auth: AuthContext, rf: ReadFiles) : Result
   if not rf.exists?(Db.ledger_db_path)
     return Ok(json_ok(200, Json.Object({"blueprints": Json.Array([])})))
   end
-  bps = try Ledger.read_locked(
+  bps_json = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -3975,22 +4191,36 @@ fn list_blueprints(_req: Api.Request, auth: AuthContext, rf: ReadFiles) : Result
       rows = try Table.scan(Ledger.store(db), Db.blueprints_table(), None, None, 200).map_error(
         Db.map_table_error
       )
-      Ok(rows.map(fn(x) x.1 end))
+      Ok(rows.map(fn(x) x.1 end).to_json)
     end
   )
-  Ok(json_ok(200, Json.Object({"blueprints": bps.to_json})))
+  Ok(json_ok(200, Json.Object({"blueprints": bps_json})))
 end
 
 ## `POST /api/blueprints` — Creates a new Statamic-style `BlueprintDef` (`manage_schema`).
 fn create_blueprint(
   req: Api.Request,
   auth: AuthContext,
-  input: CreateBlueprintInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  fields_in = case rj.get("fields")
+    None: return Error(BadInput(reason: "missing 'fields' array"))
+    Some(fj): try decode_property_defs_json(fj.to_text.bytes).map_error(fn(e)
+      BadInput(reason: "invalid 'fields': #{e}")
+    end)
+  end
+  input = CreateBlueprintInput(
+    slug: try VaultOps.req_text(rj, "slug"),
+    name: try VaultOps.req_text(rj, "name"),
+    description: rj.text_at("description"),
+    icon: rj.text_at("icon"),
+    fields: fields_in,
+    default_template_markdown: rj.text_at("default_template_markdown")
+  )
   if auth.principal.suspended or not Policy.action_permitted?(auth, "manage_schema")
     return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'manage_schema'"))
   end
@@ -4018,7 +4248,7 @@ fn create_blueprint(
     at: now
   )
   audit_payload = Json.Object({"blueprint_id": Json.String(bp.id), "slug": Json.String(bp.slug)})
-  created = try Ledger.transact_locked(
+  created_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -4030,10 +4260,10 @@ fn create_blueprint(
       t1 = try tx_authorize_if_agent(tx, auth, "manage_schema", now)
       try validate_blueprint_relations_tx(t1, auth, bp)
       t2 = try Table.put(t1, Db.blueprints_table(), bp.id, bp).map_error(Db.map_table_error)
-      Ok((t2, bp))
+      Ok((t2, bp.to_json))
     end
   )
-  Ok(json_ok(201, created.to_json))
+  Ok(json_ok(201, created_json))
 end
 
 ## `PUT /api/blueprints/:id` — Updates an existing `BlueprintDef` (`manage_schema`).
@@ -4041,11 +4271,28 @@ fn update_blueprint(
   req: Api.Request,
   id: Text,
   auth: AuthContext,
-  input: UpdateBlueprintInput,
   files: Files,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  fields_opt = case rj.get("fields")
+    None | Some(Json.Null): None
+    Some(fj): Some(
+      try decode_property_defs_json(fj.to_text.bytes).map_error(fn(e)
+        BadInput(reason: "invalid 'fields': #{e}")
+      end)
+    )
+  end
+  input = UpdateBlueprintInput(
+    slug: rj.text_at("slug"),
+    name: rj.text_at("name"),
+    description: rj.text_at("description"),
+    icon: rj.text_at("icon"),
+    fields: fields_opt,
+    default_template_markdown: rj.text_at("default_template_markdown"),
+    expected_version: rj.int_at("expected_version")
+  )
   if auth.principal.suspended or not Policy.action_permitted?(auth, "manage_schema")
     return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'manage_schema'"))
   end
@@ -4059,7 +4306,7 @@ fn update_blueprint(
   )
   audit_payload = Json.Object({"blueprint_id": Json.String(id)})
 
-  updated = try Ledger.transact_locked(
+  updated_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -4118,10 +4365,10 @@ fn update_blueprint(
       t2 = try Table.put(t1, Db.blueprints_table(), next_bp.id, next_bp).map_error(
         Db.map_table_error
       )
-      Ok((t2, next_bp))
+      Ok((t2, next_bp.to_json))
     end
   )
-  Ok(json_ok(200, updated.to_json))
+  Ok(json_ok(200, updated_json))
 end
 
 ## `PUT /api/pages/:id/meta` — Attaches, updates, or detaches a `BlueprintDef` + typed metadata on a page.
@@ -4129,12 +4376,26 @@ fn set_page_blueprint_meta(
   req: Api.Request,
   id: Text,
   auth: AuthContext,
-  input: SetPageMetaInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  vals_opt = case rj.get("values")
+    None | Some(Json.Null): None
+    Some(vj): Some(
+      try decode_cell_map_json(vj.to_text.bytes).map_error(fn(e)
+        BadInput(reason: "invalid 'values': #{e}")
+      end)
+    )
+  end
+  input = SetPageMetaInput(
+    blueprint_id: rj.text_at("blueprint_id"),
+    values: vals_opt,
+    apply_template_if_empty: rj.bool_at("apply_template_if_empty"),
+    reason: rj.text_at("reason")
+  )
   now = clock.now
   bp_prefix = Id.ulid(rng, clock)
   reason_opt = case input.reason
@@ -4286,12 +4547,17 @@ fn sync_page_markdown(
   req: Api.Request,
   id: Text,
   auth: AuthContext,
-  input: SyncPageMarkdownInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = SyncPageMarkdownInput(
+    markdown: try VaultOps.req_text(rj, "markdown"),
+    expected_page_version: try VaultOps.req_int(rj, "expected_page_version"),
+    reason: rj.text_at("reason")
+  )
   now = clock.now
   id_prefix = Id.ulid(rng, clock)
   reason_opt = case input.reason
@@ -4419,10 +4685,14 @@ end
 fn resolve_metrics(
   req: Api.Request,
   auth: AuthContext,
-  input: ResolveMetricsInput,
   rf: ReadFiles
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = ResolveMetricsInput(
+    tokens: VaultOps.json_text_list_raw(rj, "tokens"),
+    scenario_id: rj.text_at("scenario_id")
+  )
   if auth.principal.suspended
     return Error(Forbidden(reason: "principal '#{auth.principal.handle}' is suspended"))
   end

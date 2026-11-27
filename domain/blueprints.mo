@@ -437,7 +437,23 @@ fn parse_yaml_string_list(raw: Text) : Result(List(Text), Text)
   t = raw.trim
   return Ok([]) if t == "[]" or t.empty?
   if t.starts_with?("[") and t.ends_with?("]")
-    return Json.decode_strict[List(Text)](t.bytes).map_error(fn(e) e.to_text end)
+    return case Json.parse(t)
+      Error(je): Error(je.to_text)
+      Ok(Json.Array(items)):
+        var out = []
+        for it in items
+          case it
+            Json.String(s): out = out.append(s)
+            Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json.Object(_): return Error(
+              "expected string element inside JSON/YAML list field"
+            )
+          end
+        end
+        Ok(out)
+      Ok(Json.Null) | Ok(Json.Boolean(_)) | Ok(Json.Number(_)) | Ok(Json.String(_)) | Ok(
+        Json.Object(_)
+      ): Error("expected JSON/YAML string array '[...]' for list field, got '#{t}'")
+    end
   end
   Error("expected JSON/YAML string array '[...]' for list field, got '#{t}'")
 end

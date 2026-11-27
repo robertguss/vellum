@@ -5,6 +5,11 @@ expose dept_groups_bucket,
 vault_policies_bucket,
 ferpa_audit_bucket,
 json_string_list,
+json_text_list_raw,
+json_text_list_opt,
+parse_req_json_obj,
+req_text,
+req_int,
 default_vault_policy_json,
 get_vault_policy_json,
 tx_get_json,
@@ -48,16 +53,75 @@ end
 fn json_string_list(j: Json, field: Text) : List(Text)
   var out = []
   for item in j.list_at(field) or []
-    case Json.decode_strict[Text](item.to_text.bytes)
-      Ok(s) if not s.trim.empty?:
+    case item
+      Json.String(s) if not s.trim.empty?:
         clean = s.trim
         if not out.contains?(clean)
           out = out.append(clean)
         end
-      Ok(_) | Error(_): Unit
+      Json.String(_) | Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json
+        .Object(_): Unit
     end
   end
   out
+end
+
+## Extracts string entries from a JSON array property verbatim.
+fn json_text_list_raw(j: Json, field: Text) : List(Text)
+  var out = []
+  for item in j.list_at(field) or []
+    case item
+      Json.String(s): out = out.append(s)
+      Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json.Object(_): Unit
+    end
+  end
+  out
+end
+
+## Returns `Some(strings)` when `field` is a JSON array, otherwise `None`.
+fn json_text_list_opt(j: Json, field: Text) : Option(List(Text))
+  case j.list_at(field)
+    Some(items):
+      var out = []
+      for item in items
+        case item
+          Json.String(s): out = out.append(s)
+          Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json.Object(_): Unit
+        end
+      end
+      Some(out)
+    None: None
+  end
+end
+
+## Parses a request body string into a JSON object without generic `Json.decode_strict` lowering overhead.
+fn parse_req_json_obj(raw_text: Option(Text)) : Result(Json, AppError)
+  j = case Json.parse(raw_text or "")
+    Ok(parsed): parsed
+    Error(e): return Error(BadInput(reason: "invalid request body JSON: #{e}"))
+  end
+  case j
+    Json.Object(_): Ok(j)
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): Error(
+      BadInput(reason: "request body must be a JSON object")
+    )
+  end
+end
+
+## Extracts a required text field from a JSON object or fails with `BadInput`.
+fn req_text(j: Json, field: Text) : Result(Text, AppError)
+  case j.text_at(field)
+    Some(s): Ok(s)
+    None: Error(BadInput(reason: "missing string field '#{field}'"))
+  end
+end
+
+## Extracts a required integer field from a JSON object or fails with `BadInput`.
+fn req_int(j: Json, field: Text) : Result(Int, AppError)
+  case j.int_at(field)
+    Some(n): Ok(n)
+    None: Error(BadInput(reason: "missing integer field '#{field}'"))
+  end
 end
 
 ## Default `Standard` collection security policy payload returned when no override is persisted.

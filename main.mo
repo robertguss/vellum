@@ -3,6 +3,7 @@ module Main
 use Domain.Types{AuthContext}
 use Routes.Ai
 use Routes.Auth
+use Routes.Chat
 use Routes.Collab
 use Routes.Databases
 use Routes.Importer
@@ -33,6 +34,7 @@ api
   get "/packs" Packs.packs_page
   get "/llms.txt" Packs.llms_txt
   get "/admin" Workspace.admin_page
+  get "/chat" Chat.chat_page
   post "/mcp" Mcp.handle_mcp
   post "/api/webhooks/github" Collab.github_pr_webhook
 
@@ -137,6 +139,22 @@ api
     post "/ai/brief/refresh" Ai.refresh_ai_brief
     get "/admin/garden" Ai.run_garden
     post "/admin/garden/propose" Ai.propose_garden_fix
+  end
+
+  scope "/api/v1"
+    get "/events" Collab.events_stream
+    get "/chat/channels" Chat.list_channels
+    post "/chat/channels" Chat.create_channel
+    patch "/chat/channels/:id" Chat.update_channel
+    get "/chat/channels/:id/messages" Chat.list_messages
+    post "/chat/channels/:id/messages" Chat.post_message
+    patch "/chat/channels/:id/messages/:msg_id" Chat.edit_message
+    delete "/chat/channels/:id/messages/:msg_id" Chat.delete_message
+    post "/chat/channels/:id/messages/:msg_id/reactions" Chat.toggle_reaction
+    post "/chat/channels/:id/read" Chat.mark_channel_read
+    get "/chat/inbox" Chat.list_inbox
+    post "/chat/inbox/ack" Chat.ack_inbox
+    get "/chat/search" Chat.search_chat
   end
 
   job "arvo.jobs.drain" Workspace.drain_jobs every 10.seconds

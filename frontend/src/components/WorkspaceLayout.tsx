@@ -13,6 +13,7 @@ import {
   Home,
   Layers,
   LogOut,
+  MessageSquare,
   Search,
   Settings,
   ShieldAlert,
@@ -25,6 +26,7 @@ import { ApiError, apiFetch, streamAskWorkspace } from "../lib/api";
 import { useRealtimeEvents, type RealtimeScope } from "../lib/useRealtimeEvents";
 import type {
   AiCitation,
+  ChatSearchHit,
   ClaimRecord,
   Collection,
   CollectionWritePolicy,
@@ -81,8 +83,10 @@ export default function WorkspaceLayout({
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchMode, setSearchMode] = useState<SearchMode>("hybrid");
+  const [includeChatSearch, setIncludeChatSearch] = useState(true);
   const [searchBackend, setSearchBackend] = useState<"neural" | "sketch" | "none" | null>(null);
   const [searchResults, setSearchResults] = useState<SearchResultItem[]>([]);
+  const [chatResults, setChatResults] = useState<ChatSearchHit[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
 
   // Ask Workspace AI SSE drawer (Fast RAG vs Deep Research RLM Tier 1)
@@ -162,6 +166,7 @@ export default function WorkspaceLayout({
     const trimmed = searchQuery.trim();
     if (!trimmed) {
       setSearchResults([]);
+      setChatResults([]);
       setSearchBackend(null);
       return;
     }
@@ -169,19 +174,23 @@ export default function WorkspaceLayout({
       setSearchLoading(true);
       try {
         const res = await apiFetch<SearchResponse>(
-          `/api/search?q=${encodeURIComponent(trimmed)}&limit=15&mode=${searchMode}`
+          `/api/search?q=${encodeURIComponent(trimmed)}&limit=15&mode=${searchMode}${
+            includeChatSearch ? "&include_chat=1" : ""
+          }`
         );
         setSearchResults(res.results ?? []);
+        setChatResults(res.chat_results ?? []);
         setSearchBackend(res.vector_backend ?? null);
       } catch {
         setSearchResults([]);
+        setChatResults([]);
         setSearchBackend(null);
       } finally {
         setSearchLoading(false);
       }
     }, 180);
     return () => window.clearTimeout(timer);
-  }, [searchOpen, searchQuery, searchMode]);
+  }, [searchOpen, searchQuery, searchMode, includeChatSearch]);
 
   function toggleRlmBlockKind(kind: string) {
     setRlmBlockKinds((prev) =>
@@ -332,6 +341,13 @@ export default function WorkspaceLayout({
               >
                 <Home className="h-4 w-4 text-stone-500" />
                 Workspace
+              </Link>
+              <Link
+                href="/chat"
+                className="flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-stone-700 hover:bg-stone-200/70 transition"
+              >
+                <MessageSquare className="h-4 w-4 text-sky-700" />
+                Chat
               </Link>
               <Link
                 href="/proposals"
@@ -579,15 +595,26 @@ export default function WorkspaceLayout({
                   </button>
                 ))}
               </div>
-              {searchBackend && (
-                <span className="rounded-full border border-stone-200 bg-white px-2 py-0.5 font-mono text-[10px] text-stone-500">
-                  {searchBackend === "neural"
-                    ? "Neural Vec"
-                    : searchBackend === "sketch"
-                      ? "Sketch Vec"
-                      : "BM25 Only"}
-                </span>
-              )}
+              <div className="flex items-center gap-3">
+                <label className="inline-flex items-center gap-1.5 text-[11px] font-medium text-stone-600 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={includeChatSearch}
+                    onChange={(e) => setIncludeChatSearch(e.target.checked)}
+                    className="rounded border-stone-300 text-stone-900"
+                  />
+                  Include Chat
+                </label>
+                {searchBackend && (
+                  <span className="rounded-full border border-stone-200 bg-white px-2 py-0.5 font-mono text-[10px] text-stone-500">
+                    {searchBackend === "neural"
+                      ? "Neural Vec"
+                      : searchBackend === "sketch"
+                        ? "Sketch Vec"
+                        : "BM25 Only"}
+                  </span>
+                )}
+              </div>
             </div>
             <div className="max-h-80 overflow-y-auto divide-y divide-stone-100">
               {searchLoading && (
@@ -595,11 +622,14 @@ export default function WorkspaceLayout({
                   Searching MoDB index...
                 </div>
               )}
-              {!searchLoading && searchQuery.trim() && searchResults.length === 0 && (
-                <div className="px-4 py-6 text-center text-xs text-stone-500">
-                  No permitted workspace matches found.
-                </div>
-              )}
+              {!searchLoading &&
+                searchQuery.trim() &&
+                searchResults.length === 0 &&
+                chatResults.length === 0 && (
+                  <div className="px-4 py-6 text-center text-xs text-stone-500">
+                    No permitted workspace matches found.
+                  </div>
+                )}
               {searchResults.map((hit) => {
                 const hasFts = hit.fts_rank !== null && hit.fts_rank !== undefined;
                 const hasVec = hit.vec_rank !== null && hit.vec_rank !== undefined;
@@ -650,6 +680,45 @@ export default function WorkspaceLayout({
                   </button>
                 );
               })}
+              {chatResults.length > 0 && (
+                <div className="bg-stone-50/70 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-stone-500">
+                  Chat Messages ({chatResults.length})
+                </div>
+              )}
+              {chatResults.map((chit) => (
+                <button
+                  key={chit.message_id}
+                  type="button"
+                  onClick={() => {
+                    setSearchOpen(false);
+                    router.visit(
+                      `/chat?channel=${encodeURIComponent(chit.channel_id)}&msg=${encodeURIComponent(
+                        chit.message_id
+                      )}`
+                    );
+                  }}
+                  className="w-full text-left px-4 py-3 hover:bg-stone-50 flex items-center justify-between gap-4 transition"
+                >
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <MessageSquare className="h-3.5 w-3.5 text-sky-600 shrink-0" />
+                      <span className="text-xs font-semibold text-stone-800 truncate">
+                        {chit.channel_kind === "dm" ? chit.channel_name : `#${chit.channel_name}`}
+                      </span>
+                      <span className="text-[11px] text-stone-500 shrink-0">
+                        @{chit.author_handle}
+                      </span>
+                      {chit.is_decision && (
+                        <span className="rounded bg-amber-100 text-amber-900 px-1.5 py-0.5 text-[10px] font-medium">
+                          Decision
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-xs text-stone-600 mt-0.5 truncate">{chit.snippet}</div>
+                  </div>
+                  <ChevronRight className="h-4 w-4 text-stone-400 shrink-0" />
+                </button>
+              ))}
             </div>
           </div>
         </div>

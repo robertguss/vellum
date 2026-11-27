@@ -1251,7 +1251,28 @@ fn decode_block_ops_json(raw: Bytes) : Result(List(BlockOp), Text)
   Json.decode_strict[List(BlockOp)](raw).map_error(fn(e) e.to_text end)
 end
 
-## Decodes a JSON object into `Map(Text, Int)` once to avoid duplicate monomorphic decoders.
+## Decodes a JSON object into `Map(Text, Int)` without generic `Json.decode_strict` lowering.
 fn decode_version_map_json(raw: Bytes) : Result(Map(Text, Int), Text)
-  Json.decode_strict[Map(Text, Int)](raw).map_error(fn(e) e.to_text end)
+  txt = case raw.decode_utf8
+    Some(s): s
+    None: return Error("expected valid UTF-8 JSON")
+  end
+  parsed = case Json.parse(txt)
+    Ok(j): j
+    Error(e): return Error(e.to_text)
+  end
+  entries = case parsed
+    Json.Object(m): m
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+      "expected JSON object"
+    )
+  end
+  var out = {}
+  for (k, v) in entries.entries
+    case Json.Object({"v": v}).int_at("v")
+      Some(n): out = out.set(k, n)
+      None: return Error("expected integer for '#{k}'")
+    end
+  end
+  Ok(out)
 end

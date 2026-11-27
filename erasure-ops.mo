@@ -8,6 +8,7 @@ scan_workspace_secrets,
 list_erasure_receipts_json,
 get_erasure_receipt_json,
 execute_secret_purge_locked
+use ChatOps
 use Crypto
 use Db
 use Domain.Blocks
@@ -58,6 +59,28 @@ fn erasure_receipt_to_json(r: Erasure.ErasureReceipt) : Json
   })
 end
 
+fn json_text_array(j: Json, key: Text) : List(Text)
+  var out = []
+  for item in j.list_at(key) or []
+    case item
+      Json.String(s): out = out.append(s)
+      Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json.Object(_): Unit
+    end
+  end
+  out
+end
+
+fn json_neural_dims_pairs(j: Json, key: Text) : List((Text, Int))
+  var out = []
+  for item in j.list_at(key) or []
+    case (item.text_at("pid"), item.int_at("dims"))
+      (Some(p), Some(d)): out = out.append((p, d))
+      (_, _): Unit
+    end
+  end
+  out
+end
+
 fn make_hint_json(
   target_kind: Text,
   page: Page,
@@ -72,6 +95,34 @@ fn make_hint_json(
     "collection_id": Json.String(page.collection_id),
     "block_id": block_id.to_json,
     "comment_id": comment_id.to_json,
+    "kind": Json.String(f.kind),
+    "label": Json.String(f.label),
+    "severity": Json.String(f.severity),
+    "masked_preview": Json.String(f.masked_preview),
+    "match_sha256": Json.String(f.match_sha256)
+  })
+end
+
+fn make_chat_hint_json(ch_opt: Option(Json), msg: Json, f: Secrets.SecretFinding) : Json
+  ch_id = msg.text_at("channel_id") or ""
+  msg_id = msg.text_at("id") or ""
+  ch_slug = case ch_opt
+    Some(c): c.text_at("slug") or ch_id
+    None: ch_id
+  end
+  col_json = case ch_opt
+    Some(c): c.get("collection_id") or Json.Null
+    None: Json.Null
+  end
+  Json.Object({
+    "target_kind": Json.String("chat_message"),
+    "channel_id": Json.String(ch_id),
+    "message_id": Json.String(msg_id),
+    "page_id": Json.Null,
+    "page_title": Json.String("Chat ##{ch_slug}"),
+    "collection_id": col_json,
+    "block_id": Json.Null,
+    "comment_id": Json.Null,
     "kind": Json.String(f.kind),
     "label": Json.String(f.label),
     "severity": Json.String(f.severity),
@@ -192,6 +243,22 @@ fn scan_workspace_secrets(store: Store) : Result(List(Json), AppError)
       end
     end
   end
+  chat_msgs = try ChatOps.scan_all_messages(store, 0)
+  for cm in chat_msgs
+    if cm.text_at("deleted_at") == None
+      body = cm.text_at("body_markdown") or ""
+      if not body.empty?
+        findings = Secrets.scan_text(body)
+        if not findings.empty?
+          ch_id = cm.text_at("channel_id") or ""
+          ch_opt = try ChatOps.get_channel(store, ch_id)
+          for f in findings
+            out = out.append(make_chat_hint_json(ch_opt, cm, f))
+          end
+        end
+      end
+    end
+  end
   Ok(out)
 end
 
@@ -270,7 +337,7 @@ fn execute_secret_purge_locked(
   eff_subject_id = if subject_id.trim.empty?: "secret:#{receipt_id}" else: subject_id.trim
 
   # 1. Read snapshot to discover secret tokens, affected pages, and neural vector dimensions
-  (tokens, affected_page_ids, neural_dims_pairs, existing_key_opt) = try Ledger.read_locked(
+  prep_json = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -375,6 +442,14 @@ fn execute_secret_purge_locked(
               end
             end
           end
+          all_chat = try ChatOps.scan_all_messages(store, 0)
+          for cm in all_chat
+            if cm.text_at("deleted_at") == None
+              for f in Secrets.scan_text(cm.text_at("body_markdown") or "")
+                toks = append_unique_text(toks, f.raw_token)
+              end
+            end
+          end
       end
 
       if clean_mode == "redact" and toks.empty?
@@ -418,15 +493,31 @@ fn execute_secret_purge_locked(
       var nd_pairs = []
       for pid in aff
         case try Table.get(store, Db.page_neural_dims_table(), pid).map_error(Db.map_table_error)
-          Some(d): nd_pairs = nd_pairs.append((pid, d))
+          Some(d): nd_pairs = nd_pairs.append(Json.Object({"pid": Json.String(pid), "dims": Json.int(d)}))
           None: Unit
         end
       end
 
       kopt = try Erasure.get_subject_key(store, eff_subject_id).map_error(map_erasure_error)
-      Ok((toks, aff, nd_pairs, kopt))
+      (has_k, k_shred, k_b64) = case kopt
+        Some(kr): (true, kr.shredded?, kr.key_b64)
+        None: (false, false, "")
+      end
+      Ok(
+        Json.Object({
+          "tokens": toks.to_json,
+          "affected_page_ids": aff.to_json,
+          "neural_dims": Json.Array(nd_pairs),
+          "has_key": Json.Boolean(has_k),
+          "key_shredded": Json.Boolean(k_shred),
+          "key_b64": Json.String(k_b64)
+        })
+      )
     end
   )
+  tokens = json_text_array(prep_json, "tokens")
+  affected_page_ids = json_text_array(prep_json, "affected_page_ids")
+  neural_dims_pairs = json_neural_dims_pairs(prep_json, "neural_dims")
 
   # Ensure audit reason itself never echoes raw secrets
   raw_reason = if reason.trim.empty?: "One-click Modb.Erasure secret purge (#{clean_mode})" else: reason.trim
@@ -434,27 +525,28 @@ fn execute_secret_purge_locked(
   safe_reason = if san_reason.trim.empty?: "One-click Modb.Erasure secret purge (#{clean_mode})" else: san_reason.trim
 
   # 2. Layer A: Provision subject encryption key & seal quarantine record outside tx closures
-  key_rec = case existing_key_opt
-    Some(kr): kr
-    None:
-      pm = Ledger.WriteMeta(
-        principal: reviewer,
-        action: "erasure.provision_key",
-        reason: safe_reason,
-        at: now
-      )
-      try Erasure.provision_subject_key_locked(
-        files,
-        Db.ledger_db_path,
-        Db.vellum_schema(),
-        rng,
-        eff_subject_id,
-        pm
-      ).map_error(map_erasure_error)
+  (key_shredded?, key_b64) = if prep_json.bool_at("has_key") == Some(true)
+    (prep_json.bool_at("key_shredded") or false, prep_json.text_at("key_b64") or "")
+  else
+    pm = Ledger.WriteMeta(
+      principal: reviewer,
+      action: "erasure.provision_key",
+      reason: safe_reason,
+      at: now
+    )
+    kr = try Erasure.provision_subject_key_locked(
+      files,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      rng,
+      eff_subject_id,
+      pm
+    ).map_error(map_erasure_error)
+    (kr.shredded?, kr.key_b64)
   end
 
-  sealed_val_bytes = if not key_rec.shredded?
-    case Bytes.from_base64url(key_rec.key_b64)
+  sealed_val_bytes = if not key_shredded?
+    case Bytes.from_base64url(key_b64)
       Some(raw_k) if raw_k.size == 32:
         nonce = rng.bytes(12)
         aad = "modb:erase:v1:#{eff_subject_id}:secret_purge".bytes
@@ -482,7 +574,7 @@ fn execute_secret_purge_locked(
     reason: safe_reason,
     at: now
   )
-  (blocks_redacted, comments_redacted) = try Ledger.transact_locked(
+  sanitize_counts = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -685,9 +777,46 @@ fn execute_secret_purge_locked(
           end
         end
       end
-      Ok((cur, (b_cnt, c_cnt)))
+      if not tokens.empty? and target_page_id_opt == None
+        all_chat = try ChatOps.tx_scan_all_messages(cur, 0)
+        for cm in all_chat
+          if cm.text_at("deleted_at") == None
+            body = cm.text_at("body_markdown") or ""
+            (red_body, c_rep) = Secrets.redact_tokens(body, tokens)
+            if c_rep > 0
+              ch_id = cm.text_at("channel_id") or ""
+              mid = cm.text_at("id") or ""
+              updated_cm = case cm
+                Json.Object(m): Json.Object(
+                  m.set("body_markdown", Json.String(red_body)).set("edited_at", now.to_json)
+                )
+                Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): cm
+              end
+              cur = try ChatOps.tx_put_message(cur, ch_id, mid, updated_cm)
+              b_cnt += 1
+            end
+          end
+        end
+        all_inbox = try ChatOps.tx_scan_all_inbox(cur, 0)
+        for ntf in all_inbox
+          prev = ntf.text_at("preview") or ""
+          (red_prev, p_rep) = Secrets.redact_tokens(prev, tokens)
+          if p_rep > 0
+            rec_id = ntf.text_at("recipient_principal_id") or ""
+            nid = ntf.text_at("id") or ""
+            updated_ntf = case ntf
+              Json.Object(nm): Json.Object(nm.set("preview", Json.String(red_prev)))
+              Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): ntf
+            end
+            cur = try ChatOps.tx_put_inbox(cur, rec_id, nid, updated_ntf)
+          end
+        end
+      end
+      Ok((cur, Json.Object({"blocks_redacted": Json.int(b_cnt), "comments_redacted": Json.int(c_cnt)})))
     end
   )
+  blocks_redacted = sanitize_counts.int_at("blocks_redacted") or 0
+  comments_redacted = sanitize_counts.int_at("comments_redacted") or 0
 
   # 4. Dual-Layer Modb.Erasure: shred key, delete refs, remove FTS/Vec docs, scrub Replay/Audit
   var vec_list = []

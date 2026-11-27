@@ -1699,14 +1699,102 @@ fn decode_property_defs_json(raw: Bytes) : Result(List(PropertyDef), Text)
   Json.decode_strict[List(PropertyDef)](raw).map_error(fn(e) e.to_text end)
 end
 
-## Decodes a JSON array into `List(DbFilterRule)` once to avoid duplicate monomorphic decoders.
+## Decodes a JSON array into `List(DbFilterRule)` without generic `Json.decode_strict` lowering.
 fn decode_filter_rules_json(raw: Bytes) : Result(List(DbFilterRule), Text)
-  Json.decode_strict[List(DbFilterRule)](raw).map_error(fn(e) e.to_text end)
+  txt = case raw.decode_utf8
+    Some(s): s
+    None: return Error("expected valid UTF-8 JSON")
+  end
+  parsed = case Json.parse(txt)
+    Ok(j): j
+    Error(e): return Error(e.to_text)
+  end
+  items = case parsed
+    Json.Array(xs): xs
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Object(_): return Error(
+      "expected JSON array"
+    )
+  end
+  var out = []
+  for item in items
+    case item
+      Json.Object(_): Unit
+      Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+        "expected filter rule object"
+      )
+    end
+    prop_id = case item.text_at("prop_id")
+      Some(s): s
+      None: return Error("missing 'prop_id'")
+    end
+    op_str = case item.text_at("op")
+      Some(s): s
+      None: return Error("missing 'op'")
+    end
+    op = if op_str == "eq"
+      Eq
+    else if op_str == "neq"
+      Neq
+    else if op_str == "gt"
+      Gt
+    else if op_str == "gte"
+      Gte
+    else if op_str == "lt"
+      Lt
+    else if op_str == "lte"
+      Lte
+    else if op_str == "contains"
+      Contains
+    else if op_str == "in_set"
+      InSet
+    else if op_str == "is_empty"
+      IsEmpty
+    else if op_str == "is_not_empty"
+      IsNotEmpty
+    else
+      return Error("invalid filter op '#{op_str}'")
+    end
+    val = item.get("value") or Json.Null
+    out = out.append(DbFilterRule(prop_id: prop_id, op: op, value: val))
+  end
+  Ok(out)
 end
 
-## Decodes a JSON array into `List(DbSortRule)` once to avoid duplicate monomorphic decoders.
+## Decodes a JSON array into `List(DbSortRule)` without generic `Json.decode_strict` lowering.
 fn decode_sort_rules_json(raw: Bytes) : Result(List(DbSortRule), Text)
-  Json.decode_strict[List(DbSortRule)](raw).map_error(fn(e) e.to_text end)
+  txt = case raw.decode_utf8
+    Some(s): s
+    None: return Error("expected valid UTF-8 JSON")
+  end
+  parsed = case Json.parse(txt)
+    Ok(j): j
+    Error(e): return Error(e.to_text)
+  end
+  items = case parsed
+    Json.Array(xs): xs
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Object(_): return Error(
+      "expected JSON array"
+    )
+  end
+  var out = []
+  for item in items
+    case item
+      Json.Object(_): Unit
+      Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+        "expected sort rule object"
+      )
+    end
+    prop_id = case item.text_at("prop_id")
+      Some(s): s
+      None: return Error("missing 'prop_id'")
+    end
+    desc = case item.bool_at("desc")
+      Some(b): b
+      None: return Error("missing 'desc'")
+    end
+    out = out.append(DbSortRule(prop_id: prop_id, desc: desc))
+  end
+  Ok(out)
 end
 
 ## Rejects any attempt to overwrite an auto-assigned `UniqueId` property value after row creation.
