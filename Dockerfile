@@ -22,4 +22,4 @@ ENV MO_PORT=8080
 VOLUME ["/var/lib/vellum"]
 EXPOSE 8080
 
-CMD ["sh", "-c", "mkdir -p /var/lib/vellum && rm -rf /var/lib/vellum/public && cp -r /app/public /var/lib/vellum/public && exec mo serve /app/main.mo --bind 0.0.0.0 --port 8080 --workers 4 --data /var/lib/vellum"]
+CMD ["sh", "-c", "mkdir -p /var/lib/vellum && rm -rf /var/lib/vellum/public && cp -r /app/public /var/lib/vellum/public && exec mo serve /app/main.mo --bind 0.0.0.0 --port ${PORT:-8080} --workers 4 --data /var/lib/vellum"]
