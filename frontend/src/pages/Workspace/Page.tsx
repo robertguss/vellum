@@ -10,6 +10,7 @@ import {
   GitBranch,
   GitPullRequest,
   Link2,
+  Lock,
   MessageSquare,
   Paperclip,
   PenTool,
@@ -35,6 +36,7 @@ import type {
   BlueprintDef,
   ClaimRecord,
   Collection,
+  CollectionSecuritySummary,
   Comment,
   DatabaseDef,
   EditorLens,
@@ -76,6 +78,7 @@ interface PageProps {
   semantic_backlinks?: SemanticBacklink[];
   taint_provenance?: PageTaintProvenance | null;
   secret_hints?: SecretHint[];
+  collection_security?: CollectionSecuritySummary | null;
 }
 
 async function sha256Hex(file: File): Promise<string> {
@@ -128,6 +131,7 @@ export default function PageView({
   semantic_backlinks = [],
   taint_provenance = null,
   secret_hints = [],
+  collection_security = null,
 }: PageProps) {
   const [page, setPage] = useState<Page>(initialPage);
   const [stagingDriftId, setStagingDriftId] = useState<string | null>(null);
@@ -466,6 +470,15 @@ export default function PageView({
                 <span>/</span>
                 <span className="font-mono">{page.id}</span>
                 <span>· v{page.version}</span>
+                {collection_security?.security_tier === "ferpa_restricted" && (
+                  <span
+                    className="inline-flex items-center gap-1 rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-[11px] font-medium text-rose-800"
+                    title="FERPA / Restricted Vault: Department Group allowlist enforced; external AI, webhooks, and /llms.txt disabled; reads logged to Modb.Ledger"
+                  >
+                    <Lock className="h-3 w-3" />
+                    FERPA / Restricted Vault
+                  </span>
+                )}
               </div>
               <h1 className="mt-1 text-2xl font-semibold tracking-tight text-stone-950">
                 {page.title}

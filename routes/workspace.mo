@@ -100,6 +100,7 @@ use Modb.Table
 use Modb.World
 use Routes.Ai
 use Routes.Auth
+use VaultOps
 
 ## JSON payload for `POST /api/collections`.
 struct CreateCollectionInput
@@ -1329,7 +1330,7 @@ fn create_collection(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "manage_schema", now)
-      t2 = try Table.put(t1, Db.collections_table(), col.id, col).map_error(Db.map_table_error)
+      t2 = try Db.tx_put_collection(t1, col)
       Ok((t2, Unit))
     end
   )
@@ -1337,7 +1338,15 @@ fn create_collection(
 end
 
 ## `GET /p/:id` and `GET /api/pages/:id` — Loads page, sorted blocks, anchored Markdown, comments, and attachments.
-fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFiles, env: Env) : Result(
+fn show_page(
+  req: Api.Request,
+  id: Text,
+  auth: Option(AuthContext),
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock,
+  env: Env
+) : Result(
   Api.Response,
   AppError
 )
@@ -1345,12 +1354,12 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
     Some(x): x
     None: return Auth.guest_redirect_or_401(req, env)
   end
-  if not rf.exists?(Db.ledger_db_path)
+  if not files.read_only.exists?(Db.ledger_db_path)
     return Error(Missing(entity: "page", id: id))
   end
 
   page_bundle = try Ledger.read_locked(
-    rf,
+    files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
@@ -1467,12 +1476,15 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
       secret_hints = ErasureOps.scan_page_secret_hints(store, page, blks, cmt_list)
       anchored_md = Blocks.to_anchored_markdown(blks)
       yaml_fm = Blueprints.to_yaml_frontmatter(page, page_bp_opt, page_meta_opt, anchored_md)
+      vault_pol = (try VaultOps.get_vault_policy_json(store, page.collection_id)) or VaultOps
+        .default_vault_policy_json(page.collection_id)
 
       Ok(
         Json.Object({
           "collections": c_list.to_json,
           "databases": d_list.to_json,
           "collection": col.to_json,
+          "collection_security": vault_pol,
           "page": page.to_json,
           "blocks": blks.to_json,
           "anchored_markdown": Json.String(anchored_md),
@@ -1498,6 +1510,23 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
     end
   )
 
+  if (page_bundle.get("collection_security") or Json.Null).text_at("security_tier") == Some(
+    "ferpa_restricted"
+  )
+    ferpa_cid = (page_bundle.get("collection") or Json.Null).text_at("id") or ""
+    try VaultOps.record_ferpa_read_audit_locked(
+      files,
+      rng,
+      clock,
+      a,
+      "ferpa.page.viewed",
+      ferpa_cid,
+      "page",
+      id,
+      "FERPA vault page view"
+    )
+  end
+
   if Auth.wants_json?(req)
     return Ok(
       json_ok(
@@ -1505,6 +1534,7 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
         Json.Object({
           "page": page_bundle.get("page") or Json.Null,
           "collection": page_bundle.get("collection") or Json.Null,
+          "collection_security": page_bundle.get("collection_security") or Json.Null,
           "blocks": page_bundle.get("blocks") or Json.Null,
           "anchored_markdown": page_bundle.get("anchored_markdown") or Json.Null,
           "yaml_frontmatter": page_bundle.get("yaml_frontmatter") or Json.Null,
@@ -1532,13 +1562,14 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
   render_inertia_page(
     req,
     a,
-    rf,
+    files.read_only,
     env,
     "Workspace/Page",
     {
       "collections": page_bundle.get("collections") or Json.Null,
       "databases": page_bundle.get("databases") or Json.Null,
       "collection": page_bundle.get("collection") or Json.Null,
+      "collection_security": page_bundle.get("collection_security") or Json.Null,
       "page": page_bundle.get("page") or Json.Null,
       "blocks": page_bundle.get("blocks") or Json.Null,
       "anchored_markdown": page_bundle.get("anchored_markdown") or Json.Null,
@@ -2186,7 +2217,7 @@ fn verify_page(req: Api.Request, id: Text, auth: AuthContext, files: Files, cloc
         archived_at: old_page.archived_at,
         version: old_page.version + 1
       )
-      t2 = try Table.put(t1, Db.pages_table(), next_p.id, next_p).map_error(Db.map_table_error)
+      t2 = try Db.tx_put_page_row(t1, next_p)
       Ok((
         t2,
         Json.Object({
@@ -2303,7 +2334,7 @@ fn create_comment(
         Some(_) | None: return Error(Missing(entity: "page", id: id))
       end
       try Policy.require_collection_access(auth, "comment", page.collection_id)
-      t2 = try Table.put(t1, Db.comments_table(), cmt.id, cmt).map_error(Db.map_table_error)
+      t2 = try Db.tx_put_comment(t1, cmt)
       Ok((t2, Json.Object({"collection_id": Json.String(page.collection_id)})))
     end
   )
@@ -2706,20 +2737,21 @@ fn commit_attachment(req: Api.Request, id: Text, auth: AuthContext, files: Files
   )
 end
 
-## `GET /api/attachments/:id/download` — Enforces collection grant & redirects (`302`) to S3 or serves local file (with HTTP `Range` support).
+## `GET /api/attachments/:id/download` — Enforces collection grant & redirects (`302`) to S3 or serves local file (plus FERPA read audit when restricted).
 fn download_attachment(
   req: Api.Request,
   id: Text,
   auth: AuthContext,
-  rf: ReadFiles,
+  files: Files,
+  rng: SecureRandom,
   clock: Clock,
   env: Env
 ) : Result(Api.Response, AppError)
-  if not rf.exists?(Db.ledger_db_path)
+  if not files.read_only.exists?(Db.ledger_db_path)
     return Error(Missing(entity: "attachment", id: id))
   end
-  att = try Ledger.read_locked(
-    rf,
+  att_info = try Ledger.read_locked(
+    files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
@@ -2734,19 +2766,51 @@ fn download_attachment(
         Some(_) | None: return Error(Missing(entity: "page", id: a.page_id))
       end
       try Policy.require_collection_access(auth, "read", page.collection_id)
-      Ok(a)
+      is_ferpa? = try VaultOps.is_ferpa_restricted(store, page.collection_id)
+      Ok(
+        Json.Object({
+          "id": Json.String(a.id),
+          "status": Json.String(a.status),
+          "s3_bucket": Json.String(a.s3_bucket),
+          "s3_key": Json.String(a.s3_key),
+          "content_type": Json.String(a.content_type),
+          "filename": Json.String(a.filename),
+          "ferpa_col": if is_ferpa?: Json.String(page.collection_id) else: Json.Null
+        })
+      )
     end
   )
-  if att.status != "ready"
+  att_id = att_info.text_at("id") or id
+  att_status = att_info.text_at("status") or ""
+  att_s3_bucket = att_info.text_at("s3_bucket") or ""
+  att_s3_key = att_info.text_at("s3_key") or ""
+  att_content_type = att_info.text_at("content_type") or ""
+  att_filename = att_info.text_at("filename") or ""
+  if att_status != "ready"
     return Error(Conflict(reason: "attachment '#{id}' is not ready for download"))
   end
+  case att_info.text_at("ferpa_col")
+    Some(fcid):
+      try VaultOps.record_ferpa_read_audit_locked(
+        files,
+        rng,
+        clock,
+        auth,
+        "ferpa.attachment.downloaded",
+        fcid,
+        "attachment",
+        att_id,
+        "FERPA vault attachment download"
+      )
+    None: Unit
+  end
 
-  if att.s3_bucket == "local"
-    disp = if dangerous_inline_mime?(att.content_type): "attachment" else: "inline"
-    safe_name = sanitize_filename_segment(att.filename)
+  if att_s3_bucket == "local"
+    disp = if dangerous_inline_mime?(att_content_type): "attachment" else: "inline"
+    safe_name = sanitize_filename_segment(att_filename)
     case req.header("Range")
       Some(range_hdr) if not range_hdr.trim.empty?:
-        fh = try rf.open(att.s3_key).map_error(map_file_error)
+        fh = try files.read_only.open(att_s3_key).map_error(map_file_error)
         total_sz = try fh.size.map_error(map_file_error)
         (start_off, end_off) = try parse_http_range(range_hdr, total_sz)
         want_len = end_off - start_off + 1
@@ -2760,7 +2824,7 @@ fn download_attachment(
           Api.response(
             206,
             [
-              ("Content-Type", att.content_type),
+              ("Content-Type", att_content_type),
               ("Content-Range", "bytes #{start_off}-#{actual_end}/#{total_sz}"),
               ("Content-Length", "#{slice_bytes.size}"),
               ("Accept-Ranges", "bytes"),
@@ -2773,12 +2837,12 @@ fn download_attachment(
         )
       Some(_) | None: Unit
     end
-    payload = try rf.read_bytes(att.s3_key).map_error(map_file_error)
+    payload = try files.read_only.read_bytes(att_s3_key).map_error(map_file_error)
     return Ok(
       Api.response(
         200,
         [
-          ("Content-Type", att.content_type),
+          ("Content-Type", att_content_type),
           ("Accept-Ranges", "bytes"),
           ("Content-Disposition", "#{disp}; filename=\"#{safe_name}\""),
           ("Cache-Control", "private, no-store"),
@@ -2793,9 +2857,9 @@ fn download_attachment(
   get_opts = S3.PresignGetOptions(
     expires_seconds: 300,
     response_content_disposition: Some("inline"),
-    response_content_type: Some(att.content_type)
+    response_content_type: Some(att_content_type)
   )
-  signed = try S3.presign_get(s3_cfg, att.s3_key, get_opts, clock.now).map_error(map_s3_error)
+  signed = try S3.presign_get(s3_cfg, att_s3_key, get_opts, clock.now).map_error(map_s3_error)
   Ok(Api.redirect(signed.url).with_header("Cache-Control", "private, no-store"))
 end
 
@@ -2975,9 +3039,7 @@ fn revoke_grant(req: Api.Request, id: Text, auth: AuthContext, files: Files, clo
             revoked_at: Some(now),
             last_used_at: tok.last_used_at
           )
-          cur = try Table.put(cur, Db.agent_tokens_table(), upd_tok.id, upd_tok).map_error(
-            Db.map_table_error
-          )
+          cur = try Db.tx_put_agent_token(cur, upd_tok)
         end
       end
       Ok((
@@ -3319,9 +3381,7 @@ fn kill_all_agent_grants(
             revoked_at: Some(now),
             last_used_at: tok.last_used_at
           )
-          cur = try Table.put(cur, Db.agent_tokens_table(), upd_tok.id, upd_tok).map_error(
-            Db.map_table_error
-          )
+          cur = try Db.tx_put_agent_token(cur, upd_tok)
         end
       end
       Ok((cur, revoked_ids))
@@ -3525,8 +3585,10 @@ fn refresh_semantic_summary_if_stale(
   cfg: Ai.AiConfig,
   files: Files,
   clock: Clock,
+  env: Env,
   net: Network
 ) : Unit
+  local_only_ai? = VaultOps.env_ai_local_only?(env)
   prep_res = Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
@@ -3537,6 +3599,14 @@ fn refresh_semantic_summary_if_stale(
       pg = case try Table.get(store, Db.pages_table(), pid).map_error(Db.map_table_error)
         Some(p) if p.archived_at == None and p.kind == Document: p
         Some(_) | None: return Ok(None)
+      end
+      if not try VaultOps.ai_allowed_for_collection(
+        store,
+        pg.collection_id,
+        cfg.base_url,
+        local_only_ai?
+      )
+        return Ok(None)
       end
       s_opt = try Table.get(store, Db.summaries_table(), Db.page_summary_key(pg.id)).map_error(
         Db.map_table_error
@@ -3596,7 +3666,7 @@ fn refresh_semantic_summary_if_stale(
             semantic_source_version: pg_ver,
             updated_at: now
           )
-          t1 = try Table.put(tx, Db.summaries_table(), nxt.id, nxt).map_error(Db.map_table_error)
+          t1 = try Db.tx_put_summary(tx, nxt)
           Ok((t1, Unit))
         Some(_) | None: Ok((tx, Unit))
       end
@@ -3618,6 +3688,7 @@ fn drain_jobs(_payload: Json, files: Files, clock: Clock, env: Env, net: Network
   if not files.read_only.exists?(Db.ledger_db_path)
     return Ok(Unit)
   end
+  local_only_ai? = VaultOps.env_ai_local_only?(env)
   _recovered = try Jobs.requeue_stale_running(files, Db.ledger_db_path, clock, 120).map_error(
     Db.map_table_error
   )
@@ -3740,6 +3811,14 @@ fn drain_jobs(_payload: Json, files: Files, clock: Clock, env: Env, net: Network
                         Db.map_table_error
                       )
                         Some(pg) if pg.archived_at == None:
+                          if not try VaultOps.ai_allowed_for_collection(
+                            store,
+                            pg.collection_id,
+                            ecfg.base_url,
+                            local_only_ai?
+                          )
+                            return Ok(None)
+                          end
                           blks = try Db.load_page_blocks(store, pg.id)
                           extra = case pg.kind
                             Document:
@@ -3865,7 +3944,7 @@ fn drain_jobs(_payload: Json, files: Files, clock: Clock, env: Env, net: Network
                   end
               end
               case Ai.ai_config(env)
-                Ok(ai_cfg): refresh_semantic_summary_if_stale(pid, ai_cfg, files, clock, net)
+                Ok(ai_cfg): refresh_semantic_summary_if_stale(pid, ai_cfg, files, clock, env, net)
                 Error(_): Unit
               end
           end
@@ -4117,7 +4196,7 @@ fn set_page_blueprint_meta(
           cleaned = case try Table.tx_get(t1, Db.page_meta_table(), id).map_error(
             Db.map_table_error
           )
-            Some(_): try Table.delete(t1, Db.page_meta_table(), id).map_error(Db.map_table_error)
+            Some(_): try Db.tx_delete_page_meta(t1, id)
             None: t1
           end
           (cleaned, existing_blocks, None, None)
@@ -4134,7 +4213,7 @@ fn set_page_blueprint_meta(
           end
           try validate_meta_relations_tx(t1, auth, bp, vals)
           pm = PageBlueprintMeta(page_id: id, blueprint_id: bp.id, values: vals, updated_at: now)
-          t_pm = try Table.put(t1, Db.page_meta_table(), id, pm).map_error(Db.map_table_error)
+          t_pm = try Db.tx_put_page_meta(t1, pm)
           apply_tpl? = input.apply_template_if_empty or false
           tpl_blocks = if apply_tpl? and existing_blocks.empty? and not bp.default_template_markdown
             .trim

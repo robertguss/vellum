@@ -423,34 +423,26 @@ fn execute_secret_purge_locked(
           blk_rows = try Table.tx_lookup(cur, Db.blocks_table(), Db.blocks_by_page(), pid)
             .map_error(Db.map_table_error)
           for (bid, _b) in blk_rows
-            cur = try Table.delete(cur, Db.blocks_table(), bid).map_error(Db.map_table_error)
+            cur = try Db.tx_delete_block_row(cur, bid)
             b_cnt += 1
           end
           case try Table.tx_get(cur, Db.page_meta_table(), pid).map_error(Db.map_table_error)
-            Some(_pm): cur = try Table.delete(cur, Db.page_meta_table(), pid).map_error(
-              Db.map_table_error
-            )
+            Some(_pm): cur = try Db.tx_delete_page_meta(cur, pid)
             None: Unit
           end
           case try Table.tx_get(cur, Db.page_neural_dims_table(), pid).map_error(
             Db.map_table_error
           )
-            Some(_nd): cur = try Table.delete(cur, Db.page_neural_dims_table(), pid).map_error(
-              Db.map_table_error
-            )
+            Some(_nd): cur = try Db.tx_delete_page_neural_dims(cur, pid)
             None: Unit
           end
           skey = Db.page_summary_key(pid)
           case try Table.tx_get(cur, Db.summaries_table(), skey).map_error(Db.map_table_error)
-            Some(_sm): cur = try Table.delete(cur, Db.summaries_table(), skey).map_error(
-              Db.map_table_error
-            )
+            Some(_sm): cur = try Db.tx_delete_summary(cur, skey)
             None: Unit
           end
           case try Table.tx_get(cur, Db.pages_table(), pid).map_error(Db.map_table_error)
-            Some(_pg): cur = try Table.delete(cur, Db.pages_table(), pid).map_error(
-              Db.map_table_error
-            )
+            Some(_pg): cur = try Db.tx_delete_page_row(cur, pid)
             None: Unit
           end
         else
@@ -484,9 +476,7 @@ fn execute_secret_purge_locked(
                       provenance: next_prov,
                       version: blk.version + 1
                     )
-                    cur = try Table.put(cur, Db.blocks_table(), nb.id, nb).map_error(
-                      Db.map_table_error
-                    )
+                    cur = try Db.tx_put_block_row(cur, nb)
                     nb
                   else
                     blk
@@ -516,9 +506,7 @@ fn execute_secret_purge_locked(
                       resolved_at: cmt.resolved_at,
                       created_at: cmt.created_at
                     )
-                    cur = try Table.put(cur, Db.comments_table(), nc.id, nc).map_error(
-                      Db.map_table_error
-                    )
+                    cur = try Db.tx_put_comment(cur, nc)
                   end
                 end
               end
@@ -526,8 +514,7 @@ fn execute_secret_purge_locked(
               case try Table.tx_get(cur, Db.page_neural_dims_table(), pid).map_error(
                 Db.map_table_error
               )
-                Some(_nd): cur = try Table.delete(cur, Db.page_neural_dims_table(), pid)
-                  .map_error(Db.map_table_error)
+                Some(_nd): cur = try Db.tx_delete_page_neural_dims(cur, pid)
                 None: Unit
               end
 
@@ -552,9 +539,7 @@ fn execute_secret_purge_locked(
                 archived_at: pg.archived_at,
                 version: pg.version + 1
               )
-              cur = try Table.put(cur, Db.pages_table(), bumped_pg.id, bumped_pg).map_error(
-                Db.map_table_error
-              )
+              cur = try Db.tx_put_page_row(cur, bumped_pg)
               if bumped_pg.kind == Document
                 cur = try Db.tx_refresh_page_summary(cur, bumped_pg, sorted_next_blks)
               end

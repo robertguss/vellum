@@ -3620,6 +3620,311 @@ pack(sys.argv[3], sys.argv[4])`,
     fs.rmSync(m13Tmp, { recursive: true, force: true });
   }
 }
+
+// 22. Live v3 M2.1 Opt-In FERPA / Restricted Vault, Department Groups, Zero-Exfiltration Lock & Modb.Ledger Read Audit
+{
+  const fColRes = await apiJson("/api/collections", {
+    method: "POST",
+    body: JSON.stringify({
+      slug: "ferpa-vault-e2e",
+      name: "Student Care E2E",
+      description: "Live FERPA Vault test collection",
+      icon: null,
+      write_policy: "direct_with_audit",
+      freshness_ttl_days: null,
+    }),
+  });
+  assert.equal(fColRes.res.status, 201, fColRes.text);
+  const fColId = fColRes.json.id;
+
+  const fPgRes = await apiJson("/api/pages", {
+    method: "POST",
+    body: JSON.stringify({
+      collection_id: fColId,
+      parent_page_id: null,
+      title: "Student Case E2E",
+      markdown: "# Restricted Case\n\nToken ferpae2etoken884 inside live Vault.",
+      icon: null,
+      freshness_ttl_days: null,
+      reason: "seed live ferpa page",
+    }),
+  });
+  assert.equal(fPgRes.res.status, 201, fPgRes.text);
+  const fPgId = fPgRes.json.page.id;
+
+  const fDbRes = await apiJson("/api/databases", {
+    method: "POST",
+    body: JSON.stringify({
+      collection_id: fColId,
+      parent_page_id: null,
+      title: "FERPA Case DB",
+      description: null,
+      properties: [{ id: "title", name: "Title", kind: "title", required: true, sort_order: "a" }],
+    }),
+  });
+  assert.equal(fDbRes.res.status, 201, fDbRes.text);
+  const fDbId = fDbRes.json.database.id;
+
+  const fRowRes = await apiJson(`/api/databases/${fDbId}/rows`, {
+    method: "POST",
+    body: JSON.stringify({
+      cells: { title: { text_val: "FERPA Live Row 01" } },
+      markdown: null,
+      reason: "seed live ferpa row",
+    }),
+  });
+  assert.equal(fRowRes.res.status, 201, fRowRes.text);
+
+  // VersityGW S3 attachment on FERPA page
+  const fAttBytes = Buffer.from("live-ferpa-s3-attachment\n", "utf8");
+  const fSha = createHash("sha256").update(fAttBytes).digest("hex");
+  const fPreRes = await apiJson("/api/attachments/presign", {
+    method: "POST",
+    body: JSON.stringify({
+      page_id: fPgId,
+      filename: "ferpa-record.txt",
+      content_type: "text/plain",
+      size_bytes: fAttBytes.length,
+      sha256_hex: fSha,
+    }),
+  });
+  assert.equal(fPreRes.res.status, 201, fPreRes.text);
+  const fAttId = fPreRes.json.attachment.id;
+  const fPutHdrs = {};
+  for (const h of fPreRes.json.required_headers ?? []) fPutHdrs[h.name] = h.value;
+  const fPutRes = await fetch(fPreRes.json.upload_url, {
+    method: fPreRes.json.method || "PUT",
+    headers: fPutHdrs,
+    body: fAttBytes,
+  });
+  assert.equal(fPutRes.status, 200, "VersityGW PUT on FERPA attachment");
+  const fCommRes = await apiJson(`/api/attachments/${fAttId}/commit`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  assert.equal(fCommRes.res.status, 200, fCommRes.text);
+
+  // Mint workspace:* agent to represent non-member principal denied even with workspace:* grant
+  const fMintRes = await apiJson("/api/admin/agents", {
+    method: "POST",
+    body: JSON.stringify({
+      handle: "ferpa-wildcard-bot",
+      display_name: "Wildcard Bot",
+      model_id: "gpt-4o-mini",
+      label: "ferpa-e2e-nonmember",
+      allowed_actions: ["read", "comment", "propose", "write_direct", "write_db"],
+      allowed_collections: null,
+      max_calls: 50,
+      ttl_days: 7,
+    }),
+  });
+  assert.equal(fMintRes.res.status, 201, fMintRes.text);
+  const fBotToken = fMintRes.json.raw_token;
+  const fBotGrantId = fMintRes.json.grant.id;
+  const botHeaders = {
+    Authorization: `Bearer ${fBotToken}`,
+    Accept: "application/json",
+    "Content-Type": "application/json",
+  };
+
+  // Lookup admin principal id & create Department Group "Registrar" containing only admin
+  const vStat = await apiJson("/api/admin/vault/status");
+  assert.equal(vStat.res.status, 200, vStat.text);
+  const adaPr = (vStat.json.principals ?? []).find((p) => p.kind === "human" || p.role === "owner");
+  assert.ok(adaPr?.id, "Found live admin principal for Department Group");
+
+  const grpRes = await apiJson("/api/admin/groups", {
+    method: "POST",
+    body: JSON.stringify({
+      name: "Registrar",
+      slug: null,
+      description: "Live E2E FERPA Registrar Group",
+      member_principal_ids: [adaPr.id],
+    }),
+  });
+  assert.equal(grpRes.res.status, 201, grpRes.text);
+  const grpId = grpRes.json.group.id;
+
+  const badSec = await apiJson(`/api/collections/${fColId}/security`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      security_tier: "ferpa_restricted",
+      allowed_group_ids: [],
+      allowed_principal_ids: [],
+      allow_local_ai: false,
+      reason: "empty allowlist reject",
+    }),
+  });
+  assert.equal(badSec.res.status, 422, badSec.text);
+
+  const onSec = await apiJson(`/api/collections/${fColId}/security`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      security_tier: "ferpa_restricted",
+      allowed_group_ids: [grpId],
+      allowed_principal_ids: [],
+      allow_local_ai: false,
+      reason: "enable live FERPA vault",
+    }),
+  });
+  assert.equal(onSec.res.status, 200, onSec.text);
+  assert.equal(onSec.json.policy?.security_tier, "ferpa_restricted");
+
+  // Sole group delete fails 409
+  const delBlocked = await apiJson(`/api/admin/groups/${grpId}`, { method: "DELETE" });
+  assert.equal(delBlocked.res.status, 409, delBlocked.text);
+
+  // Non-member workspace:* agent fails closed across pages, DB, query, attachments, search, /llms.txt
+  assert.equal((await fetch(`${BASE}/api/pages/${fPgId}`, { headers: botHeaders })).status, 403);
+  assert.equal((await fetch(`${BASE}/api/databases/${fDbId}`, { headers: botHeaders })).status, 403);
+  assert.equal(
+    (
+      await fetch(`${BASE}/api/databases/${fDbId}/query`, {
+        method: "POST",
+        headers: botHeaders,
+        body: JSON.stringify({
+          view_id: null,
+          filters: [],
+          filter_match_all: true,
+          sorts: [],
+          from_date: null,
+          to_date: null,
+        }),
+      })
+    ).status,
+    403
+  );
+  assert.equal(
+    (await fetch(`${BASE}/api/attachments/${fAttId}/download`, { headers: botHeaders })).status,
+    403
+  );
+  const botSearch = await (await fetch(`${BASE}/api/search?q=ferpae2etoken884`, { headers: botHeaders })).json();
+  assert.ok(
+    (botSearch.results ?? []).every((r) => r.collection_id !== fColId && r.page_id !== fPgId),
+    "Non-member hybrid search never leaks FERPA collection or page"
+  );
+  const botBm25 = await (
+    await fetch(`${BASE}/api/search?q=ferpae2etoken884&mode=bm25`, { headers: botHeaders })
+  ).json();
+  assert.equal((botBm25.results ?? []).length, 0, "Non-member BM25 search yields zero FERPA hits");
+  const botScopedSearch = await (
+    await fetch(`${BASE}/api/search?q=ferpae2etoken884&collection_id=${encodeURIComponent(fColId)}`, {
+      headers: botHeaders,
+    })
+  ).json();
+  assert.equal(
+    (botScopedSearch.results ?? []).length,
+    0,
+    "Non-member scoped FERPA search yields zero hits"
+  );
+  const botLlms = await (await fetch(`${BASE}/llms.txt`, { headers: botHeaders })).text();
+  assert.ok(!botLlms.includes("ferpa-vault-e2e"), "Non-member /llms.txt excludes FERPA collection");
+
+  // Zero-exfiltration lock for admin: /llms.txt, webhooks, and AI (when allow_local_ai: false)
+  const adminLlmsRes = await rawFetch(`${BASE}/llms.txt`);
+  assert.equal(adminLlmsRes.status, 200);
+  const adminLlmsTxt = await adminLlmsRes.text();
+  assert.ok(!adminLlmsTxt.includes("ferpa-vault-e2e"), "/llms.txt excludes FERPA collection");
+  assert.ok(!adminLlmsTxt.includes("Student Case E2E"), "/llms.txt excludes FERPA page");
+
+  const fWhRes = await apiJson("/api/webhooks", {
+    method: "POST",
+    body: JSON.stringify({
+      collection_id: fColId,
+      url: "https://hooks.example.test/ferpa-e2e",
+      events: ["page.updated"],
+    }),
+  });
+  assert.equal(fWhRes.res.status, 403, "Webhooks blocked on FERPA collection");
+
+  const fAskLocked = await apiJson("/api/ai/ask", {
+    method: "POST",
+    body: JSON.stringify({
+      question: "ferpae2etoken884",
+      collection_id: fColId,
+      max_sources: 3,
+      stream: false,
+    }),
+  });
+  assert.equal(fAskLocked.res.status, 403, "AI locked when allow_local_ai: false");
+
+  // Admin (Registrar member) reads page, DB query, S3 attachment (302 -> 200), sync snapshot -> Modb.Ledger audit logs recorded
+  const viewPg = await apiJson(`/api/pages/${fPgId}`);
+  assert.equal(viewPg.res.status, 200, viewPg.text);
+  assert.equal(viewPg.json.collection_security?.security_tier, "ferpa_restricted");
+
+  const viewDbQ = await apiJson(`/api/databases/${fDbId}/query`, {
+    method: "POST",
+    body: JSON.stringify({
+      view_id: null,
+      filters: [],
+      filter_match_all: true,
+      sorts: [],
+      from_date: null,
+      to_date: null,
+    }),
+  });
+  assert.equal(viewDbQ.res.status, 200, viewDbQ.text);
+
+  const fDl = await rawFetch(`${BASE}/api/attachments/${fAttId}/download`);
+  assert.equal(fDl.status, 302);
+  const fS3Res = await fetch(fDl.headers.get("location"));
+  assert.equal(fS3Res.status, 200);
+  assert.deepEqual(Buffer.from(await fS3Res.arrayBuffer()), fAttBytes);
+
+  const fSnap = await apiJson(`/api/sync/snapshot?collections=${encodeURIComponent(fColId)}`);
+  assert.equal(fSnap.res.status, 200, fSnap.text);
+
+  const fAud = await apiJson(`/api/admin/ferpa/audit?collection_id=${encodeURIComponent(fColId)}`);
+  assert.equal(fAud.res.status, 200, fAud.text);
+  const actions = new Set((fAud.json.entries ?? []).map((e) => e.action));
+  assert.ok(actions.has("ferpa.page.viewed"), "Recorded ferpa.page.viewed");
+  assert.ok(actions.has("ferpa.db_row.viewed"), "Recorded ferpa.db_row.viewed");
+  assert.ok(actions.has("ferpa.attachment.downloaded"), "Recorded ferpa.attachment.downloaded");
+  assert.ok(actions.has("ferpa.export.requested"), "Recorded ferpa.export.requested");
+
+  // Loopback campus AI allowed once allow_local_ai: true
+  const onLocAi = await apiJson(`/api/collections/${fColId}/security`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      security_tier: "ferpa_restricted",
+      allowed_group_ids: [grpId],
+      allowed_principal_ids: [],
+      allow_local_ai: true,
+      reason: "allow loopback mock AI",
+    }),
+  });
+  assert.equal(onLocAi.res.status, 200, onLocAi.text);
+  const fAskLocal = await apiJson("/api/ai/ask", {
+    method: "POST",
+    body: JSON.stringify({
+      question: "ferpae2etoken884",
+      collection_id: fColId,
+      max_sources: 3,
+      stream: false,
+    }),
+  });
+  assert.equal(fAskLocal.res.status, 200, fAskLocal.text);
+
+  // Declassify -> wildcard agent regains access, group delete succeeds, revoke temporary agent
+  const offSec = await apiJson(`/api/collections/${fColId}/security`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      security_tier: "standard",
+      allowed_group_ids: [],
+      allowed_principal_ids: [],
+      allow_local_ai: false,
+      reason: "revert E2E vault",
+    }),
+  });
+  assert.equal(offSec.res.status, 200, offSec.text);
+  assert.equal((await fetch(`${BASE}/api/pages/${fPgId}`, { headers: botHeaders })).status, 200);
+  const delOk = await apiJson(`/api/admin/groups/${grpId}`, { method: "DELETE" });
+  assert.equal(delOk.res.status, 200, delOk.text);
+  await apiJson(`/api/admin/grants/${fBotGrantId}/revoke`, { method: "POST", body: JSON.stringify({}) });
+
+  console.log("✓ Live v3 M2.1 FERPA Vault, Department Groups, Zero-Exfiltration Lock & Modb.Ledger Read Audit verified");
+}
 EOF
 
 echo "All Live Vellum E2E checks against mo serve + Dex + VersityGW S3 passed."

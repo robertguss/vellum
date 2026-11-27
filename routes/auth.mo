@@ -47,6 +47,7 @@ use Domain.Types{AppError, AuthContext, Principal}
 use Json
 use Modb.Ledger
 use Modb.Table
+use VaultOps
 
 enum AuthMode
   SoloMode
@@ -498,13 +499,14 @@ fn authenticate_bearer(raw_tok: Text, rf: ReadFiles, now: Time) : Result(AuthCon
         Ok(g): g
         Error(_): return Error(Unauthenticated)
       end
+      eff_views = try VaultOps.apply_vault_restrictions(store, principal.id, grant.allowed_views)
 
       Ok(
         AuthContext(
           principal: principal,
           grant_id: grant.id,
           session: None,
-          allowed_collections: grant.allowed_views,
+          allowed_collections: eff_views,
           allowed_actions: grant.allowed_actions
         )
       )
@@ -557,13 +559,14 @@ fn authenticate(req: Api.Request, rf: ReadFiles, clock: Clock, env: Env) : Resul
         Ok(g): g
         Error(_): return Error(Unauthenticated)
       end
+      eff_views = try VaultOps.apply_vault_restrictions(store, principal.id, grant.allowed_views)
 
       Ok(
         AuthContext(
           principal: principal,
           grant_id: grant.id,
           session: Some(sess),
-          allowed_collections: grant.allowed_views,
+          allowed_collections: eff_views,
           allowed_actions: grant.allowed_actions
         )
       )

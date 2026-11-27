@@ -9,6 +9,7 @@ use Routes.Importer
 use Routes.Mcp
 use Routes.Packs
 use Routes.Sync
+use Routes.Vault
 use Routes.Workspace
 
 api
@@ -57,6 +58,13 @@ api
     post "/admin/grants/kill-all" Workspace.kill_all_agent_grants
     post "/admin/grants/:id/revoke" Workspace.revoke_grant
     get "/audit" Workspace.audit_index
+    get "/admin/vault/status" Vault.vault_status
+    get "/admin/groups" Vault.list_groups
+    post "/admin/groups" Vault.create_group
+    patch "/admin/groups/:id" Vault.update_group
+    delete "/admin/groups/:id" Vault.delete_group
+    patch "/collections/:id/security" Vault.update_collection_security
+    get "/admin/ferpa/audit" Vault.ferpa_audit_index
 
     get "/databases" Databases.list_databases
     post "/databases" Databases.create_database

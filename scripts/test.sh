@@ -85,6 +85,8 @@ mo check tests/unit-packs.mo
 mo check tests/unit-domain-misc.mo
 mo check tests/unit-rlm.mo
 mo check tests/unit-sync-cli.mo
+mo check tests/unit-vault.mo
+mo check tests/v3m2a.mo
 
 mo test domain/blocks.mo
 mo test domain/policy.mo
@@ -116,5 +118,7 @@ mo test tests/phase4.mo
 mo test tests/v3m1.mo
 mo test tests/v3m1b.mo
 mo test tests/v3m1c.mo
+mo test tests/unit-vault.mo
+mo test tests/v3m2a.mo
 
 echo "All Vellum Stage 1-5 checks, frontend build checks, and tests passed."

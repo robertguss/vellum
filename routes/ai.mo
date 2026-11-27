@@ -94,6 +94,7 @@ use Modb.Views
 use Modb.World
 use Routes.Auth
 use Routes.Packs
+use VaultOps
 
 ## Runtime configuration for Vellum's built-in LLM client.
 struct AiConfig
@@ -516,6 +517,25 @@ fn ask_workspace(
     return Error(BadInput(reason: "question must not be empty"))
   end
   cfg = try ai_config(env)
+  local_only_ai? = VaultOps.env_ai_local_only?(env)
+  case input.collection_id
+    Some(cid) if not cid.trim.empty? and rf.exists?(Db.ledger_db_path):
+      _ok = try Ledger.read_locked(
+        rf,
+        Db.ledger_db_path,
+        Db.vellum_schema(),
+        Db.map_ledger_error,
+        fn(db)
+          VaultOps.require_ai_allowed_for_collection(
+            Ledger.store(db),
+            cid.trim,
+            cfg.base_url,
+            local_only_ai?
+          )
+        end
+      )
+    Some(_) | None: Unit
+  end
   max_src = case input.max_sources
     Some(n) if n >= 1 and n <= 10: n
     Some(_) | None: 5
@@ -545,6 +565,14 @@ fn ask_workspace(
         var cites = []
         var ctx = []
         for hit in search_out.results
+          if not try VaultOps.ai_allowed_for_collection(
+            store,
+            hit.collection_id,
+            cfg.base_url,
+            local_only_ai?
+          )
+            continue
+          end
           blks = try Db.load_page_blocks(store, hit.page_id)
           first_blk = blks.first
           excerpt = case first_blk
@@ -645,6 +673,11 @@ fn draft_blocks(
     return Error(Missing(entity: "page", id: input.page_id))
   end
 
+  cfg_url_opt = case ai_config(env)
+    Ok(c): Some(c.base_url)
+    Error(_): None
+  end
+  local_only_ai? = VaultOps.env_ai_local_only?(env)
   (page, existing_blocks) = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
@@ -657,6 +690,16 @@ fn draft_blocks(
         Some(_) | None: return Error(Missing(entity: "page", id: input.page_id))
       end
       try Policy.require_collection_access(auth, "read", pg.collection_id)
+      case cfg_url_opt
+        Some(url):
+          try VaultOps.require_ai_allowed_for_collection(
+            store,
+            pg.collection_id,
+            url,
+            local_only_ai?
+          )
+        None: Unit
+      end
       blks = try Db.load_page_blocks(store, pg.id)
       Ok((pg, blks))
     end
@@ -788,7 +831,7 @@ fn draft_blocks(
       else
         tx
       end
-      t2 = try Table.put(t1, Db.proposals_table(), pm.id, pm).map_error(Db.map_table_error)
+      t2 = try Db.tx_put_proposal(t1, pm)
       Ok((t2, pm))
     end
   )
@@ -1051,6 +1094,11 @@ fn propose_garden_fix(
     return Error(Missing(entity: "page", id: input.target_page_id))
   end
 
+  cfg_url_opt = case ai_config(env)
+    Ok(c): Some(c.base_url)
+    Error(_): None
+  end
+  local_only_ai? = VaultOps.env_ai_local_only?(env)
   (target_pg, target_blks, rel_pg_opt, rel_blk_opt) = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
@@ -1065,6 +1113,16 @@ fn propose_garden_fix(
         Some(_) | None: return Error(Missing(entity: "page", id: input.target_page_id))
       end
       try Policy.require_collection_access(auth, "propose", tpg.collection_id)
+      case cfg_url_opt
+        Some(url):
+          try VaultOps.require_ai_allowed_for_collection(
+            store,
+            tpg.collection_id,
+            url,
+            local_only_ai?
+          )
+        None: Unit
+      end
       tblks = try Db.load_page_blocks(store, tpg.id)
 
       rpg_opt = case input.related_page_id
@@ -1266,7 +1324,7 @@ fn propose_garden_fix(
       else
         tx
       end
-      t2 = try Table.put(t1, Db.proposals_table(), pm.id, pm).map_error(Db.map_table_error)
+      t2 = try Db.tx_put_proposal(t1, pm)
       Ok((t2, pm))
     end
   )
@@ -1343,6 +1401,11 @@ fn refresh_ai_brief(
     return Error(Missing(entity: "page", id: input.page_id))
   end
 
+  cfg_url_opt = case ai_config(env)
+    Ok(c): Some(c.base_url)
+    Error(_): None
+  end
+  local_only_ai? = VaultOps.env_ai_local_only?(env)
   (pg, target_blk, brief_prompt, scope_opt, sum_lines, cits) = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
@@ -1358,6 +1421,18 @@ fn refresh_ai_brief(
       end
       try Policy.require_collection_access(auth, "read", pg.collection_id)
       try Policy.require_collection_access(auth, "propose", pg.collection_id)
+      if input.deterministic_fallback != Some(true)
+        case cfg_url_opt
+          Some(url):
+            try VaultOps.require_ai_allowed_for_collection(
+              store,
+              pg.collection_id,
+              url,
+              local_only_ai?
+            )
+          None: Unit
+        end
+      end
 
       blks = try Db.load_page_blocks(store, pg.id)
       var found_blk = None
@@ -1391,6 +1466,20 @@ fn refresh_ai_brief(
       var lines = []
       var citations = []
       for s in sums.take(15)
+        if input.deterministic_fallback != Some(true)
+          case cfg_url_opt
+            Some(url):
+              if not try VaultOps.ai_allowed_for_collection(
+                store,
+                s.collection_id,
+                url,
+                local_only_ai?
+              )
+                continue
+              end
+            None: Unit
+          end
+        end
         blurb = s.semantic_summary or s.structural_summary
         lines = lines.append("- [#{s.entity_kind} #{s.entity_id}] #{s.title}: #{blurb}")
         if s.entity_kind == "page" and citations.size < 5
@@ -1531,7 +1620,7 @@ fn refresh_ai_brief(
       else
         tx
       end
-      t2 = try Table.put(t1, Db.proposals_table(), pm.id, pm).map_error(Db.map_table_error)
+      t2 = try Db.tx_put_proposal(t1, pm)
       Ok((t2, pm))
     end
   )
@@ -2043,6 +2132,11 @@ fn run_ai_column(
     None: true
   end
 
+  cfg_url_opt = case ai_config(env)
+    Ok(c): Some(c.base_url)
+    Error(_): None
+  end
+  local_only_ai? = VaultOps.env_ai_local_only?(env)
   (used_before, candidates, row_blocks_map) = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
@@ -2050,6 +2144,16 @@ fn run_ai_column(
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
+      case cfg_url_opt
+        Some(url):
+          try VaultOps.require_ai_allowed_for_collection(
+            store,
+            col_check.id,
+            url,
+            local_only_ai?
+          )
+        None: Unit
+      end
       used = case try Table.get(store, Db.ai_col_usage_table(), usage_key).map_error(
         Db.map_table_error
       )
@@ -2324,9 +2428,7 @@ fn run_ai_column(
             proposal_id: None,
             computed_at: now
           )
-          t = try Table.put(t, Db.ai_cell_meta_table(), cmeta.id, cmeta).map_error(
-            Db.map_table_error
-          )
+          t = try Db.tx_put_ai_cell_meta(t, cmeta)
           applied += 1
         end
         Ok((t, (new_u, applied)))
@@ -2544,7 +2646,7 @@ fn run_ai_column(
     Json.Object({"proposal_id": Json.String(prop_id_new), "database_id": Json.String(def_check.id)}),
     Db.map_ledger_error,
     fn(tx)
-      t1 = try Table.put(tx, Db.proposals_table(), pm.id, pm).map_error(Db.map_table_error)
+      t1 = try Db.tx_put_proposal(tx, pm)
       Ok((t1, pm))
     end
   )
@@ -2610,6 +2712,11 @@ fn steer_proposal(
     return Error(Missing(entity: "proposal", id: id))
   end
 
+  cfg_url_opt = case ai_config(env)
+    Ok(c): Some(c.base_url)
+    Error(_): None
+  end
+  local_only_ai? = VaultOps.env_ai_local_only?(env)
   (pm, target_pid, page_title, spec_blk, live_md) = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
@@ -2625,6 +2732,18 @@ fn steer_proposal(
         return Error(Conflict(reason: "proposal '#{id}' is '#{found.status}', not 'open'"))
       end
       try Policy.require_collection_access(auth, "propose", found.collection_id)
+      if input.deterministic_fallback != Some(true)
+        case cfg_url_opt
+          Some(url):
+            try VaultOps.require_ai_allowed_for_collection(
+              store,
+              found.collection_id,
+              url,
+              local_only_ai?
+            )
+          None: Unit
+        end
+      end
       world = case try World.get_world(store, found.world_id).map_error(Db.map_world_error)
         Some(w): w
         None: return Error(Missing(entity: "world", id: found.world_id))
@@ -2820,12 +2939,8 @@ fn steer_proposal(
       else
         tx
       end
-      t2 = try Table.put(t1, Db.proposal_comments_table(), human_cmt.id, human_cmt).map_error(
-        Db.map_table_error
-      )
-      t3 = try Table.put(t2, Db.proposal_comments_table(), agent_cmt.id, agent_cmt).map_error(
-        Db.map_table_error
-      )
+      t2 = try Db.tx_put_proposal_comment(t1, human_cmt)
+      t3 = try Db.tx_put_proposal_comment(t2, agent_cmt)
       Ok((t3, Unit))
     end
   )
@@ -2913,7 +3028,9 @@ end
 fn rlm_target_collections(
   rf: ReadFiles,
   auth: AuthContext,
-  col_filter: Option(Text)
+  col_filter: Option(Text),
+  ai_url_opt: Option(Text),
+  local_only_ai?: Bool
 ) : Result((List(Text), List(Text)), AppError)
   filter_opt = case col_filter
     Some(raw) if not raw.trim.empty?: Some(raw.trim)
@@ -2931,10 +3048,40 @@ fn rlm_target_collections(
     Db.vellum_schema(),
     Db.map_ledger_error,
     fn(db)
-      pairs = try Table.scan(Ledger.store(db), Db.collections_table(), None, None, 200).map_error(
+      store = Ledger.store(db)
+      pairs = try Table.scan(store, Db.collections_table(), None, None, 200).map_error(
         Db.map_table_error
       )
-      Ok(pairs.filter(fn(p) p.1.archived_at == None end).map(fn(p) p.1 end).sort_by(fn(c) c.id end))
+      active = pairs.filter(fn(p) p.1.archived_at == None end).map(fn(p) p.1 end).sort_by(
+        fn(c) c.id end
+      )
+      case (filter_opt, ai_url_opt)
+        (Some(cid), Some(url)):
+          if active.any?(fn(c) c.id == cid end)
+            try Policy.require_collection_access(auth, "read", cid)
+            try VaultOps.require_ai_allowed_for_collection(store, cid, url, local_only_ai?)
+          end
+          Ok(active)
+        (Some(cid), None):
+          if active.any?(fn(c) c.id == cid end)
+            try Policy.require_collection_access(auth, "read", cid)
+          end
+          Ok(active)
+        (None, Some(url)):
+          var ok_cols = []
+          for c in active
+            if Policy.collection_permitted?(auth, c.id) and try VaultOps.ai_allowed_for_collection(
+              store,
+              c.id,
+              url,
+              local_only_ai?
+            )
+              ok_cols = ok_cols.append(c)
+            end
+          end
+          Ok(ok_cols)
+        (None, None): Ok(active)
+      end
     end
   )
   case filter_opt
@@ -2942,9 +3089,7 @@ fn rlm_target_collections(
       if not cols.any?(fn(c) c.id == cid end)
         return Error(Missing(entity: "collection", id: cid))
       end
-      if auth.allowed_collections is None
-        try Policy.require_collection_access(auth, "read", cid)
-      end
+      try Policy.require_collection_access(auth, "read", cid)
       Ok(([cid], [cid]))
     None:
       cids = cols.filter(fn(c) Policy.collection_permitted?(auth, c.id) end).map(fn(c) c.id end)
@@ -3345,10 +3490,13 @@ fn execute_rlm_tier1(
   now = clock.now
 
   (grant_opt, is_admin) = rlm_auth_mode(auth)
+  local_only_ai? = VaultOps.env_ai_local_only?(env)
   (catalog_cids, query_cids) = try rlm_target_collections(
     files.read_only,
     auth,
-    input.collection_id
+    input.collection_id,
+    Some(cfg.base_url),
+    local_only_ai?
   )
 
   sess_id = case input.session_id
@@ -3574,11 +3722,14 @@ fn rlm_vm_text_list(v: RlmVm.RlmVal) : List(Text)
   end
 end
 
-fn rlm_merge_cids(auth: AuthContext, col_opt: Option(Text), rf: ReadFiles) : Result(
-  (List(Text), List(Text)),
-  AppError
-)
-  rlm_target_collections(rf, auth, col_opt)
+fn rlm_merge_cids(
+  auth: AuthContext,
+  col_opt: Option(Text),
+  rf: ReadFiles,
+  ai_url_opt: Option(Text),
+  local_only_ai?: Bool
+) : Result((List(Text), List(Text)), AppError)
+  rlm_target_collections(rf, auth, col_opt, ai_url_opt, local_only_ai?)
 end
 
 struct TaintMerge
@@ -3644,15 +3795,21 @@ fn rlm_vm_run_summaries(
   limits: Views.ReadLimits,
   default_col_opt: Option(Text),
   arg_col: RlmVm.RlmVal,
+  ai_url_opt: Option(Text),
+  local_only_ai?: Bool,
   now: Time
 ) : Result(RlmVm.RlmHostDelta, RlmVm.RlmVmError)
   eff_col = case rlm_vm_opt_text(arg_col)
     Some(c): Some(c)
     None: default_col_opt
   end
-  (catalog_cids, target_cids) = try rlm_merge_cids(auth, eff_col, files.read_only).map_error(fn(e)
-    RlmVm.HostAppError(err: e)
-  end)
+  (catalog_cids, target_cids) = try rlm_merge_cids(
+    auth,
+    eff_col,
+    files.read_only,
+    ai_url_opt,
+    local_only_ai?
+  ).map_error(fn(e) RlmVm.HostAppError(err: e) end)
   cat = Db.rlm_view_catalog(catalog_cids)
   var out_vals = []
   var total_rows = 0
@@ -3783,9 +3940,18 @@ fn rlm_vm_run_search(
     Some(c): Some(c)
     None: default_col_opt
   end
-  (_cat_cids, target_cids) = try rlm_merge_cids(auth, eff_col, files.read_only).map_error(fn(e)
-    RlmVm.HostAppError(err: e)
-  end)
+  ai_url_opt = case ai_config(env)
+    Ok(c): Some(c.base_url)
+    Error(_): None
+  end
+  local_only_ai? = VaultOps.env_ai_local_only?(env)
+  (_cat_cids, target_cids) = try rlm_merge_cids(
+    auth,
+    eff_col,
+    files.read_only,
+    ai_url_opt,
+    local_only_ai?
+  ).map_error(fn(e) RlmVm.HostAppError(err: e) end)
   if target_cids.empty? or not files.read_only.exists?(Db.ledger_db_path)
     return Ok(RlmVm.plain_delta(RlmVm.VList([])))
   end
@@ -4213,6 +4379,7 @@ end
 
 struct RlmFrameConfig
   cfg: AiConfig
+  local_only_ai?: Bool
   auth: AuthContext
   default_col_opt: Option(Text)
   catalog_cids: List(Text)
@@ -4310,6 +4477,8 @@ fn run_rlm_tier2_frame(
         fcfg.limits,
         fcfg.default_col_opt,
         col_v,
+        Some(fcfg.cfg.base_url),
+        fcfg.local_only_ai?,
         now
       )
     end,
@@ -4605,7 +4774,14 @@ fn execute_rlm_tier2(
     Some(_) | None: None
   end
   (grant_opt, is_admin) = rlm_auth_mode(auth)
-  (catalog_cids, _query_cids) = try rlm_target_collections(files.read_only, auth, col_opt)
+  local_only_ai? = VaultOps.env_ai_local_only?(env)
+  (catalog_cids, _query_cids) = try rlm_target_collections(
+    files.read_only,
+    auth,
+    col_opt,
+    Some(cfg.base_url),
+    local_only_ai?
+  )
 
   sess_id = case input.session_id
     Some(raw) if not raw.trim.empty?: "rlm2:#{auth.grant_id}:#{raw.trim}"
@@ -4645,6 +4821,7 @@ fn execute_rlm_tier2(
 
   fcfg = RlmFrameConfig(
     cfg: cfg,
+    local_only_ai?: local_only_ai?,
     auth: auth,
     default_col_opt: col_opt,
     catalog_cids: catalog_cids,

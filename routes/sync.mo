@@ -33,6 +33,7 @@ use Modb.Table
 use Modb.World
 use Routes.Auth
 use Routes.Workspace{validate_meta_relations_tx}
+use VaultOps
 
 ## JSON payload for `POST /api/sync/push`.
 struct SyncPushInput
@@ -162,8 +163,15 @@ fn resolve_snapshot_collections(
   Ok(out)
 end
 
-## `GET /api/sync/snapshot` — Grant-filtered read-only snapshot of mirrored YAML + anchored Markdown docs.
-fn sync_snapshot(req: Api.Request, auth: AuthContext, rf: ReadFiles) : Result(
+## `GET /api/sync/snapshot` — Grant-filtered snapshot of mirrored YAML + anchored Markdown docs
+## (records FERPA read/export audit entries when restricted collections are included).
+fn sync_snapshot(
+  req: Api.Request,
+  auth: AuthContext,
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock
+) : Result(
   Api.Response,
   AppError
 )
@@ -174,7 +182,7 @@ fn sync_snapshot(req: Api.Request, auth: AuthContext, rf: ReadFiles) : Result(
     return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'read'"))
   end
   col_filter = req.query_param("collections")
-  if not rf.exists?(Db.ledger_db_path)
+  if not files.read_only.exists?(Db.ledger_db_path)
     return Ok(
       json_ok(
         200,
@@ -183,8 +191,8 @@ fn sync_snapshot(req: Api.Request, auth: AuthContext, rf: ReadFiles) : Result(
     )
   end
 
-  snap_json = try Ledger.read_locked(
-    rf,
+  snap_wrap = try Ledger.read_locked(
+    files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
@@ -192,7 +200,11 @@ fn sync_snapshot(req: Api.Request, auth: AuthContext, rf: ReadFiles) : Result(
       store = Ledger.store(db)
       selected = try resolve_snapshot_collections(store, auth, col_filter)
       var items = []
+      var ferpa_cols = []
       for col in selected
+        if try VaultOps.is_ferpa_restricted(store, col.id)
+          ferpa_cols = ferpa_cols.append(Json.String(col.id))
+        end
         p_rows = try Table.lookup(store, Db.pages_table(), Db.pages_by_collection(), col.id).map_error(
           Db.map_table_error
         )
@@ -223,15 +235,32 @@ fn sync_snapshot(req: Api.Request, auth: AuthContext, rf: ReadFiles) : Result(
       end
       Ok(
         Json.Object({
-          "txid": Json.int(Modb.txid(store)),
-          "collections": selected.to_json,
-          "pages": Json.Array(items)
+          "body": Json.Object({
+            "txid": Json.int(Modb.txid(store)),
+            "collections": selected.to_json,
+            "pages": Json.Array(items)
+          }),
+          "ferpa_cols": Json.Array(ferpa_cols)
         })
       )
     end
   )
 
-  Ok(json_ok(200, snap_json))
+  for fcid in VaultOps.json_string_list(snap_wrap, "ferpa_cols")
+    try VaultOps.record_ferpa_read_audit_locked(
+      files,
+      rng,
+      clock,
+      auth,
+      "ferpa.export.requested",
+      fcid,
+      "collection",
+      fcid,
+      "FERPA vault sync snapshot export"
+    )
+  end
+
+  Ok(json_ok(200, snap_wrap.get("body") or Json.Null))
 end
 
 fn infer_collection_token(
@@ -345,7 +374,7 @@ fn sync_push_create(
       t1 = try tx_authorize_if_agent(tx, auth, "write_direct", now)
       (b_opt, m_opt) = try tx_resolve_frontmatter_meta(t1, auth, fm, page.id, now)
       t2 = case m_opt
-        Some(pm): try Table.put(t1, Db.page_meta_table(), page.id, pm).map_error(Db.map_table_error)
+        Some(pm): try Db.tx_put_page_meta(t1, pm)
         None: t1
       end
       t3 = try Db.tx_save_page_and_blocks(t2, page, blocks)
@@ -515,7 +544,7 @@ fn sync_push_stage_proposal(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "propose", now)
-      t2 = try Table.put(t1, Db.proposals_table(), pm.id, pm).map_error(Db.map_table_error)
+      t2 = try Db.tx_put_proposal(t1, pm)
       Ok((t2, pm))
     end
   )
@@ -602,8 +631,7 @@ fn sync_push_direct_update(
         None: (cur_bp_opt, cur_pm_opt)
       end
       t2 = case next_pm_opt
-        Some(pm) if fm.blueprint_slug != None: try Table.put(t1, Db.page_meta_table(), live.id, pm)
-          .map_error(Db.map_table_error)
+        Some(pm) if fm.blueprint_slug != None: try Db.tx_put_page_meta(t1, pm)
         Some(_) | None: t1
       end
 

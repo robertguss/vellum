@@ -51,6 +51,7 @@ use Modb.Grants
 use Modb.Ledger
 use Modb.Table
 use Routes.Auth
+use VaultOps
 
 ## JSON payload for `POST /api/databases`.
 struct CreateDatabaseInput
@@ -533,13 +534,9 @@ fn create_database(
         Some(c) if c.archived_at == None: Unit
         Some(_) | None: return Error(Missing(entity: "collection", id: input.collection_id))
       end
-      t2 = try Table.put(t1, Db.pages_table(), host_page.id, host_page).map_error(
-        Db.map_table_error
-      )
-      t3 = try Table.put(t2, Db.databases_table(), def.id, def).map_error(Db.map_table_error)
-      t4 = try Table.put(t3, Db.db_views_table(), default_view.id, default_view).map_error(
-        Db.map_table_error
-      )
+      t2 = try Db.tx_put_page_row(t1, host_page)
+      t3 = try Db.tx_put_database(t2, def)
+      t4 = try Db.tx_put_db_view(t3, default_view)
       t5 = try Db.tx_refresh_db_summary(t4, def, now)
       Ok((t5, Unit))
     end
@@ -690,12 +687,13 @@ fn build_show_ai_meta(
   Ok((Json.Object(usage_map), Json.Object(cell_meta_map)))
 end
 
-## `GET /d/:id` and `GET /api/databases/:id` — Returns database schema, saved views, and enriched rows (`ReadFiles`-only).
+## `GET /d/:id` and `GET /api/databases/:id` — Returns database schema, saved views, and enriched rows (plus FERPA read audit when restricted).
 fn show_database(
   req: Api.Request,
   id: Text,
   auth: Option(AuthContext),
-  rf: ReadFiles,
+  files: Files,
+  rng: SecureRandom,
   clock: Clock,
   env: Env
 ) : Result(
@@ -706,7 +704,7 @@ fn show_database(
     Some(x): x
     None: return Auth.guest_redirect_or_401(req, env)
   end
-  if not rf.exists?(Db.ledger_db_path)
+  if not files.read_only.exists?(Db.ledger_db_path)
     return Error(Missing(entity: "database", id: id))
   end
 
@@ -715,7 +713,7 @@ fn show_database(
   read_act = db_read_action(a)
   show_payload = try Ledger
     .read_locked(
-      rf,
+      files.read_only,
       Db.ledger_db_path,
       Db.vellum_schema(),
       Db.map_ledger_error,
@@ -786,6 +784,7 @@ fn show_database(
         end
 
         (usage_json, cell_meta_json) = try build_show_ai_meta(store, def, active_rows, today_iso)
+        ferpa? = try VaultOps.is_ferpa_restricted(store, def.collection_id)
 
         Ok(
           Json.Object({
@@ -798,11 +797,28 @@ fn show_database(
             "relation_targets": rel_targets_json,
             "scenarios": open_scenarios.to_json,
             "ai_cell_meta": cell_meta_json,
-            "ai_usage": usage_json
+            "ai_usage": usage_json,
+            "_ferpa_restricted": Json.Boolean(ferpa?),
+            "_collection_id": Json.String(def.collection_id)
           })
         )
       end
     )
+
+  if show_payload.bool_at("_ferpa_restricted") == Some(true)
+    ferpa_cid = show_payload.text_at("_collection_id") or ""
+    try VaultOps.record_ferpa_read_audit_locked(
+      files,
+      rng,
+      clock,
+      a,
+      "ferpa.db_row.viewed",
+      ferpa_cid,
+      "database",
+      id,
+      "FERPA vault database view"
+    )
+  end
 
   if Auth.wants_json?(req)
     return Ok(
@@ -822,11 +838,11 @@ fn show_database(
     )
   end
 
-  icfg = try Auth.load_inertia_config(rf, env)
+  icfg = try Auth.load_inertia_config(files.read_only, env)
   if Inertia.check_version(req, icfg) is Some(ver_res)
     return Ok(ver_res)
   end
-  (shared, had_flash?) = try Auth.shared_props_for(req, Some(a), rf, env)
+  (shared, had_flash?) = try Auth.shared_props_for(req, Some(a), files.read_only, env)
   res = Inertia.render(
     req,
     icfg,
@@ -1006,7 +1022,7 @@ fn create_view(
         Some(msg): return Error(BadInput(reason: msg))
         None: Unit
       end
-      t2 = try Table.put(t1, Db.db_views_table(), v.id, v).map_error(Db.map_table_error)
+      t2 = try Db.tx_put_db_view(t1, v)
       Ok((t2, Unit))
     end
   )
@@ -1132,7 +1148,7 @@ fn update_view(
         Some(msg): return Error(BadInput(reason: msg))
         None: Unit
       end
-      t2 = try Table.put(t1, Db.db_views_table(), next_v.id, next_v).map_error(Db.map_table_error)
+      t2 = try Db.tx_put_db_view(t1, next_v)
       Ok((t2, next_v.to_json))
     end
   )
@@ -1218,13 +1234,15 @@ fn delete_view(
   )
 end
 
-## `POST /api/databases/:id/query` — Executes Table/Board/Calendar filtering, sorting, and Rollups (`ReadFiles`-only).
+## `POST /api/databases/:id/query` — Executes Table/Board/Calendar filtering, sorting, and Rollups (plus FERPA read audit when restricted).
 fn query_database(
   req: Api.Request,
   id: Text,
   auth: AuthContext,
   input: QueryDatabaseInput,
-  rf: ReadFiles
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
   from_d = case input.from_date
@@ -1244,13 +1262,13 @@ fn query_database(
     Some(_) | None: None
   end
 
-  if not rf.exists?(Db.ledger_db_path)
+  if not files.read_only.exists?(Db.ledger_db_path)
     return Error(Missing(entity: "database", id: id))
   end
   read_act = db_read_action(auth)
 
-  res_json = try Ledger.read_locked(
-    rf,
+  res_wrap = try Ledger.read_locked(
+    files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
@@ -1320,17 +1338,36 @@ fn query_database(
         None: (sorted, None)
       end
 
+      ferpa? = try VaultOps.is_ferpa_restricted(store, def.collection_id)
       Ok(
-        ViewQueryResult(
-          view: view_opt,
-          rows: final_rows,
-          board_groups: board_groups,
-          total_count: final_rows.size
-        ).to_json
+        Json.Object({
+          "body": ViewQueryResult(
+            view: view_opt,
+            rows: final_rows,
+            board_groups: board_groups,
+            total_count: final_rows.size
+          ).to_json,
+          "col_id": Json.String(def.collection_id),
+          "ferpa": Json.Boolean(ferpa?)
+        })
       )
     end
   )
-  Ok(json_ok(200, res_json))
+  if res_wrap.bool_at("ferpa") == Some(true)
+    ferpa_cid = res_wrap.text_at("col_id") or ""
+    try VaultOps.record_ferpa_read_audit_locked(
+      files,
+      rng,
+      clock,
+      auth,
+      "ferpa.db_row.viewed",
+      ferpa_cid,
+      "database",
+      id,
+      "FERPA vault database query"
+    )
+  end
+  Ok(json_ok(200, res_wrap.get("body") or Json.Null))
 end
 
 ## `POST /api/databases/:id/rows` — Atomically creates a `DbRow`, backing `Page(DatabaseRow)`, `vlm_db_cells` indexes, and `Modb.Fts`.
@@ -1426,9 +1463,7 @@ fn create_row(
         version: 1
       )
       t2 = try Db.tx_put_db_row(t_seq, def, row, page, blocks)
-      t2b = try Table.put(t2, Db.db_row_editors_table(), row.id, auth.principal.id).map_error(
-        Db.map_table_error
-      )
+      t2b = try Db.tx_put_db_row_editor(t2, row.id, auth.principal.id)
       (t3, _jid) = try Jobs.tx_put(t2b, idx_job).map_error(Db.map_table_error)
       Ok((
         t3,
@@ -1566,8 +1601,7 @@ fn update_row(
         version: old_page.version + 1
       )
       t2 = try Db.tx_put_db_row(t1, def, bumped_row, bumped_page, existing_blocks)
-      t2b = try Table.put(t2, Db.db_row_editors_table(), bumped_row.id, auth.principal.id)
-        .map_error(Db.map_table_error)
+      t2b = try Db.tx_put_db_row_editor(t2, bumped_row.id, auth.principal.id)
       idx_job = Jobs.JobRecord(
         id: stub_job.id,
         queue: stub_job.queue,

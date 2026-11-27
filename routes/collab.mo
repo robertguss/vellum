@@ -104,6 +104,7 @@ use Modb.World
 use Routes.Ai
 use Routes.Auth
 use Routes.Databases
+use VaultOps
 
 ## JSON payload for `POST /api/claims`.
 struct AcquireClaimInput
@@ -253,6 +254,13 @@ fn matching_webhooks_in_store(store: Store, event: Text, collection_id: Option(T
   List(WebhookSub),
   AppError
 )
+  case collection_id
+    Some(cid):
+      if try VaultOps.is_ferpa_restricted(store, cid)
+        return Ok([])
+      end
+    None: Unit
+  end
   rows = try Table.scan(store, Db.webhooks_table(), None, None, 200).map_error(Db.map_table_error)
   var out = []
   for (_id, sub) in rows
@@ -633,9 +641,7 @@ fn open_proposal(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "propose", now)
-      var cur = try Table.put(t1, Db.proposals_table(), proposal.id, proposal).map_error(
-        Db.map_table_error
-      )
+      var cur = try Db.tx_put_proposal(t1, proposal)
       for job_rec in hook_jobs
         (next_tx, _jid) = try Jobs.tx_put(cur, job_rec).map_error(Db.map_table_error)
         cur = next_tx
@@ -777,9 +783,7 @@ fn open_db_scenario(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "propose", now)
-      var cur = try Table.put(t1, Db.proposals_table(), proposal.id, proposal).map_error(
-        Db.map_table_error
-      )
+      var cur = try Db.tx_put_proposal(t1, proposal)
       for job_rec in hook_jobs
         (next_tx, _jid) = try Jobs.tx_put(cur, job_rec).map_error(Db.map_table_error)
         cur = next_tx
@@ -2050,9 +2054,7 @@ fn accept_proposal(
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, accept_act, now)
-      var cur = try Table.put(t1, Db.proposals_table(), accepted.id, accepted).map_error(
-        Db.map_table_error
-      )
+      var cur = try Db.tx_put_proposal(t1, accepted)
       if prop_untrusted
         cur = try TaintBridge.tx_mark_provenance(
           cur,
@@ -2195,9 +2197,7 @@ fn reject_proposal(req: Api.Request, id: Text, auth: AuthContext, files: Files, 
     Json.Object({"proposal_id": Json.String(rejected.id)}),
     Db.map_ledger_error,
     fn(tx)
-      t1 = try Table.put(tx, Db.proposals_table(), rejected.id, rejected).map_error(
-        Db.map_table_error
-      )
+      t1 = try Db.tx_put_proposal(tx, rejected)
       Ok((t1, rejected))
     end
   )
@@ -2691,7 +2691,7 @@ fn delegate_grant(
         created_at: now,
         last_seen_at: None
       )
-      t3 = try Table.put(t2, Db.principals_table(), p.id, p).map_error(Db.map_table_error)
+      t3 = try Db.tx_put_principal(t2, p)
       t_rec = AgentToken(
         id: token_id,
         principal_id: child_agent_id,
@@ -2704,7 +2704,7 @@ fn delegate_grant(
         revoked_at: None,
         last_used_at: None
       )
-      t4 = try Table.put(t3, Db.agent_tokens_table(), t_rec.id, t_rec).map_error(Db.map_table_error)
+      t4 = try Db.tx_put_agent_token(t3, t_rec)
       Ok((
         t4,
         Json.Object({
@@ -2797,6 +2797,24 @@ fn create_webhook(
   end)
   if input.events.empty?
     return Error(BadInput(reason: "events must not be empty"))
+  end
+  case input.collection_id
+    Some(cid) if not cid.trim.empty? and files.read_only.exists?(Db.ledger_db_path):
+      ferpa? = try Ledger.read_locked(
+        files.read_only,
+        Db.ledger_db_path,
+        Db.vellum_schema(),
+        Db.map_ledger_error,
+        fn(db) VaultOps.is_ferpa_restricted(Ledger.store(db), cid.trim) end
+      )
+      if ferpa?
+        return Error(
+          Forbidden(
+            reason: "outbound webhooks are disabled on FERPA / Restricted Vault collections"
+          )
+        )
+      end
+    Some(_) | None: Unit
   end
 
   now = clock.now
@@ -3201,7 +3219,7 @@ fn create_proposal_comment(
         None: return Error(Missing(entity: "proposal", id: id))
       end
       try Policy.require_collection_access(auth, act, pm.collection_id)
-      t2 = try Table.put(t1, Db.proposal_comments_table(), cmt.id, cmt).map_error(Db.map_table_error)
+      t2 = try Db.tx_put_proposal_comment(t1, cmt)
       Ok((
         t2,
         Json.Object({
@@ -3304,9 +3322,7 @@ fn resolve_proposal_comment(
         resolved_at: if resolve?: Some(now) else: None,
         created_at: old_c.created_at
       )
-      t2 = try Table.put(t1, Db.proposal_comments_table(), next_c.id, next_c).map_error(
-        Db.map_table_error
-      )
+      t2 = try Db.tx_put_proposal_comment(t1, next_c)
       Ok((
         t2,
         Json.Object({
@@ -3620,9 +3636,7 @@ fn ensure_github_bridge_auth_locked(
           last_seen_at: None
         )
       end
-      t2 = try Table.put(t1, Db.principals_table(), principal.id, principal).map_error(
-        Db.map_table_error
-      )
+      t2 = try Db.tx_put_principal(t1, principal)
       grant = try (try Grants.tx_get(t2, gid).map_error(Db.map_grants_error)).or_fail(
         ServerFailed(reason: "failed loading github bridge grant")
       )
@@ -3644,6 +3658,7 @@ fn draft_github_pr_callout(
   ev: Garden.GithubPrEvent,
   pg_title: Text,
   pg_excerpt: Text,
+  allow_llm?: Bool,
   env: Env,
   net: Network
 ) : Text
@@ -3653,6 +3668,7 @@ fn draft_github_pr_callout(
     "\nChanged files: `#{ev.changed_files.take(6).join("`, `")}`"
   end
   fallback = "PR ##{ev.pr_number} (#{ev.repo_full_name}): #{ev.title}\nCommit: `#{ev.head_sha}`#{files_line}"
+  return fallback if not allow_llm?
   case Ai.ai_config(env)
     Error(_): fallback
     Ok(cfg):
@@ -3684,7 +3700,33 @@ fn stage_pr_proposal_for_page_locked(
   net: Network
 ) : Result(ProposalMeta, AppError)
   now = clock.now
-  note_md = draft_github_pr_callout(ev, pg.title, Blocks.blocks_plain_text(blks.take(4)), env, net)
+  local_only_ai? = VaultOps.env_ai_local_only?(env)
+  allow_llm? = case Ai.ai_config(env)
+    Ok(cfg):
+      try Ledger.read_locked(
+        files.read_only,
+        Db.ledger_db_path,
+        Db.vellum_schema(),
+        Db.map_ledger_error,
+        fn(db)
+          VaultOps.ai_allowed_for_collection(
+            Ledger.store(db),
+            pg.collection_id,
+            cfg.base_url,
+            local_only_ai?
+          )
+        end
+      )
+    Error(_): false
+  end
+  note_md = draft_github_pr_callout(
+    ev,
+    pg.title,
+    Blocks.blocks_plain_text(blks.take(4)),
+    allow_llm?,
+    env,
+    net
+  )
   prop_id = "prop_#{Id.ulid(rng, clock)}"
   world_id = "w_#{Id.ulid(rng, clock)}"
   _wrec = try World.open_world_locked(
@@ -3782,7 +3824,7 @@ fn stage_pr_proposal_for_page_locked(
       (t1, _g) = try Grants.tx_authorize(tx, bridge_auth.grant_id, "propose", now).map_error(
         Db.map_grants_error
       )
-      t2 = try Table.put(t1, Db.proposals_table(), pm.id, pm).map_error(Db.map_table_error)
+      t2 = try Db.tx_put_proposal(t1, pm)
       t3 = try TaintBridge.tx_mark_provenance(
         t2,
         "vlm_proposals",

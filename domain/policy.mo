@@ -67,12 +67,15 @@ fn action_permitted?(auth: AuthContext, action: Text) : Bool
   auth.allowed_actions.contains?(action)
 end
 
-## Returns `true` iff `auth` may access `collection_id` (`None` = workspace-wide root access).
+## Returns `true` iff `auth` may access `collection_id` (`None` = workspace-wide root access),
+## failing closed when a `deny:collection:<id>` restriction is present.
 fn collection_permitted?(auth: AuthContext, collection_id: Text) : Bool
   return false if auth.principal.suspended or collection_id.empty?
   case auth.allowed_collections
     None: true
-    Some(scopes): scopes.contains?("workspace:*") or scopes.contains?("collection:#{collection_id}")
+    Some(scopes):
+      return false if scopes.contains?("deny:collection:#{collection_id}")
+      scopes.contains?("workspace:*") or scopes.contains?("collection:#{collection_id}")
   end
 end
 
@@ -245,9 +248,31 @@ test "fail-closed collection policy and write_policy enforcement"
     archived_at: None
   )
 
+  ferpa_ws_deny = AuthContext(
+    principal: agent,
+    grant_id: "gr_agt_deny1",
+    session: None,
+    allowed_collections: Some(["workspace:*", "deny:collection:col_ferpa"]),
+    allowed_actions: ["read"]
+  )
+  ferpa_col_deny = AuthContext(
+    principal: agent,
+    grant_id: "gr_agt_deny2",
+    session: None,
+    allowed_collections: Some(["collection:col_ferpa", "deny:collection:col_ferpa"]),
+    allowed_actions: ["read"]
+  )
+
   assert require_collection_access(a_ctx, "read", "col_eng") == Ok(Unit)
   assert require_collection_access(a_ctx, "read", "col_secret") is Error(Forbidden(reason: _))
   assert require_collection_access(a_ctx, "manage_grants", "col_eng") is Error(Forbidden(reason: _))
+  assert require_collection_access(ferpa_ws_deny, "read", "col_eng") == Ok(Unit)
+  assert require_collection_access(ferpa_ws_deny, "read", "col_ferpa") is Error(Forbidden(
+    reason: _
+  ))
+  assert require_collection_access(ferpa_col_deny, "read", "col_ferpa") is Error(Forbidden(
+    reason: _
+  ))
   assert can_write_page_direct?(a_ctx, col_eng_open)
   assert not can_write_page_direct?(a_ctx, col_eng_gated)
   assert can_write_page_direct?(h_ctx, col_eng_gated)
