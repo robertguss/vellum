@@ -16,9 +16,11 @@ DeepResearchOutcome(..),
 GardenStalePage(..),
 GardenBrokenLink(..),
 GardenReport(..),
+GardenProposeInput(..),
 ai_config,
 embed_config,
 build_llm_request,
+extract_llm_text,
 build_llm_request_with_stream,
 build_embedding_request,
 fetch_embedding,
@@ -39,12 +41,14 @@ run_ai_column,
 ai_columns_status,
 sync_ai_column_feed,
 run_garden,
+propose_garden_fix,
 garden_job
 use Api
 use Arvo.Id
 use Db
 use Domain.Blocks
 use Domain.Collab{ProposalComment, ProposalMeta, WorldBranchArgs, WorldMutation, WorldPatchArgs}
+use Domain.Garden{GardenCitationDrift, GardenDuplicatePair}
 use Domain.DatabaseModel{
   AiCellMeta,
   AiColumnMode,
@@ -69,6 +73,7 @@ use Domain.Types{
   Citation,
   CollectionWritePolicy,
   Page,
+  PageKind,
   PrincipalKind,
   Provenance,
   SearchResultItem
@@ -148,7 +153,20 @@ struct GardenReport
   checked_pages: Int
   stale_pages: List(GardenStalePage)
   broken_links: List(GardenBrokenLink)
+  duplicate_pairs: List(GardenDuplicatePair)
+  citation_drifts: List(GardenCitationDrift)
   scanned_at: Time
+end
+
+## JSON payload for `POST /api/admin/garden/propose` (strictly Proposals-Only Gardener).
+struct GardenProposeInput
+  kind: Text
+  target_page_id: Text
+  target_block_id: Option(Text)
+  related_page_id: Option(Text)
+  related_block_id: Option(Text)
+  reason: Option(Text)
+  deterministic_fallback: Option(Bool)
 end
 
 fn json_ok(status: Int, body: Json) : Api.Response
@@ -817,6 +835,8 @@ fn scan_garden_report(store: Store, auth_opt: Option(AuthContext), now: Time) : 
   var checked = 0
   var stale = []
   var broken = []
+  var all_drifts = []
+  var permitted_docs = []
   for (_pid, p) in page_rows
     permitted = case auth_opt
       Some(a): Policy.collection_permitted?(a, p.collection_id)
@@ -876,11 +896,29 @@ fn scan_garden_report(store: Store, auth_opt: Option(AuthContext), now: Time) : 
           ) | AiBrief(prompt: _, source_scope: _, refreshed_at: _): Unit
         end
       end
+
+      page_drifts = try Db.detect_page_citation_drifts(store, auth_opt, p, blks)
+      for d in page_drifts
+        all_drifts = all_drifts.append(d)
+      end
+      if p.kind == Document
+        permitted_docs = permitted_docs.append((p, blks))
+      end
     end
   end
 
+  sorted_docs = permitted_docs.sort_by(fn(pair) pair.0.id end)
+  dup_pairs = try Db.detect_duplicate_contradictions(store, auth_opt, sorted_docs)
+
   Ok(
-    GardenReport(checked_pages: checked, stale_pages: stale, broken_links: broken, scanned_at: now)
+    GardenReport(
+      checked_pages: checked,
+      stale_pages: stale,
+      broken_links: broken,
+      duplicate_pairs: dup_pairs,
+      citation_drifts: all_drifts,
+      scanned_at: now
+    )
   )
 end
 
@@ -894,7 +932,14 @@ fn run_garden(auth: AuthContext, rf: ReadFiles, clock: Clock) : Result(Api.Respo
     return Ok(
       json_ok(
         200,
-        GardenReport(checked_pages: 0, stale_pages: [], broken_links: [], scanned_at: now).to_json
+        GardenReport(
+          checked_pages: 0,
+          stale_pages: [],
+          broken_links: [],
+          duplicate_pairs: [],
+          citation_drifts: [],
+          scanned_at: now
+        ).to_json
       )
     )
   end
@@ -922,6 +967,324 @@ fn garden_job(_payload: Json, files: Files, clock: Clock) : Result(Unit, AppErro
     fn(db) scan_garden_report(Ledger.store(db), None, now) end
   )
   Ok(Unit)
+end
+
+fn garden_draft_note(
+  kind: Text,
+  target_pg: Page,
+  target_blks: List(Block),
+  rel_pg_opt: Option(Page),
+  rel_blk_opt: Option(Block),
+  custom_reason: Text,
+  use_det?: Bool,
+  env: Env,
+  net: Network
+) : Result((Text, Text), AppError)
+  det_note = case (kind, rel_pg_opt, rel_blk_opt)
+    ("citation_drift", Some(rp), Some(rb)):
+      "Gardener sync review: cited source [#{rp.title} §#{rb.id}] (v#{rb.version}) changed:\n#{rb
+        .markdown}"
+    ("duplicate_contradiction", Some(rp), _):
+      "Gardener contradiction check: reconcile overlap/conflict with '#{rp.title}' (#{rp.id}). #{custom_reason}"
+    (_, Some(rp), _):
+      "Gardener review suggested against '#{rp.title}': #{custom_reason}"
+    (_, None, _):
+      "Gardener verification reminder for '#{target_pg.title}': #{custom_reason}"
+  end
+  if use_det?
+    return Ok((det_note, "deterministic-gardener"))
+  end
+  case ai_config(env)
+    Error(_): Ok((det_note, "deterministic-gardener"))
+    Ok(cfg):
+      sys = "You are Vellum Knowledge Gardener. Draft a crisp, actionable 1-2 sentence Markdown reconciliation callout for a Modb.World Change Proposal. Return plain Markdown text only."
+      target_ctx = Blocks.blocks_plain_text(target_blks.take(6))
+      rel_ctx = case (rel_pg_opt, rel_blk_opt)
+        (Some(rp), Some(rb)): "\nCited Block [#{rp.title} §#{rb.id} v#{rb.version}]:\n#{rb.markdown}"
+        (Some(rp), None): "\nRelated Page [#{rp.title} (#{rp.id})]"
+        (_, _): ""
+      end
+      usr = "Kind: #{kind}\nTarget Page: #{target_pg.title}\nReason: #{custom_reason}\nTarget Excerpt:\n#{target_ctx}#{rel_ctx}"
+      http_res = try Http.send(build_llm_request(cfg, sys, usr), net).map_error(fn(e)
+        ServerFailed(reason: "Gardener LLM request failed: #{e.to_text}")
+      end)
+      if http_res.status < 200 or http_res.status >= 300
+        return Ok((det_note, "deterministic-gardener"))
+      end
+      txt = (try extract_llm_text(cfg, http_res.body)).trim
+      if txt.empty?
+        Ok((det_note, "deterministic-gardener"))
+      else
+        Ok((txt, cfg.model))
+      end
+  end
+end
+
+## `POST /api/admin/garden/propose` — Proposals-Only Gardener: stages stale-refresh, duplicate/contradiction,
+## or cited-dependency drift fixes strictly into a `Modb.World` Change Proposal (never writes live).
+fn propose_garden_fix(
+  req: Api.Request,
+  auth: AuthContext,
+  input: GardenProposeInput,
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock,
+  env: Env,
+  net: Network
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  kind = input.kind.trim.ascii_lowercase
+  if kind != "citation_drift" and kind != "duplicate_contradiction" and kind != "stale_refresh"
+    return Error(
+      BadInput(
+        reason: "kind must be 'citation_drift', 'duplicate_contradiction', or 'stale_refresh'"
+      )
+    )
+  end
+  if not files.read_only.exists?(Db.ledger_db_path)
+    return Error(Missing(entity: "page", id: input.target_page_id))
+  end
+
+  (target_pg, target_blks, rel_pg_opt, rel_blk_opt) = try Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      tpg = case try Table.get(store, Db.pages_table(), input.target_page_id).map_error(
+        Db.map_table_error
+      )
+        Some(p) if p.archived_at == None: p
+        Some(_) | None: return Error(Missing(entity: "page", id: input.target_page_id))
+      end
+      try Policy.require_collection_access(auth, "propose", tpg.collection_id)
+      tblks = try Db.load_page_blocks(store, tpg.id)
+
+      rpg_opt = case input.related_page_id
+        Some(rpid) if not rpid.trim.empty?:
+          rp = case try Table.get(store, Db.pages_table(), rpid.trim).map_error(Db.map_table_error)
+            Some(p) if p.archived_at == None: p
+            Some(_) | None: return Error(Missing(entity: "page", id: rpid.trim))
+          end
+          try Policy.require_collection_access(auth, "read", rp.collection_id)
+          Some(rp)
+        Some(_) | None: None
+      end
+      rblk_opt = case input.related_block_id
+        Some(rbid) if not rbid.trim.empty?:
+          case try Table.get(store, Db.blocks_table(), rbid.trim).map_error(Db.map_table_error)
+            Some(rb):
+              rpg2 = case try Table.get(store, Db.pages_table(), rb.page_id).map_error(
+                Db.map_table_error
+              )
+                Some(p) if p.archived_at == None: p
+                Some(_) | None: return Error(Missing(entity: "page", id: rb.page_id))
+              end
+              try Policy.require_collection_access(auth, "read", rpg2.collection_id)
+              Some(rb)
+            None: return Error(Missing(entity: "block", id: rbid.trim))
+          end
+        Some(_) | None: None
+      end
+      Ok((tpg, tblks, rpg_opt, rblk_opt))
+    end
+  )
+
+  reason_str = case input.reason
+    Some(r) if not r.trim.empty?: r.trim
+    Some(_) | None: "Knowledge Gardener #{kind} proposal"
+  end
+  (note_md, model_label) = try garden_draft_note(
+    kind,
+    target_pg,
+    target_blks,
+    rel_pg_opt,
+    rel_blk_opt,
+    reason_str,
+    input.deterministic_fallback or false,
+    env,
+    net
+  )
+
+  var cits = []
+  case rel_blk_opt
+    Some(rb):
+      src_title = rel_pg_opt.map(fn(p) p.title end) or rb.page_id
+      cits = cits.append(
+        Citation(
+          source_kind: "block",
+          source_ref: rb.id,
+          label: "#{src_title} §#{rb.id}",
+          excerpt: Some(rb.markdown)
+        )
+      )
+    None:
+      case rel_pg_opt
+        Some(rp): cits = cits.append(
+          Citation(
+            source_kind: "page",
+            source_ref: "/p/#{rp.id}",
+            label: rp.title,
+            excerpt: None
+          )
+        )
+        None: Unit
+      end
+  end
+
+  now = clock.now
+  prop_id = "prop_#{Id.ulid(rng, clock)}"
+  world_id = "w_#{Id.ulid(rng, clock)}"
+  _wrec = try World.open_world_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    world_id,
+    auth.grant_id,
+    now,
+    now + 7.days
+  ).map_error(Db.map_world_error)
+
+  prop_prov = Provenance(
+    author_id: auth.principal.id,
+    author_kind: AgentAuthor(model: Some(model_label)),
+    grant_id: if auth.principal.kind == Agent: Some(auth.grant_id) else: None,
+    proposal_id: Some(prop_id),
+    reason: Some(reason_str),
+    citations: cits,
+    updated_at: now
+  )
+  target_blk_opt = case input.target_block_id
+    Some(tbid) if not tbid.trim.empty?: target_blks.find(fn(b) b.id == tbid.trim end)
+    Some(_) | None: None
+  end
+  (ops, new_ids) = case target_blk_opt
+    Some(tb) if kind == "citation_drift":
+      (
+        [
+          ReplaceBlock(
+            block_id: tb.id,
+            expected_version: tb.version,
+            kind: None,
+            markdown: "#{tb.markdown}\n\n#{note_md}"
+          )
+        ],
+        []
+      )
+    Some(_) | None:
+      new_bid = "blk_#{Id.ulid(rng, clock)}"
+      tone = if kind == "duplicate_contradiction": "WARNING" else: "NOTE"
+      (
+        [
+          InsertBlockAfter(
+            after_block_id: target_blks.last.map(fn(b) b.id end),
+            parent_block_id: None,
+            kind: Callout(tone: tone, icon: Some("leaf")),
+            markdown: note_md
+          )
+        ],
+        [new_bid]
+      )
+  end
+
+  wargs = WorldPatchArgs(
+    page_id: target_pg.id,
+    ops: ops,
+    new_ids: new_ids,
+    provenance: prop_prov,
+    expected_versions: {},
+    updated_at: now
+  )
+  _step = try World.world_call_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.world_catalog(),
+    world_id,
+    "propose",
+    wargs.to_json,
+    reason_str,
+    now
+  ).map_error(Db.map_world_error)
+
+  prop_title = if kind == "citation_drift"
+    "Gardener Drift: #{target_pg.title}"
+  else if kind == "duplicate_contradiction"
+    "Gardener Reconcile: #{target_pg.title}"
+  else
+    "Gardener Refresh: #{target_pg.title}"
+  end
+  pm = ProposalMeta(
+    id: prop_id,
+    world_id: world_id,
+    collection_id: target_pg.collection_id,
+    target_page_id: target_pg.id,
+    target_database_id: None,
+    branch_kind: "proposal",
+    title: prop_title,
+    reason: reason_str,
+    author_id: auth.principal.id,
+    author_handle: auth.principal.handle,
+    grant_id: auth.grant_id,
+    status: "open",
+    created_at: now,
+    updated_at: now,
+    decided_by: None,
+    decided_at: None
+  )
+  meta = Ledger.WriteMeta(
+    principal: auth.principal.handle,
+    action: "garden.propose",
+    reason: reason_str,
+    at: now
+  )
+  saved = try Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    meta,
+    "staged gardener proposal #{pm.id}",
+    Json.Object({
+      "proposal_id": Json.String(pm.id),
+      "page_id": Json.String(target_pg.id),
+      "kind": Json.String(kind)
+    }),
+    Db.map_ledger_error,
+    fn(tx)
+      t1 = if auth.principal.kind == Agent
+        (tg, _g) = try Grants.tx_authorize(tx, auth.grant_id, "propose", now).map_error(
+          Db.map_grants_error
+        )
+        tg
+      else
+        tx
+      end
+      t2 = try Table.put(t1, Db.proposals_table(), pm.id, pm).map_error(Db.map_table_error)
+      Ok((t2, pm))
+    end
+  )
+
+  prop_ev = Json.Object({
+    "proposal_id": Json.String(saved.id),
+    "page_id": Json.String(target_pg.id),
+    "collection_id": Json.String(target_pg.collection_id),
+    "title": Json.String(saved.title),
+    "actor": Json.String(auth.principal.handle)
+  })
+  Ok(
+    json_ok(
+      201,
+      Json.Object({
+        "proposal": saved.to_json,
+        "kind": Json.String(kind),
+        "target_page_id": Json.String(target_pg.id),
+        "citations": cits.to_json,
+        "model": Json.String(model_label)
+      })
+    ).with_sse_publish_json("page:#{target_pg.id}", "proposal.opened", prop_ev)
+      .with_sse_publish_json("collection:#{target_pg.collection_id}", "proposal.opened", prop_ev)
+  )
 end
 
 ## JSON payload for `POST /api/ai/brief/refresh`.

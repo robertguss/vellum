@@ -38,6 +38,7 @@ discard_replay,
 delegate_grant,
 list_webhooks,
 create_webhook,
+github_pr_webhook,
 events_stream
 use Api
 use Arvo.Id
@@ -56,6 +57,7 @@ use Domain.Collab{
   WorldMutation,
   WorldPatchArgs
 }
+use Domain.Garden
 use Domain.DatabaseModel{
   CellValue,
   DatabaseDef,
@@ -72,13 +74,18 @@ use Domain.Types{
   AuthContext,
   AuthorKind,
   Block,
+  BlockKind,
   BlockOp,
+  Citation,
   CollectionWritePolicy,
+  Page,
+  PageKind,
   Principal,
   PrincipalKind,
   Provenance,
   WorkspaceRole
 }
+use Http
 use Json
 use Modb{Store, WriteTx}
 use Modb.Claims
@@ -86,7 +93,9 @@ use Modb.Grants
 use Modb.Ledger
 use Modb.Replay
 use Modb.Table
+use Modb.Vec
 use Modb.World
+use Routes.Ai
 use Routes.Auth
 use Routes.Databases
 
@@ -3052,6 +3061,396 @@ fn reject_proposal_hunk(
     Some(did) if not did.trim.empty?:
       resp = resp.with_sse_publish_json("database:#{did}", "proposal.updated", upd_ev)
     Some(_) | None: Unit
+  end
+  Ok(resp)
+end
+
+fn ensure_github_bridge_auth_locked(
+  files: Files,
+  allowed_cols_opt: Option(List(Text)),
+  now: Time
+) : Result(AuthContext, AppError)
+  pid = "agt_github_bridge"
+  gid = "gr_github_bridge"
+  handle = "@github-pr-bridge"
+  scopes_opt = allowed_cols_opt.map(fn(cols)
+    cols.map(fn(c) if c.starts_with?("collection:"): c else: "collection:#{c}" end)
+  end)
+
+  if files.read_only.exists?(Db.ledger_db_path)
+    existing_opt = try Ledger.read_locked(
+      files.read_only,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      Db.map_ledger_error,
+      fn(db)
+        store = Ledger.store(db)
+        p_opt = try Table.get(store, Db.principals_table(), pid).map_error(Db.map_table_error)
+        g_opt = try Grants.get(store, gid).map_error(Db.map_grants_error)
+        Ok((p_opt, g_opt))
+      end
+    )
+    case existing_opt
+      (Some(prn), Some(gr)):
+        if gr.revoked or now > gr.expires_at
+          return Error(Forbidden(reason: "GitHub PR bridge grant '#{gid}' is revoked or expired"))
+        end
+        return Ok(
+          AuthContext(
+            principal: prn,
+            grant_id: gr.id,
+            session: None,
+            allowed_collections: scopes_opt,
+            allowed_actions: ["read", "propose"]
+          )
+        )
+      (_, _): Unit
+    end
+  end
+
+  meta = Ledger.WriteMeta(
+    principal: handle,
+    action: "github_bridge.init",
+    reason: "initialize proposals-only @github-pr-bridge principal",
+    at: now
+  )
+  (prn, gr) = try Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    meta,
+    "initialized proposals-only @github-pr-bridge",
+    Json.Object({"principal": Json.String(pid), "grant_id": Json.String(gid)}),
+    Db.map_ledger_error,
+    fn(tx)
+      t1 = case try Grants.tx_get(tx, gid).map_error(Db.map_grants_error)
+        Some(_): tx
+        None:
+          spec = Grants.GrantSpec(
+            id: gid,
+            principal: pid,
+            allowed_actions: ["read", "propose"],
+            max_calls: 100000,
+            expires_at: now + 3650.days
+          )
+          (tg, _g) = try Grants.tx_issue_root_scoped(
+            tx,
+            "system:github-bridge",
+            spec,
+            scopes_opt,
+            None,
+            now
+          ).map_error(Db.map_grants_error)
+          tg
+      end
+      principal = case try Table.tx_get(t1, Db.principals_table(), pid).map_error(
+        Db.map_table_error
+      )
+        Some(existing_p): existing_p
+        None: Principal(
+          id: pid,
+          kind: Agent,
+          handle: handle,
+          display_name: "GitHub PR Bridge",
+          email: None,
+          avatar_url: None,
+          role: Bot,
+          model_id: None,
+          root_grant_id: gid,
+          suspended: false,
+          created_at: now,
+          last_seen_at: None
+        )
+      end
+      t2 = try Table.put(t1, Db.principals_table(), principal.id, principal).map_error(
+        Db.map_table_error
+      )
+      grant = try (try Grants.tx_get(t2, gid).map_error(Db.map_grants_error)).or_fail(
+        ServerFailed(reason: "failed loading github bridge grant")
+      )
+      Ok((t2, (principal, grant)))
+    end
+  )
+  Ok(
+    AuthContext(
+      principal: prn,
+      grant_id: gr.id,
+      session: None,
+      allowed_collections: scopes_opt,
+      allowed_actions: ["read", "propose"]
+    )
+  )
+end
+
+fn draft_github_pr_callout(
+  ev: Garden.GithubPrEvent,
+  pg_title: Text,
+  pg_excerpt: Text,
+  env: Env,
+  net: Network
+) : Text
+  files_line = if ev.changed_files.empty?
+    ""
+  else
+    "\nChanged files: `#{ev.changed_files.take(6).join("`, `")}`"
+  end
+  fallback = "PR ##{ev.pr_number} (#{ev.repo_full_name}): #{ev.title}\nCommit: `#{ev.head_sha}`#{files_line}"
+  case Ai.ai_config(env)
+    Error(_): fallback
+    Ok(cfg):
+      sys = "You are Vellum GitHub PR Bridge. Draft a 1-2 sentence runbook update callout from this GitHub PR for a Modb.World Change Proposal. Return Markdown plain text only."
+      usr = "Repo: #{ev.repo_full_name}\nPR ##{ev.pr_number}: #{ev.title}\nBody: #{ev.body}\nFiles: #{ev
+        .changed_files
+        .join(", ")}\nTarget Page: #{pg_title}\nExcerpt:\n#{pg_excerpt}"
+      case Http.send(Ai.build_llm_request(cfg, sys, usr), net)
+        Error(_): fallback
+        Ok(res) if res.status >= 200 and res.status < 300:
+          case Ai.extract_llm_text(cfg, res.body)
+            Ok(txt) if not txt.trim.empty?: txt.trim
+            Ok(_) | Error(_): fallback
+          end
+        Ok(_): fallback
+      end
+  end
+end
+
+fn stage_pr_proposal_for_page_locked(
+  bridge_auth: AuthContext,
+  ev: Garden.GithubPrEvent,
+  pg: Page,
+  blks: List(Block),
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock,
+  env: Env,
+  net: Network
+) : Result(ProposalMeta, AppError)
+  now = clock.now
+  note_md = draft_github_pr_callout(ev, pg.title, Blocks.blocks_plain_text(blks.take(4)), env, net)
+  prop_id = "prop_#{Id.ulid(rng, clock)}"
+  world_id = "w_#{Id.ulid(rng, clock)}"
+  _wrec = try World.open_world_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    world_id,
+    bridge_auth.grant_id,
+    now,
+    now + 7.days
+  ).map_error(Db.map_world_error)
+
+  pr_cit = Citation(
+    source_kind: "github_pr",
+    source_ref: ev.html_url,
+    label: "#{ev.repo_full_name}##{ev.pr_number}",
+    excerpt: Some(ev.title)
+  )
+  prop_reason = "GitHub PR ##{ev.pr_number} (#{ev.repo_full_name}): #{ev.title}"
+  prov = Provenance(
+    author_id: bridge_auth.principal.id,
+    author_kind: AgentAuthor(model: Some("github-pr-bridge")),
+    grant_id: Some(bridge_auth.grant_id),
+    proposal_id: Some(prop_id),
+    reason: Some(prop_reason),
+    citations: [pr_cit],
+    updated_at: now
+  )
+  new_bid = "blk_#{Id.ulid(rng, clock)}"
+  callout_kind = Callout(tone: "NOTE", icon: Some("git-pull-request"))
+  wargs = WorldPatchArgs(
+    page_id: pg.id,
+    ops: [
+      InsertBlockAfter(
+        after_block_id: blks.last.map(fn(b) b.id end),
+        parent_block_id: None,
+        kind: callout_kind,
+        markdown: note_md
+      )
+    ],
+    new_ids: [new_bid],
+    provenance: prov,
+    expected_versions: {},
+    updated_at: now
+  )
+  _step = try World.world_call_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.world_catalog(),
+    world_id,
+    "propose",
+    wargs.to_json,
+    prop_reason,
+    now
+  ).map_error(Db.map_world_error)
+
+  pm = ProposalMeta(
+    id: prop_id,
+    world_id: world_id,
+    collection_id: pg.collection_id,
+    target_page_id: pg.id,
+    target_database_id: None,
+    branch_kind: "proposal",
+    title: "PR ##{ev.pr_number}: Sync #{pg.title}",
+    reason: prop_reason,
+    author_id: bridge_auth.principal.id,
+    author_handle: bridge_auth.principal.handle,
+    grant_id: bridge_auth.grant_id,
+    status: "open",
+    created_at: now,
+    updated_at: now,
+    decided_by: None,
+    decided_at: None
+  )
+  wmeta = Ledger.WriteMeta(
+    principal: bridge_auth.principal.handle,
+    action: "webhook.github_pr_proposal",
+    reason: prop_reason,
+    at: now
+  )
+  Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    wmeta,
+    "opened PR ##{ev.pr_number} proposal #{pm.id}",
+    Json.Object({
+      "proposal_id": Json.String(pm.id),
+      "page_id": Json.String(pg.id),
+      "pr_number": Json.int(ev.pr_number)
+    }),
+    Db.map_ledger_error,
+    fn(tx)
+      (t1, _g) = try Grants.tx_authorize(tx, bridge_auth.grant_id, "propose", now).map_error(
+        Db.map_grants_error
+      )
+      t2 = try Table.put(t1, Db.proposals_table(), pm.id, pm).map_error(Db.map_table_error)
+      Ok((t2, pm))
+    end
+  )
+end
+
+## `POST /api/webhooks/github` — Signed inbound GitHub `pull_request` webhook bridge that matches
+## affected docs via `Db.search_pages_hybrid` and opens `Modb.World` Change Proposals (never writes live).
+fn github_pr_webhook(
+  req: Api.Request,
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock,
+  env: Env,
+  net: Network
+) : Result(Api.Response, AppError)
+  secret = case env.get("VELLUM_GITHUB_WEBHOOK_SECRET")
+    Some(s) if not s.trim.empty?: s.trim
+    Some(_) | None: return Error(
+      Forbidden(reason: "GitHub webhook bridge disabled: missing VELLUM_GITHUB_WEBHOOK_SECRET")
+    )
+  end
+  if not Garden.verify_github_signature(secret, req.body, req.header("X-Hub-Signature-256"))
+    return Error(Forbidden(reason: "invalid GitHub webhook X-Hub-Signature-256"))
+  end
+
+  gh_event = (req.header("X-GitHub-Event") or "pull_request").trim.ascii_lowercase
+  if gh_event == "ping"
+    return Ok(json_ok(200, Json.Object({"ok": Json.Boolean(true), "event": Json.String("ping")})))
+  end
+  if gh_event != "pull_request"
+    return Ok(
+      json_ok(200, Json.Object({"ignored": Json.Boolean(true), "event": Json.String(gh_event)}))
+    )
+  end
+
+  ev = try Garden.parse_github_pr_webhook(req.body).map_error(fn(e) BadInput(reason: e) end)
+  relevant? = ev.action == "opened" or ev.action == "synchronize" or ev.action == "reopened" or
+    (ev.action == "closed" and ev.merged)
+  if not relevant?
+    return Ok(
+      json_ok(200, Json.Object({"ignored": Json.Boolean(true), "action": Json.String(ev.action)}))
+    )
+  end
+
+  now = clock.now
+  allowed_cols_opt = case env.get("VELLUM_GITHUB_WEBHOOK_COLLECTIONS")
+    Some(raw) if not raw.trim.empty?:
+      Some(raw.split(",").map(fn(s) s.trim end).filter(fn(s) not s.empty? end))
+    Some(_) | None: None
+  end
+  bridge_auth = try ensure_github_bridge_auth_locked(files, allowed_cols_opt, now)
+  search_q = Garden.build_pr_search_query(ev)
+
+  matches = try Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      qvec = Some(Vec.text_sketch_embedding(search_q, Db.sketch_vec_dims))
+      hits = try Db.search_pages_hybrid(
+        store,
+        bridge_auth,
+        search_q,
+        qvec,
+        Db.sketch_vec_index(),
+        "hybrid",
+        3,
+        true,
+        None,
+        Some(Db.sketch_min_vec_score)
+      )
+      var out = []
+      for h in hits
+        case try Table.get(store, Db.pages_table(), h.page_id).map_error(Db.map_table_error)
+          Some(pg) if pg.archived_at == None and pg.kind == Document:
+            blks = try Db.load_page_blocks(store, pg.id)
+            out = out.append((pg, blks))
+          Some(_) | None: Unit
+        end
+      end
+      Ok(out)
+    end
+  )
+
+  var staged_props = []
+  var sse_cols = []
+  for (pg, blks) in matches
+    saved_pm = try stage_pr_proposal_for_page_locked(
+      bridge_auth,
+      ev,
+      pg,
+      blks,
+      files,
+      rng,
+      clock,
+      env,
+      net
+    )
+    staged_props = staged_props.append(saved_pm)
+    sse_cols = sse_cols.append((saved_pm.collection_id, saved_pm.target_page_id, saved_pm))
+  end
+
+  status = if staged_props.empty?: 200 else: 201
+  var resp = json_ok(
+    status,
+    Json.Object({
+      "event": Json.String("pull_request"),
+      "action": Json.String(ev.action),
+      "pr_number": Json.int(ev.pr_number),
+      "repo": Json.String(ev.repo_full_name),
+      "matched_pages": Json.int(matches.size),
+      "proposals": staged_props.to_json
+    })
+  )
+  for (cid, pid, spm) in sse_cols
+    pev = Json.Object({
+      "proposal_id": Json.String(spm.id),
+      "page_id": Json.String(pid),
+      "collection_id": Json.String(cid),
+      "title": Json.String(spm.title),
+      "actor": Json.String(bridge_auth.principal.handle)
+    })
+    resp = resp.with_sse_publish_json("page:#{pid}", "proposal.opened", pev)
+      .with_sse_publish_json("collection:#{cid}", "proposal.opened", pev)
   end
   Ok(resp)
 end

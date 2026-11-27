@@ -39,6 +39,7 @@ mo check domain/taint-bridge.mo
 mo check domain/rlm.mo
 mo check domain/packs.mo
 mo check domain/sync.mo
+mo check domain/garden.mo
 mo check domain/collab.mo
 mo check domain/notion-import.mo
 mo check db.mo
@@ -61,6 +62,7 @@ mo test domain/blueprints.mo
 mo test domain/packs.mo
 mo test domain/sync.mo
 mo test domain/rlm.mo
+mo test domain/garden.mo
 mo test domain/collab.mo
 mo test domain/notion-import.mo
 mo test sync.mo

@@ -32,6 +32,7 @@ import type {
   Comment,
   DatabaseDef,
   EditorLens,
+  GardenCitationDrift,
   Page,
   PageBlueprintMeta,
   PrincipalSummary,
@@ -59,6 +60,7 @@ interface PageProps {
   resolved_metrics?: Record<string, ResolvedMetric>;
   open_scenarios?: ProposalMeta[];
   page_audit?: AuditFeedItem[];
+  citation_drifts?: GardenCitationDrift[];
 }
 
 async function sha256Hex(file: File): Promise<string> {
@@ -106,8 +108,10 @@ export default function PageView({
   resolved_metrics: initialResolvedMetrics = {},
   open_scenarios: initialScenarios = [],
   page_audit = [],
+  citation_drifts = [],
 }: PageProps) {
   const [page, setPage] = useState<Page>(initialPage);
+  const [stagingDriftId, setStagingDriftId] = useState<string | null>(null);
   const [blocks, setBlocks] = useState<Block[]>(initialBlocks);
   const [anchoredMd, setAnchoredMd] = useState<string>(initialAnchored);
   const [yamlFm, setYamlFm] = useState<string>(initialYaml || initialAnchored);
@@ -709,6 +713,34 @@ export default function PageView({
             resolvedMetrics={metricsMap}
             yamlFrontmatter={yamlFm}
             pageAudit={page_audit}
+            citationDrifts={citation_drifts}
+            stagingDriftId={stagingDriftId}
+            onStageDriftProposal={async (d) => {
+              const driftKey = `${d.dependent_block_id}->${d.cited_block_id}`;
+              setStagingDriftId(driftKey);
+              setError(null);
+              try {
+                const res = await apiFetch<{ proposal: { id: string } }>(
+                  "/api/admin/garden/propose",
+                  {
+                    method: "POST",
+                    body: JSON.stringify({
+                      kind: "citation_drift",
+                      target_page_id: d.dependent_page_id,
+                      target_block_id: d.dependent_block_id,
+                      related_page_id: d.cited_page_id,
+                      related_block_id: d.cited_block_id,
+                      reason: d.summary,
+                    }),
+                  }
+                );
+                setLiveNotice(`Staged refresh proposal ${res.proposal.id} in Change Proposals.`);
+              } catch (err) {
+                setError(err instanceof ApiError ? err.message : "Failed to stage drift proposal");
+              } finally {
+                setStagingDriftId(null);
+              }
+            }}
             onInspectBlock={(blockId) => setInspectorTarget({ kind: "block", blockId })}
           />
         )}

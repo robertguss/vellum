@@ -641,10 +641,38 @@ export interface GardenBrokenLink {
   label: string;
 }
 
+export interface GardenDuplicatePair {
+  page_a_id: string;
+  page_a_title: string;
+  collection_a_id: string;
+  page_b_id: string;
+  page_b_title: string;
+  collection_b_id: string;
+  similarity: number;
+  possible_contradiction: boolean;
+  contradiction_reason: string | null;
+}
+
+export interface GardenCitationDrift {
+  dependent_page_id: string;
+  dependent_page_title: string;
+  dependent_collection_id: string;
+  dependent_block_id: string;
+  cited_page_id: string;
+  cited_page_title: string;
+  cited_block_id: string;
+  cited_block_version: number;
+  dependent_updated_at: string;
+  cited_updated_at: string;
+  summary: string;
+}
+
 export interface GardenReport {
   checked_pages: number;
   stale_pages: GardenStalePage[];
   broken_links: GardenBrokenLink[];
+  duplicate_pairs?: GardenDuplicatePair[];
+  citation_drifts?: GardenCitationDrift[];
   scanned_at: string;
 }
 

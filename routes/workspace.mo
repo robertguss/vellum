@@ -1344,10 +1344,11 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
       metrics_json = try resolve_metrics_in_store(store, a, metric_tokens, None)
       audit_entries = try Ledger.audit_tail_store(store, 200).map_error(Db.map_ledger_error)
       page_audit = filter_audit_for_page(audit_entries, page.id, 25)
+      citation_drifts = try Db.detect_page_citation_drifts(store, Some(a), page, blks)
 
       Ok((
         (c_list, d_list, col, page, blks, cmt_rows.map(fn(x) x.1 end), att_rows.map(fn(x) x.1 end)),
-        (bps, page_bp_opt, page_meta_opt, page_props, scenarios, page_audit),
+        (bps, page_bp_opt, page_meta_opt, page_props, scenarios, page_audit, citation_drifts),
         (principals_json, rel_targets_json, metrics_json)
       ))
     end
@@ -1355,7 +1356,15 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
 
   (
     (cols, dbs, col, page, blocks, comments, attachments),
-    (blueprints, page_bp_opt, page_meta_opt, page_proposals, open_scenarios, page_audit),
+    (
+      blueprints,
+      page_bp_opt,
+      page_meta_opt,
+      page_proposals,
+      open_scenarios,
+      page_audit,
+      citation_drifts
+    ),
     (principals_json, rel_targets_json, resolved_metrics_json)
   ) = page_bundle
   anchored_md = Blocks.to_anchored_markdown(blocks)
@@ -1380,7 +1389,8 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
           "relation_targets": rel_targets_json,
           "resolved_metrics": resolved_metrics_json,
           "open_scenarios": open_scenarios.to_json,
-          "page_audit": page_audit.to_json
+          "page_audit": page_audit.to_json,
+          "citation_drifts": citation_drifts.to_json
         })
       )
     )
@@ -1410,7 +1420,8 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
       "relation_targets": rel_targets_json,
       "resolved_metrics": resolved_metrics_json,
       "open_scenarios": open_scenarios.to_json,
-      "page_audit": page_audit.to_json
+      "page_audit": page_audit.to_json,
+      "citation_drifts": citation_drifts.to_json
     }
   )
 end
