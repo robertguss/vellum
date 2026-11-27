@@ -963,3 +963,47 @@ export interface TaintStatusResponse {
     proposals: TaintUntrustedRecord[];
   };
 }
+
+export interface SecretHint {
+  target_kind: string;
+  page_id: string;
+  page_title: string;
+  collection_id: string;
+  block_id: string | null;
+  comment_id: string | null;
+  kind: string;
+  label: string;
+  severity: string;
+  masked_preview: string;
+  match_sha256: string;
+}
+
+export interface ErasureReceiptRecord {
+  id: string;
+  subject_id_sha256: string;
+  erased_by: string;
+  reason: string;
+  at: string;
+  key_shredded: boolean;
+  rows_deleted: number;
+  fts_docs_deleted: number;
+  vec_docs_deleted: number;
+  replay_calls_scrubbed: number;
+  read_logs_scrubbed: number;
+  audit_entries_redacted: number;
+  pre_erasure_tip_hash: string;
+  post_erasure_tip_hash: string;
+  compacted: boolean;
+}
+
+export interface ErasureStatusResponse {
+  findings: SecretHint[];
+  receipts: ErasureReceiptRecord[];
+}
+
+export interface PurgeSecretResponse {
+  receipt: ErasureReceiptRecord;
+  blocks_redacted: number;
+  comments_redacted: number;
+  affected_page_ids: string[];
+}

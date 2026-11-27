@@ -2614,6 +2614,89 @@ const unblockedPatchRes = await mcpTaintCall(1605, "vellum.patch_blocks", {
 });
 assert.equal(unblockedPatchRes.result?.isError, false, JSON.stringify(unblockedPatchRes));
 console.log("✓ Live Phase 4.1 Modb.Taint Lethal Trifecta Provenance, Fork Inheritance & Admin Clear verified");
+
+// 17. Live Phase 4.2 One-Click Modb.Erasure Secret Purge & Downloadable Receipt
+const liveLeakedKey = "sk-proj-Zqx9vK2mNp4rSt7wXy0zAb3cDe6fGh9j";
+const secPgRes = await apiJson("/api/pages", {
+  method: "POST",
+  body: JSON.stringify({
+    collection_id: taintColId,
+    title: "Xylophone Erasure Playbook",
+    markdown: `Temporary credential: ${liveLeakedKey}\nRevoke once rotated.`,
+    reason: `seed leaked credential ${liveLeakedKey}`,
+  }),
+});
+assert.equal(secPgRes.res.status, 201, secPgRes.text);
+const secPgId = secPgRes.json.page.id;
+assert.ok(Array.isArray(secPgRes.json.blocks));
+
+const showSecRes = await apiJson(`/api/pages/${secPgId}`);
+assert.equal(showSecRes.res.status, 200, showSecRes.text);
+assert.equal(showSecRes.json.secret_hints?.length, 1);
+assert.equal(showSecRes.json.secret_hints[0].kind, "ai_api_key");
+assert.ok(!JSON.stringify(showSecRes.json.secret_hints).includes(liveLeakedKey));
+
+const unauthEraseSt = await rawFetch(`${BASE}/api/admin/erasure/status`, {
+  headers: { Authorization: `Bearer ${taintTok}`, Accept: "application/json" },
+});
+assert.equal(unauthEraseSt.status, 403);
+
+const eraseStRes = await apiJson("/api/admin/erasure/status");
+assert.equal(eraseStRes.res.status, 200, eraseStRes.text);
+assert.ok((eraseStRes.json.findings ?? []).some((f) => f.page_id === secPgId));
+
+const purgeLiveRes = await apiJson("/api/admin/erasure/purge", {
+  method: "POST",
+  body: JSON.stringify({
+    page_id: secPgId,
+    mode: "redact",
+    compact: true,
+    reason: `Live E2E secret purge ${liveLeakedKey}`,
+  }),
+});
+assert.equal(purgeLiveRes.res.status, 200, purgeLiveRes.text);
+assert.ok(!purgeLiveRes.text.includes(liveLeakedKey));
+assert.equal(purgeLiveRes.json.receipt?.key_shredded, true);
+assert.ok((purgeLiveRes.json.receipt?.fts_docs_deleted ?? 0) >= 1);
+assert.ok((purgeLiveRes.json.receipt?.vec_docs_deleted ?? 0) >= 1);
+assert.equal(purgeLiveRes.json.receipt?.compacted, true);
+const liveRcptId = purgeLiveRes.json.receipt.id;
+
+const afterPurgeShow = await apiJson(`/api/pages/${secPgId}`);
+assert.equal(afterPurgeShow.res.status, 200, afterPurgeShow.text);
+assert.ok(afterPurgeShow.json.anchored_markdown.includes("[REDACTED]"));
+assert.ok(!afterPurgeShow.text.includes(liveLeakedKey));
+assert.equal(afterPurgeShow.json.secret_hints?.length, 0);
+
+const afterPurgeBm25 = await apiJson(
+  `/api/search?q=${encodeURIComponent(liveLeakedKey)}&mode=bm25`
+);
+assert.equal(afterPurgeBm25.res.status, 200, afterPurgeBm25.text);
+assert.equal((afterPurgeBm25.json.results ?? []).length, 0);
+
+const afterPurgeCol = await apiJson(
+  `/api/search?q=${encodeURIComponent("Zqx9vK2mNp4rSt7wXy0zAb3cDe6fGh9j")}&collection_id=${encodeURIComponent(taintColId)}`
+);
+assert.equal(afterPurgeCol.res.status, 200, afterPurgeCol.text);
+assert.equal((afterPurgeCol.json.results ?? []).length, 0);
+
+const cleanTitleSearch = await apiJson(
+  `/api/search?q=Xylophone&collection_id=${encodeURIComponent(taintColId)}`
+);
+assert.equal(cleanTitleSearch.res.status, 200, cleanTitleSearch.text);
+assert.ok((cleanTitleSearch.json.results ?? []).some((r) => r.page_id === secPgId));
+
+const dlRcptRes = await rawFetch(
+  `${BASE}/api/admin/erasure/receipts/${encodeURIComponent(liveRcptId)}/download`,
+  { headers: { Accept: "application/json" } }
+);
+assert.equal(dlRcptRes.status, 200);
+const dlDisp = dlRcptRes.headers.get("content-disposition") ?? "";
+assert.ok(dlDisp.includes("attachment") && dlDisp.includes(liveRcptId));
+const dlRcptJson = await dlRcptRes.json();
+assert.equal(dlRcptJson.receipt?.id, liveRcptId);
+assert.equal(dlRcptJson.receipt?.compacted, true);
+console.log("✓ Live Phase 4.2 One-Click Modb.Erasure Secret Purge & Downloadable Receipt verified");
 EOF
 
 echo "All Live Vellum E2E checks against mo serve + Dex + VersityGW S3 passed."

@@ -42,8 +42,10 @@ mo check domain/packs.mo
 mo check domain/sync.mo
 mo check domain/garden.mo
 mo check domain/collab.mo
+mo check domain/secrets.mo
 mo check domain/notion-import.mo
 mo check db.mo
+mo check erasure-ops.mo
 mo check routes/auth.mo
 mo check routes/workspace.mo
 mo check routes/databases.mo
@@ -55,6 +57,9 @@ mo check routes/packs.mo
 mo check routes/sync.mo
 mo check sync.mo
 mo check main.mo
+mo check tests/stages13.mo
+mo check tests/stages45.mo
+mo check tests/phase1.mo
 mo check tests/phase2.mo
 mo check tests/phase3.mo
 mo check tests/phase4.mo
@@ -69,10 +74,13 @@ mo test domain/rlm.mo
 mo test domain/rlm-vm.mo
 mo test domain/garden.mo
 mo test domain/collab.mo
+mo test domain/secrets.mo
 mo test domain/notion-import.mo
 mo test sync.mo
 mo test db.mo
-mo test main.mo
+mo test tests/stages13.mo
+mo test tests/stages45.mo
+mo test tests/phase1.mo
 mo test tests/phase2.mo
 mo test tests/phase3.mo
 mo test tests/phase4.mo
