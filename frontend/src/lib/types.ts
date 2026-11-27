@@ -905,3 +905,61 @@ export interface PageTimeTravelResponse {
   summary: ReplaySummary;
   outcomes: unknown[];
 }
+
+export interface TaintProvenanceEntry {
+  trust: string;
+  writer: string;
+  updated_at: string;
+}
+
+export interface PageTaintProvenance {
+  trust: "trusted" | "untrusted" | string;
+  page: TaintProvenanceEntry | null;
+  blocks: Record<string, TaintProvenanceEntry>;
+  untrusted_block_ids: string[];
+}
+
+export interface TaintPolicySummary {
+  peer_agents_taint: boolean;
+  max_sensitivity_when_tainted: string;
+  exfil_sinks: string[];
+  external_actions: string[];
+  block_write_down: boolean;
+  strict_no_write_down: boolean;
+}
+
+export interface TaintSessionRecord {
+  id: string;
+  principal: string;
+  grant_id: string | null;
+  parent_session_id: string | null;
+  untrusted_tainted: boolean;
+  untrusted_sources: string[];
+  max_sensitivity_read: string;
+  sensitive_sources: string[];
+  blocked_attempts: number;
+  opened_at: string;
+  updated_at: string;
+  cleared_at: string | null;
+  cleared_by: string | null;
+  closed: boolean;
+}
+
+export interface TaintUntrustedRecord {
+  bucket: string;
+  key_hex: string;
+  writer: string;
+  trust: string;
+  recorded_txid: number;
+  updated_at: string;
+}
+
+export interface TaintStatusResponse {
+  policy: TaintPolicySummary;
+  sessions: TaintSessionRecord[];
+  untrusted: {
+    pages: TaintUntrustedRecord[];
+    blocks: TaintUntrustedRecord[];
+    proposals: TaintUntrustedRecord[];
+  };
+}

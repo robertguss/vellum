@@ -42,7 +42,9 @@ delegate_grant,
 list_webhooks,
 create_webhook,
 github_pr_webhook,
-events_stream
+events_stream,
+taint_status,
+clear_taint_session
 use Api
 use Arvo.Id
 use Arvo.Modb.Jobs
@@ -71,6 +73,7 @@ use Domain.DatabaseModel{
   ViewQueryResult
 }
 use Domain.Policy
+use Domain.TaintBridge
 use Domain.Types{
   AgentToken,
   AppError,
@@ -260,10 +263,23 @@ fn matching_webhooks_in_store(store: Store, event: Text, collection_id: Option(T
   Ok(out)
 end
 
+fn caller_taint_sid(req: Api.Request, auth: AuthContext) : Option(Text)
+  case req.header("X-Taint-Session")
+    Some(s) if not s.trim.empty?: Some(s.trim)
+    Some(_) | None:
+      if auth.principal.kind == Agent
+        Some("agent:#{auth.grant_id}")
+      else
+        None
+      end
+  end
+end
+
 fn prepare_webhook_jobs(
   subs: List(WebhookSub),
   event: Text,
   body_json: Json,
+  taint_session_id: Option(Text),
   rng: SecureRandom,
   clock: Clock
 ) : List(Jobs.JobRecord)
@@ -276,7 +292,8 @@ fn prepare_webhook_jobs(
       url: sub.url,
       secret: sub.secret,
       event: event,
-      body_json: body_json
+      body_json: body_json,
+      taint_session_id: taint_session_id
     )
     out = out.append(Jobs.prepare(rng, clock, "vellum.webhook.deliver", payload.to_json))
   end
@@ -590,6 +607,7 @@ fn open_proposal(
     matching_subs,
     "proposal.opened",
     Json.Object({"event": Json.String("proposal.opened"), "proposal": proposal.to_json}),
+    caller_taint_sid(req, auth),
     rng,
     clock
   )
@@ -734,6 +752,7 @@ fn open_db_scenario(
     matching_subs,
     "proposal.opened",
     Json.Object({"event": Json.String("proposal.opened"), "proposal": proposal.to_json}),
+    caller_taint_sid(req, auth),
     rng,
     clock
   )
@@ -1855,7 +1874,7 @@ fn accept_proposal(
     "write_direct"
   end
 
-  (pm, col, matching_subs, touched_pages, touched_dbs, touches_schema?) = try Ledger.read_locked(
+  (pm, col, matching_subs, touched_pages, touched_dbs, touches_schema?, prop_untrusted) = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -1940,8 +1959,13 @@ fn accept_proposal(
         end
       end
 
+      prop_prov_opt = try TaintBridge.get_provenance_info(store, "vlm_proposals", found.id)
+      prop_untrusted = case prop_prov_opt
+        Some((tr, _w, _at)): tr == "untrusted"
+        None: false
+      end
       subs = try matching_webhooks_in_store(store, "proposal.accepted", Some(found.collection_id))
-      Ok((found, c, subs, t_pages, t_dbs, t_schema?))
+      Ok((found, c, subs, t_pages, t_dbs, t_schema?, prop_untrusted))
     end
   )
   if pm.status != "open"
@@ -2007,6 +2031,7 @@ fn accept_proposal(
       "proposal": accepted.to_json,
       "commit_txid": Json.int(land_res.commit_txid)
     }),
+    caller_taint_sid(req, auth),
     rng,
     clock
   )
@@ -2032,6 +2057,33 @@ fn accept_proposal(
       var cur = try Table.put(t1, Db.proposals_table(), accepted.id, accepted).map_error(
         Db.map_table_error
       )
+      if prop_untrusted
+        cur = try TaintBridge.tx_mark_provenance(
+          cur,
+          "vlm_pages",
+          accepted.target_page_id,
+          "proposal:#{accepted.id}",
+          "untrusted",
+          now
+        )
+        for ipid in idx_page_ids
+          b_rows = try Table.tx_lookup(cur, Db.blocks_table(), Db.blocks_by_page(), ipid).map_error(
+            Db.map_table_error
+          )
+          for (bid, blk) in b_rows
+            if blk.provenance.proposal_id == Some(accepted.id)
+              cur = try TaintBridge.tx_mark_provenance(
+                cur,
+                "vlm_blocks",
+                bid,
+                "proposal:#{accepted.id}",
+                "untrusted",
+                now
+              )
+            end
+          end
+        end
+      end
       for ij in idx_jobs
         (cur_idx, _idx_jid) = try Jobs.tx_put(cur, ij).map_error(Db.map_table_error)
         cur = cur_idx
@@ -2734,6 +2786,32 @@ fn create_webhook(
   end
 
   now = clock.now
+  case caller_taint_sid(req, auth)
+    Some(sid):
+      if files.read_only.exists?(Db.ledger_db_path)
+        sess_opt = try Ledger.read_locked(
+          files.read_only,
+          Db.ledger_db_path,
+          Db.vellum_schema(),
+          Db.map_ledger_error,
+          fn(db) TaintBridge.get_taint_session(Ledger.store(db), sid) end
+        )
+        case sess_opt
+          Some(_):
+            _auth_sess = try TaintBridge.authorize_write_locked(
+              files,
+              Db.ledger_db_path,
+              Db.vellum_schema(),
+              sid,
+              "vlm_webhooks",
+              "webhook.create",
+              now
+            )
+          None: Unit
+        end
+      end
+    None: Unit
+  end
   wh_id = "wh_#{Id.ulid(rng, clock)}"
   secret = "whsec_#{rng.bytes(24).to_hex}"
   sub = WebhookSub(
@@ -3587,7 +3665,15 @@ fn stage_pr_proposal_for_page_locked(
         Db.map_grants_error
       )
       t2 = try Table.put(t1, Db.proposals_table(), pm.id, pm).map_error(Db.map_table_error)
-      Ok((t2, pm))
+      t3 = try TaintBridge.tx_mark_provenance(
+        t2,
+        "vlm_proposals",
+        pm.id,
+        "webhook:github:#{ev.repo_full_name}##{ev.pr_number}",
+        "untrusted",
+        now
+      )
+      Ok((t3, pm))
     end
   )
 end
@@ -3715,4 +3801,97 @@ fn github_pr_webhook(
       .with_sse_publish_json("collection:#{cid}", "proposal.opened", pev)
   end
   Ok(resp)
+end
+
+## `GET /api/admin/taint/status` — Lists active/cleared `Modb.Taint` sessions, Lethal Trifecta policy,
+## and untrusted provenance markers across pages, blocks, and proposals.
+fn taint_status(auth: AuthContext, rf: ReadFiles) : Result(Api.Response, AppError)
+  role_ok = auth.principal.role == Owner or auth.principal.role == Admin
+  if not role_ok
+    return Error(Forbidden(reason: "only Owner/Admin may inspect Modb.Taint status"))
+  end
+  policy_json = TaintBridge.policy_summary_json()
+  if not rf.exists?(Db.ledger_db_path)
+    return Ok(
+      json_ok(
+        200,
+        Json.Object({
+          "policy": policy_json,
+          "sessions": Json.Array([]),
+          "untrusted": Json.Object({
+            "pages": Json.Array([]),
+            "blocks": Json.Array([]),
+            "proposals": Json.Array([])
+          })
+        })
+      )
+    )
+  end
+  payload = try Ledger.read_locked(
+    rf,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      sessions = try TaintBridge.list_sessions_json(store)
+      pages = try TaintBridge.list_untrusted_provenance_json(store, "vlm_pages")
+      blocks = try TaintBridge.list_untrusted_provenance_json(store, "vlm_blocks")
+      proposals = try TaintBridge.list_untrusted_provenance_json(store, "vlm_proposals")
+      Ok(
+        Json.Object({
+          "policy": policy_json,
+          "sessions": Json.Array(sessions),
+          "untrusted": Json.Object({
+            "pages": Json.Array(pages),
+            "blocks": Json.Array(blocks),
+            "proposals": Json.Array(proposals)
+          })
+        })
+      )
+    end
+  )
+  Ok(json_ok(200, payload))
+end
+
+## `POST /api/admin/taint/sessions/:id/clear` — Admin review action clearing dynamic taint on a session.
+fn clear_taint_session(
+  req: Api.Request,
+  id: Text,
+  auth: AuthContext,
+  files: Files,
+  clock: Clock
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  role_ok = auth.principal.role == Owner or auth.principal.role == Admin
+  if not role_ok or not Policy.action_permitted?(auth, "manage_grants")
+    return Error(Forbidden(reason: "only Owner/Admin may clear session taint"))
+  end
+  if not files.read_only.exists?(Db.ledger_db_path)
+    return Error(Missing(entity: "taint_session", id: id))
+  end
+  reason = if req.body.empty?
+    "admin verified and cleared session taint"
+  else
+    case Json.parse(req.text or "")
+      Ok(j): (j.text_at("reason") or "").trim
+      Error(_): ""
+    end
+  end
+  clean_reason = if reason.empty?
+    "admin verified and cleared session taint"
+  else
+    reason
+  end
+  cleared = try TaintBridge.clear_session_taint_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    id,
+    auth.principal.handle,
+    true,
+    clean_reason,
+    clock.now
+  )
+  Ok(json_ok(200, Json.Object({"session": TaintBridge.taint_session_to_json(cleared)})))
 end

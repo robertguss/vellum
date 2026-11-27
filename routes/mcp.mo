@@ -11,6 +11,7 @@ use Domain.Blocks
 use Domain.Collab{ProposalMeta, WorldBranchArgs, WorldMutation, WorldPatchArgs}
 use Domain.DatabaseModel{CellValue, DbFilterRule, DbRow, DbSortRule, PropertyDef, ViewQueryResult}
 use Domain.Policy
+use Domain.TaintBridge
 use Domain.Types{
   AppError,
   AuthContext,
@@ -28,6 +29,7 @@ use Modb.Claims
 use Modb.Grants
 use Modb.Ledger
 use Modb.Table
+use Modb.Vec
 use Modb.World
 use Routes.Ai
 use Routes.Packs
@@ -63,12 +65,14 @@ fn vellum_tools() : List(Mcp.ToolDef)
     ),
     Mcp.ToolDef(
       name: "vellum.search",
-      description: "Hybrid BM25 + semantic Modb.Vec search across accessible pages and database rows.",
+      description: "Hybrid BM25 + semantic Modb.Vec search across accessible pages and database rows under Modb.Taint supervision.",
       input_schema: Mcp.object_schema(
         {
           "q": str_prop("Search query"),
           "collection_id": str_prop("Optional collection filter"),
-          "mode": str_prop("Optional mode: 'hybrid' (default), 'bm25', or 'semantic'")
+          "mode": str_prop("Optional mode: 'hybrid' (default), 'bm25', or 'semantic'"),
+          "session_id": str_prop("Optional Modb.Taint session ID"),
+          "parent_session_id": str_prop("Optional parent Modb.Taint session ID to fork monotonic taint from")
         },
         ["q"]
       ),
@@ -76,8 +80,15 @@ fn vellum_tools() : List(Mcp.ToolDef)
     ),
     Mcp.ToolDef(
       name: "vellum.read_page",
-      description: "Read page metadata and lossless anchored Markdown (with stable blk IDs).",
-      input_schema: Mcp.object_schema({"page_id": str_prop("Target page ID")}, ["page_id"]),
+      description: "Read page metadata, provenance trust tier, and lossless anchored Markdown (with stable blk IDs).",
+      input_schema: Mcp.object_schema(
+        {
+          "page_id": str_prop("Target page ID"),
+          "session_id": str_prop("Optional Modb.Taint session ID"),
+          "parent_session_id": str_prop("Optional parent Modb.Taint session ID to fork monotonic taint from")
+        },
+        ["page_id"]
+      ),
       read_only?: true
     ),
     Mcp.ToolDef(
@@ -88,7 +99,9 @@ fn vellum_tools() : List(Mcp.ToolDef)
           "page_id": str_prop("Target page ID"),
           "ops": Json.Object({"type": Json.String("array")}),
           "expected_versions": Json.Object({"type": Json.String("object")}),
-          "reason": str_prop("Audit reason for this mutation")
+          "reason": str_prop("Audit reason for this mutation"),
+          "session_id": str_prop("Optional Modb.Taint session ID"),
+          "parent_session_id": str_prop("Optional parent Modb.Taint session ID")
         },
         ["page_id", "ops", "reason"]
       ),
@@ -173,7 +186,9 @@ fn vellum_tools() : List(Mcp.ToolDef)
           "database_id": str_prop("Target database ID"),
           "cells": Json.Object({"type": Json.String("object")}),
           "markdown": str_prop("Optional backing page Markdown"),
-          "reason": str_prop("Audit reason for row creation")
+          "reason": str_prop("Audit reason for row creation"),
+          "session_id": str_prop("Optional Modb.Taint session ID"),
+          "parent_session_id": str_prop("Optional parent Modb.Taint session ID")
         },
         ["database_id", "cells", "reason"]
       ),
@@ -188,7 +203,9 @@ fn vellum_tools() : List(Mcp.ToolDef)
           "row_id": str_prop("Target row ID"),
           "cells": Json.Object({"type": Json.String("object")}),
           "expected_version": Json.Object({"type": Json.String("integer")}),
-          "reason": str_prop("Audit reason for row update")
+          "reason": str_prop("Audit reason for row update"),
+          "session_id": str_prop("Optional Modb.Taint session ID"),
+          "parent_session_id": str_prop("Optional parent Modb.Taint session ID")
         },
         ["database_id", "row_id", "cells", "expected_version", "reason"]
       ),
@@ -368,6 +385,157 @@ fn generate_insert_ids(ops: List(BlockOp), rng: SecureRandom, clock: Clock) : Li
   out
 end
 
+fn mcp_session_id(args: Json, auth: AuthContext) : Text
+  case args.text_at("session_id")
+    Some(s) if not s.trim.empty?: s.trim
+    Some(_) | None: "agent:#{auth.grant_id}"
+  end
+end
+
+fn ensure_mcp_session_locked(
+  args: Json,
+  auth: AuthContext,
+  files: Files,
+  now: Time
+) : Result((Text, Bool), AppError)
+  sid = mcp_session_id(args, auth)
+  if not files.read_only.exists?(Db.ledger_db_path)
+    return Ok((sid, false))
+  end
+  existing = try Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db) TaintBridge.get_taint_session(Ledger.store(db), sid) end
+  )
+  grant_opt = if auth.principal.kind == Agent: Some(auth.grant_id) else: None
+  case existing
+    Some(s): Ok((sid, s.untrusted_tainted))
+    None:
+      parent_opt = case args.text_at("parent_session_id")
+        Some(p) if not p.trim.empty?: Some(p.trim)
+        Some(_) | None: None
+      end
+      sess = case parent_opt
+        Some(pid):
+          try TaintBridge.fork_taint_session_locked(
+            files,
+            Db.ledger_db_path,
+            Db.vellum_schema(),
+            pid,
+            sid,
+            auth.principal.handle,
+            grant_opt,
+            now
+          )
+        None:
+          try TaintBridge.ensure_taint_session_locked(
+            files,
+            Db.ledger_db_path,
+            Db.vellum_schema(),
+            sid,
+            auth.principal.handle,
+            grant_opt,
+            now
+          )
+      end
+      Ok((sid, sess.untrusted_tainted))
+  end
+end
+
+fn authorize_mcp_write_locked(
+  args: Json,
+  auth: AuthContext,
+  files: Files,
+  action_name: Text,
+  now: Time
+) : Result(Unit, AppError)
+  if not files.read_only.exists?(Db.ledger_db_path)
+    return Ok(Unit)
+  end
+  sid = mcp_session_id(args, auth)
+  parent_opt = case args.text_at("parent_session_id")
+    Some(p) if not p.trim.empty?: Some(p.trim)
+    Some(_) | None: None
+  end
+  existing = try Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db) TaintBridge.get_taint_session(Ledger.store(db), sid) end
+  )
+  case existing
+    Some(_): Unit
+    None:
+      case parent_opt
+        Some(_):
+          _forked = try ensure_mcp_session_locked(args, auth, files, now)
+        None: return Ok(Unit)
+      end
+  end
+  _ok_sess = try TaintBridge.authorize_action_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    sid,
+    action_name,
+    now
+  )
+  Ok(Unit)
+end
+
+fn mcp_search_vec_setup(
+  rf: ReadFiles,
+  q: Text,
+  env: Env,
+  net: Network
+) : Result((Option(List(Float)), Vec.VecIndex, Text, Option(Float)), AppError)
+  case Ai.embed_config(env)
+    None:
+      Ok(
+        (
+          Some(Vec.text_sketch_embedding(q, Db.sketch_vec_dims)),
+          Db.sketch_vec_index(),
+          "sketch",
+          Some(Db.sketch_min_vec_score)
+        )
+      )
+    Some(ecfg):
+      has_neural = try Ledger.read_locked(
+        rf,
+        Db.ledger_db_path,
+        Db.vellum_schema(),
+        Db.map_ledger_error,
+        fn(db) Db.neural_vec_populated(Ledger.store(db), ecfg.dimensions) end
+      )
+      if has_neural
+        case Ai.fetch_embedding(ecfg, q, net)
+          Ok(qv): Ok((Some(qv), Db.neural_vec_index(ecfg.dimensions), "neural", Some(ecfg.min_score)))
+          Error(_):
+            Ok(
+              (
+                Some(Vec.text_sketch_embedding(q, Db.sketch_vec_dims)),
+                Db.sketch_vec_index(),
+                "sketch",
+                Some(Db.sketch_min_vec_score)
+              )
+            )
+        end
+      else
+        Ok(
+          (
+            Some(Vec.text_sketch_embedding(q, Db.sketch_vec_dims)),
+            Db.sketch_vec_index(),
+            "sketch",
+            Some(Db.sketch_min_vec_score)
+          )
+        )
+      end
+  end
+end
+
 fn decode_ops_and_versions(args: Json) : Result((List(BlockOp), Map(Text, Int)), Text)
   ops_json = try args.get("ops").or_fail("missing 'ops' array")
   ops = try Json.decode_strict[List(BlockOp)](ops_json.to_text.bytes).map_error(fn(e) e.to_text end)
@@ -449,6 +617,10 @@ fn handle_mcp_db_create_row(
   cells = case Json.decode_strict[Map(Text, CellValue)](cells_json.to_text.bytes)
     Ok(m): m
     Error(e): return Ok(Mcp.tool_error(id, "invalid cells: #{e.to_text}"))
+  end
+  case authorize_mcp_write_locked(args, auth, files, "mcp.db_create_row", now)
+    Ok(_): Unit
+    Error(e): return Ok(Mcp.tool_error(id, e.to_text))
   end
   md_opt = args.text_at("markdown")
   row_id = "row_#{Id.ulid(rng, clock)}"
@@ -590,6 +762,10 @@ fn handle_mcp_db_update_row(
   cell_updates = case Json.decode_strict[Map(Text, CellValue)](cells_json.to_text.bytes)
     Ok(m): m
     Error(e): return Ok(Mcp.tool_error(id, "invalid cells: #{e.to_text}"))
+  end
+  case authorize_mcp_write_locked(args, auth, files, "mcp.db_update_row", now)
+    Ok(_): Unit
+    Error(e): return Ok(Mcp.tool_error(id, e.to_text))
   end
   idx_job = Jobs.prepare(rng, clock, "vellum.page.indexed", Json.Null)
   meta = Ledger.WriteMeta(
@@ -1290,32 +1466,205 @@ fn handle_tool_call(
     if q.empty?
       return Ok(Mcp.tool_error(id, "'q' must not be empty"))
     end
-    col_filter = args.text_at("collection_id")
-    mode_arg = args.text_at("mode")
-    out = case Ai.execute_workspace_search(
+    col_filter = case args.text_at("collection_id")
+      Some(s) if not s.trim.empty?: Some(s.trim)
+      Some(_) | None: None
+    end
+    raw_mode = (args.text_at("mode") or "hybrid").trim.ascii_lowercase
+    if raw_mode != "hybrid" and raw_mode != "bm25" and raw_mode != "semantic"
+      return Ok(Mcp.tool_error(id, "invalid search mode '#{raw_mode}'; expected hybrid, bm25, or semantic"))
+    end
+    if not files.read_only.exists?(Db.ledger_db_path)
+      return Ok(
+        Mcp.tool_ok(
+          id,
+          "Found 0 #{raw_mode} search hits.",
+          Some(
+            Json.Object({
+              "results": Json.Array([]),
+              "mode": Json.String(raw_mode),
+              "vector_backend": Json.String("none")
+            })
+          )
+        )
+      )
+    end
+    (sess_id, _init_tainted) = case ensure_mcp_session_locked(args, auth, files, now)
+      Ok(pair): pair
+      Error(e): return Ok(Mcp.tool_error(id, e.to_text))
+    end
+    cids_res = Ledger.read_locked(
       files.read_only,
-      auth,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      Db.map_ledger_error,
+      fn(db)
+        store = Ledger.store(db)
+        case col_filter
+          Some(cid):
+            try Policy.require_collection_access(auth, "read", cid)
+            Ok([cid])
+          None:
+            rows = try Table.scan(store, Db.collections_table(), None, None, 200).map_error(
+              Db.map_table_error
+            )
+            var out = []
+            for (_id, c) in rows
+              if c.archived_at == None and Policy.collection_permitted?(auth, c.id)
+                out = out.append(c.id)
+              end
+            end
+            Ok(out)
+        end
+      end
+    )
+    target_cids = case cids_res
+      Ok(xs): xs
+      Error(e): return Ok(Mcp.tool_error(id, e.to_text))
+    end
+    (raw_qv_opt, vec_idx, vec_backend, min_vec) = try mcp_search_vec_setup(
+      files.read_only,
       q,
-      20,
-      true,
-      col_filter,
-      mode_arg,
       env,
       net
     )
-      Ok(o): o
-      Error(BadInput(reason: msg)): return Ok(Mcp.tool_error(id, msg))
-      Error(e): return Error(e)
+    (qv_opt, fts_w, vec_w, eff_backend) = if raw_mode == "bm25"
+      (None, 1.0.to_float, 0.0.to_float, "none")
+    else if raw_mode == "semantic"
+      (raw_qv_opt, 0.0.to_float, 1.0.to_float, vec_backend)
+    else
+      (raw_qv_opt, 1.0.to_float, 1.0.to_float, vec_backend)
     end
+    is_admin = auth.principal.role == Owner or auth.principal.role == Admin
+    var raw_hits = []
+    for cid in target_cids
+      opts = Vec.HybridOptions(
+        limit: 20,
+        prefix_last_term?: true,
+        required_scope: Some(cid),
+        rrf_k: 60,
+        fts_weight: fts_w,
+        vec_weight: vec_w,
+        candidate_limit: 40,
+        min_vec_score: min_vec
+      )
+      (hhits, _upd_sess) = case TaintBridge.run_tainted_hybrid_search_locked(
+        files,
+        Db.ledger_db_path,
+        Db.vellum_schema(),
+        sess_id,
+        Db.fts_index(),
+        vec_idx,
+        q,
+        qv_opt,
+        opts,
+        is_admin,
+        now
+      )
+        Ok(pair): pair
+        Error(e): return Ok(Mcp.tool_error(id, e.to_text))
+      end
+      for hh in hhits
+        if hh.scope == cid and Policy.collection_permitted?(auth, hh.scope)
+          raw_hits = raw_hits.append(hh)
+        end
+      end
+    end
+    sorted_hits = raw_hits.sort_by(fn(h) -h.score end).take(20)
+    (items_json, untrusted_srcs) = try Ledger.read_locked(
+      files.read_only,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      Db.map_ledger_error,
+      fn(db)
+        store = Ledger.store(db)
+        ptbl = Db.pages_table()
+        var items = []
+        var srcs = []
+        var seen = []
+        for hh in sorted_hits
+          if not seen.contains?(hh.doc_id)
+            case try Table.get(store, ptbl, hh.doc_id).map_error(Db.map_table_error)
+              Some(p) if p.archived_at == None and Policy.collection_permitted?(auth, p.collection_id):
+                seen = seen.append(p.id)
+                pg_prov = try TaintBridge.get_provenance_info(store, "vlm_pages", p.id)
+                var untrusted_w = case pg_prov
+                  Some((tr, w, _at)) if tr == "untrusted": Some(w)
+                  Some(_) | None: None
+                end
+                if untrusted_w == None
+                  pblks = try Db.load_page_blocks(store, p.id)
+                  for blk in pblks
+                    if untrusted_w == None
+                      case try TaintBridge.get_provenance_info(store, "vlm_blocks", blk.id)
+                        Some((btr, bw, _bat)) if btr == "untrusted": untrusted_w = Some(bw)
+                        Some(_) | None: Unit
+                      end
+                    end
+                  end
+                end
+                trust_tier = case untrusted_w
+                  Some(w):
+                    srcs = srcs.append("page:#{p.id}(#{w})")
+                    "untrusted"
+                  None: "trusted"
+                end
+                fields = if hh.matched_fields.empty? and hh.vec_rank != None
+                  ["semantic"]
+                else
+                  hh.matched_fields
+                end
+                items = items.append(
+                  Json.Object({
+                    "page_id": Json.String(p.id),
+                    "collection_id": Json.String(p.collection_id),
+                    "title": Json.String(p.title),
+                    "score": hh.score.to_json,
+                    "matched_terms": hh.matched_terms.to_json,
+                    "matched_fields": fields.to_json,
+                    "fts_rank": hh.fts_rank.to_json,
+                    "vec_rank": hh.vec_rank.to_json,
+                    "vec_score": hh.vec_score.to_json,
+                    "trust_tier": Json.String(trust_tier)
+                  })
+                )
+              Some(_) | None: Unit
+            end
+          end
+        end
+        Ok((items, srcs))
+      end
+    )
+    for usrc in untrusted_srcs
+      _ts = try TaintBridge.record_untrusted_read_locked(
+        files,
+        Db.ledger_db_path,
+        Db.vellum_schema(),
+        sess_id,
+        usrc,
+        now
+      )
+    end
+    final_sess_json = try Ledger.read_locked(
+      files.read_only,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      Db.map_ledger_error,
+      fn(db)
+        sopt = try TaintBridge.get_taint_session(Ledger.store(db), sess_id)
+        Ok(sopt.map(fn(s) TaintBridge.taint_session_to_json(s) end).to_json)
+      end
+    )
     return Ok(
       Mcp.tool_ok(
         id,
-        "Found #{out.results.size} #{out.mode} (#{out.vector_backend}) search hits.",
+        "Found #{items_json.size} #{raw_mode} (#{eff_backend}) search hits.",
         Some(
           Json.Object({
-            "results": out.results.to_json,
-            "mode": Json.String(out.mode),
-            "vector_backend": Json.String(out.vector_backend)
+            "results": Json.Array(items_json),
+            "mode": Json.String(raw_mode),
+            "vector_backend": Json.String(eff_backend),
+            "taint_session": final_sess_json
           })
         )
       )
@@ -1326,6 +1675,13 @@ fn handle_tool_call(
     pid = case args.text_at("page_id")
       Some(s) if not s.trim.empty?: s.trim
       Some(_) | None: return Ok(Mcp.tool_error(id, "missing 'page_id'"))
+    end
+    if not files.read_only.exists?(Db.ledger_db_path)
+      return Ok(Mcp.tool_error(id, "page '#{pid}' not found"))
+    end
+    (sess_id, _init_tainted) = case ensure_mcp_session_locked(args, auth, files, now)
+      Ok(pair): pair
+      Error(e): return Ok(Mcp.tool_error(id, e.to_text))
     end
     res = Ledger.read_locked(
       files.read_only,
@@ -1340,17 +1696,62 @@ fn handle_tool_call(
         end
         try Policy.require_collection_access(auth, "read", pg.collection_id)
         blks = try Db.load_page_blocks(store, pg.id)
-        Ok(
-          Json.Object({
-            "page": pg.to_json,
-            "blocks": blks.to_json,
-            "anchored_markdown": Json.String(Blocks.to_anchored_markdown(blks))
-          })
-        )
+        pg_prov = try TaintBridge.get_provenance_info(store, "vlm_pages", pg.id)
+        var untrusted_w = case pg_prov
+          Some((tr, w, _at)) if tr == "untrusted": Some(w)
+          Some(_) | None: None
+        end
+        if untrusted_w == None
+          for blk in blks
+            if untrusted_w == None
+              case try TaintBridge.get_provenance_info(store, "vlm_blocks", blk.id)
+                Some((btr, bw, _bat)) if btr == "untrusted": untrusted_w = Some(bw)
+                Some(_) | None: Unit
+              end
+            end
+          end
+        end
+        trust_tier = case untrusted_w
+          Some(_): "untrusted"
+          None: "trusted"
+        end
+        untrusted_src_opt = untrusted_w.map(fn(w) "page:#{pg.id}(#{w})" end)
+        Ok((pg, blks, trust_tier, untrusted_src_opt))
       end
     )
     return case res
-      Ok(payload): Ok(Mcp.tool_ok(id, payload.text_at("anchored_markdown") or "", Some(payload)))
+      Ok((pg, blks, trust_tier, untrusted_src_opt)):
+        case untrusted_src_opt
+          Some(src):
+            _ts = try TaintBridge.record_untrusted_read_locked(
+              files,
+              Db.ledger_db_path,
+              Db.vellum_schema(),
+              sess_id,
+              src,
+              now
+            )
+          None: Unit
+        end
+        sess_json = try Ledger.read_locked(
+          files.read_only,
+          Db.ledger_db_path,
+          Db.vellum_schema(),
+          Db.map_ledger_error,
+          fn(db)
+            sopt = try TaintBridge.get_taint_session(Ledger.store(db), sess_id)
+            Ok(sopt.map(fn(s) TaintBridge.taint_session_to_json(s) end).to_json)
+          end
+        )
+        anchored = Blocks.to_anchored_markdown(blks)
+        payload = Json.Object({
+          "page": pg.to_json,
+          "blocks": blks.to_json,
+          "anchored_markdown": Json.String(anchored),
+          "trust_tier": Json.String(trust_tier),
+          "taint_session": sess_json
+        })
+        Ok(Mcp.tool_ok(id, anchored, Some(payload)))
       Error(e): Ok(Mcp.tool_error(id, e.to_text))
     end
   end
@@ -1367,6 +1768,10 @@ fn handle_tool_call(
     (ops, exp_vers) = case decode_ops_and_versions(args)
       Ok(p): p
       Error(msg): return Ok(Mcp.tool_error(id, msg))
+    end
+    case authorize_mcp_write_locked(args, auth, files, "mcp.patch_blocks", now)
+      Ok(_): Unit
+      Error(e): return Ok(Mcp.tool_error(id, e.to_text))
     end
     new_ids = generate_insert_ids(ops, rng, clock)
     prov = make_provenance(auth, reason, now)

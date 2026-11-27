@@ -142,6 +142,7 @@ struct WebhookJobPayload
   secret: Text
   event: Text
   body_json: Json
+  taint_session_id: Option(Text)
 end
 
 ## Canonical `Modb.Claims` resource identifier for a whole page.

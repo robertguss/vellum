@@ -12,10 +12,19 @@ fork_taint_session_locked,
 run_tainted_hybrid_search_locked,
 record_untrusted_read_locked,
 mark_block_untrusted_locked,
-get_taint_session
+get_taint_session,
+tx_mark_provenance,
+get_provenance_info,
+list_untrusted_provenance_json,
+taint_session_to_json,
+list_sessions_json,
+policy_summary_json,
+authorize_action_locked,
+authorize_write_locked,
+clear_session_taint_locked
 use Domain.Types{AppError}
 use Json
-use Modb{Store}
+use Modb{Store, WriteTx}
 use Modb.Fts
 use Modb.Ledger{Schema}
 use Modb.Policy
@@ -141,9 +150,166 @@ fn default_sensitivity_policy() : Policy.SensitivityPolicy
   Policy.policy()
 end
 
-## Default `Modb.Taint.TaintPolicy` (monotonic untrusted read tracking + `block_write_down?: true`).
+## Default `Modb.Taint.TaintPolicy` (monotonic untrusted read tracking + `block_write_down?: true`
+## + Lethal Trifecta external actions and webhook exfiltration sink).
 fn default_taint_policy() : Taint.TaintPolicy
   Taint.taint_policy()
+    .with_external_action("webhook.create")
+    .with_external_action("webhook.deliver")
+    .with_external_action("mcp.patch_blocks")
+    .with_external_action("mcp.db_create_row")
+    .with_external_action("mcp.db_update_row")
+    .with_external_action("page.write_direct")
+    .with_exfil_sink("vlm_webhooks")
+    .with_block_write_down(true)
+end
+
+fn trust_from_tag(tag: Text) : Taint.TrustTier
+  clean = tag.trim.ascii_lowercase
+  if clean == "untrusted"
+    Taint.Untrusted
+  else if clean == "internal_agent" or clean == "agent"
+    Taint.InternalAgent
+  else
+    Taint.Owner
+  end
+end
+
+fn tx_mark_provenance(
+  tx: WriteTx,
+  bucket: Text,
+  key_id: Text,
+  writer: Text,
+  trust_tag: Text,
+  now: Time
+) : Result(WriteTx, AppError)
+  Taint.tx_mark_provenance(tx, bucket, key_id.bytes, writer, trust_from_tag(trust_tag), now)
+    .map_error(map_taint_error)
+end
+
+fn get_provenance_info(store: Store, bucket: Text, key_id: Text) : Result(
+  Option((Text, Text, Time)),
+  AppError
+)
+  rec_opt = try Taint.get_provenance(store, bucket, key_id.bytes).map_error(map_taint_error)
+  Ok(rec_opt.map(fn(r) (Taint.trust_to_text(r.trust), r.writer, r.updated_at) end))
+end
+
+fn list_untrusted_provenance_json(store: Store, bucket: Text) : Result(List(Json), AppError)
+  recs = try Taint.list_provenance_for_bucket(store, bucket).map_error(map_taint_error)
+  Ok(
+    recs.filter(fn(r) r.trust is Taint.Untrusted end).map(fn(r)
+      Json.Object({
+        "bucket": Json.String(r.bucket),
+        "key_hex": Json.String(r.key_hex),
+        "writer": Json.String(r.writer),
+        "trust": Json.String(Taint.trust_to_text(r.trust)),
+        "recorded_txid": Json.int(r.recorded_txid),
+        "updated_at": r.updated_at.to_json
+      })
+    end)
+  )
+end
+
+fn taint_session_to_json(s: Taint.TaintSession) : Json
+  Json.Object({
+    "id": Json.String(s.id),
+    "principal": Json.String(s.principal),
+    "grant_id": s.grant_id.to_json,
+    "parent_session_id": s.parent_session_id.to_json,
+    "untrusted_tainted": Json.Boolean(s.untrusted_tainted),
+    "untrusted_sources": s.untrusted_sources.to_json,
+    "max_sensitivity_read": Json.String(sensitivity_label(s.max_sensitivity_read)),
+    "sensitive_sources": s.sensitive_sources.to_json,
+    "blocked_attempts": Json.int(s.blocked_attempts),
+    "opened_at": s.opened_at.to_json,
+    "updated_at": s.updated_at.to_json,
+    "cleared_at": s.cleared_at.to_json,
+    "cleared_by": s.cleared_by.to_json,
+    "closed": Json.Boolean(s.closed)
+  })
+end
+
+fn list_sessions_json(store: Store) : Result(List(Json), AppError)
+  rows = try Taint.list_sessions(store).map_error(map_taint_error)
+  sorted = rows.sort_by(fn(s) s.id end)
+  Ok(sorted.map(fn(s) taint_session_to_json(s) end))
+end
+
+fn policy_summary_json() : Json
+  p = default_taint_policy()
+  Json.Object({
+    "peer_agents_taint": Json.Boolean(p.peer_agents_taint?),
+    "max_sensitivity_when_tainted": Json.String(sensitivity_label(p.max_sensitivity_when_tainted)),
+    "exfil_sinks": p.exfil_sinks.to_list.to_json,
+    "external_actions": p.external_actions.to_list.to_json,
+    "block_write_down": Json.Boolean(p.block_write_down?),
+    "strict_no_write_down": Json.Boolean(p.strict_no_write_down?)
+  })
+end
+
+fn authorize_action_locked(
+  files: Files,
+  path: Text,
+  sc: Schema,
+  session_id: Text,
+  action_name: Text,
+  now: Time
+) : Result(Taint.TaintSession, AppError)
+  Taint.authorize_action_locked(
+    files,
+    path,
+    sc,
+    default_sensitivity_policy(),
+    default_taint_policy(),
+    session_id,
+    action_name,
+    now
+  ).map_error(map_taint_error)
+end
+
+fn authorize_write_locked(
+  files: Files,
+  path: Text,
+  sc: Schema,
+  session_id: Text,
+  target_bucket: Text,
+  action_name: Text,
+  now: Time
+) : Result(Taint.TaintSession, AppError)
+  Taint.authorize_write_locked(
+    files,
+    path,
+    sc,
+    default_sensitivity_policy(),
+    default_taint_policy(),
+    session_id,
+    target_bucket,
+    action_name,
+    now
+  ).map_error(map_taint_error)
+end
+
+fn clear_session_taint_locked(
+  files: Files,
+  path: Text,
+  sc: Schema,
+  session_id: Text,
+  reviewer: Text,
+  is_admin: Bool,
+  reason: Text,
+  now: Time
+) : Result(Taint.TaintSession, AppError)
+  Taint.clear_session_taint_locked(
+    files,
+    path,
+    sc,
+    session_id,
+    reviewer,
+    is_admin,
+    reason,
+    now
+  ).map_error(map_taint_error)
 end
 
 ## Formats a `Modb.Policy.Sensitivity` value as canonical lowercase text.
