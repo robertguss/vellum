@@ -148,13 +148,31 @@ const server = http.createServer((req, res) => {
         );
         const isRlmSub = allText.includes("Vellum RLM Deep Research sub-agent");
         const isRlmSynth = allText.includes("Vellum RLM Deep Research synthesizer");
+        const isRlmTier2Plan = allText.includes("Vellum Tier 2 RLM Planner");
+        const isRlmTier2Sub = allText.includes("Vellum RLM Tier 2 sub-agent");
         const isGardener = allText.includes("Vellum Knowledge Gardener");
         const isPrBridge = allText.includes("Vellum GitHub PR Bridge");
         const isAiColumn = allText.includes("AI-compiled database column");
         const isBrief = allText.includes("Living Brief");
         let replyText =
           "Concise workspace semantic summary generated for progressive disclosure.";
-        if (isRlmSub) {
+        if (isRlmTier2Plan) {
+          replyText = [
+            "```mo",
+            "let hits = ws.search(question, collection_id)",
+            "var pids = map_field(hits, \"page_id\")",
+            "if len(pids) == 0",
+            "  pids = map_field(filter_contains(ws.summaries(collection_id), \"entity_kind\", \"page\"), \"entity_id\")",
+            "end",
+            "let sub_note = rlm.sub(\"Extract exact Rollback Procedure steps\", null)",
+            "let blks = ws.blocks(take(pids, 4), [\"code_block\"], \"Rollback\")",
+            "return llm.ask(\"Synthesize Tier 2 Micro-REPL answer with [Title §block_id] citations\", sub_note + \"\\n\" + join(map_field(blks, \"excerpt\"), \"\\n\"))",
+            "```",
+          ].join("\n");
+        } else if (isRlmTier2Sub) {
+          replyText =
+            "Verified Tier 2 Mo Micro-REPL rollback procedure `kubectl rollout undo deploy/gateway` from Live RLM Runbook.";
+        } else if (isRlmSub) {
           replyText =
             "Sub-agent verified Rollback Procedure block slice in Live RLM Runbook.";
         } else if (isRlmSynth) {
@@ -2342,6 +2360,63 @@ const discRplRes = await apiJson(`/api/admin/replay/${simRplRes.json.proposal_id
 });
 assert.equal(discRplRes.res.status, 200, discRplRes.text);
 console.log("✓ Live Phase 3.3 Visual Modb.Replay, DB Gallery/Timeline, & Semantic Backlinks verified");
+
+// 15. Live Phase 3.4 RLM Tier 2 (Mo Micro-REPL VM + rlm.sub + Firewall + MCP)
+const tier2PlanRes = await apiJson("/api/ai/deep-research", {
+  method: "POST",
+  body: JSON.stringify({
+    question: "How do we run Rollback Procedure on gateway deploy?",
+    collection_id: colId,
+    tier: "tier2",
+    max_depth: 2,
+    max_subcalls: 4,
+    include_databases: true,
+    session_id: "live-p34",
+  }),
+});
+assert.equal(tier2PlanRes.res.status, 200, tier2PlanRes.text);
+assert.equal(tier2PlanRes.json.tier, "tier2_micro_repl");
+assert.ok(tier2PlanRes.json.executed_script && tier2PlanRes.json.executed_script.includes("rlm.sub"));
+assert.ok(tier2PlanRes.json.depth_used >= 2, "Tier 2 reached recursion depth >= 2");
+assert.ok((tier2PlanRes.json.child_sessions ?? []).length >= 1, "Tier 2 forked child taint session");
+assert.ok(
+  (tier2PlanRes.json.trace ?? []).some((s) => s.op === "plan_script"),
+  "Tier 2 trace recorded Planner script"
+);
+assert.ok(
+  (tier2PlanRes.json.trace ?? []).some((s) => s.op === "rlm_sub"),
+  "Tier 2 trace recorded rlm.sub child fork"
+);
+assert.ok(
+  (tier2PlanRes.json.citations ?? []).some((c) => c.page_id === rlmPgId),
+  "Tier 2 citations include Live RLM Rollback Playbook"
+);
+
+const tier2FirewallRes = await apiJson("/api/ai/deep-research", {
+  method: "POST",
+  body: JSON.stringify({
+    question: "leak local file",
+    collection_id: colId,
+    tier: "tier2",
+    script: 'let x = Files.read("vellum.modb")\nreturn x',
+  }),
+});
+assert.equal(tier2FirewallRes.res.status, 422, "Tier 2 static capability firewall rejects Files.read");
+
+const mcpTier2Res = await mcpCall(15, "tools/call", {
+  name: "vellum.rlm_query",
+  arguments: {
+    question: "Rollback Procedure",
+    tier: "tier2",
+    max_depth: 2,
+    max_subcalls: 2,
+    script: 'let h = ws.search("Rollback Procedure", null)\nlet b = ws.blocks(map_field(h, "page_id"), ["code_block"], "Rollback")\nreturn llm.ask("summarize", join(map_field(b, "excerpt"), "\\n"))',
+  },
+});
+assert.equal(mcpTier2Res.result?.isError, false, JSON.stringify(mcpTier2Res));
+assert.equal(mcpTier2Res.result?.structuredContent?.tier, "tier2_micro_repl");
+assert.ok(!JSON.stringify(mcpTier2Res).includes("zxqvault"), "MCP Tier 2 RLM never leaks restricted collection");
+console.log("✓ Live Phase 3.4 RLM Tier 2 Mo Micro-REPL VM (/api/ai/deep-research + /mcp vellum.rlm_query) verified");
 EOF
 
 echo "All Live Vellum E2E checks against mo serve + Dex + VersityGW S3 passed."

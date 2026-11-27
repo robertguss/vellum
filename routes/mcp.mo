@@ -248,7 +248,7 @@ fn vellum_tools() : List(Mcp.ToolDef)
     ),
     Mcp.ToolDef(
       name: "vellum.rlm_query",
-      description: "RLM Tier 1 Deep Research via sandboxed Modb.Views ReadProgram, section/block-kind slicing, and bounded sub-calls with inspectable trace.",
+      description: "RLM Deep Research (Tier 1 Modb.Views ReadProgram or Tier 2 capability-confined Mo Micro-REPL VM) with recursive child taint forks and inspectable trace.",
       input_schema: Mcp.object_schema(
         {
           "question": str_prop("Research question to answer across accessible collections"),
@@ -263,7 +263,10 @@ fn vellum_tools() : List(Mcp.ToolDef)
           "max_blocks_per_page": Json.Object({"type": Json.String("integer")}),
           "max_subcalls": Json.Object({"type": Json.String("integer")}),
           "max_rows_scanned": Json.Object({"type": Json.String("integer")}),
-          "session_id": str_prop("Optional Modb.Taint session suffix")
+          "session_id": str_prop("Optional Modb.Taint session suffix"),
+          "tier": str_prop("Execution tier: 'tier1' (default) or 'tier2' (Mo Micro-REPL)"),
+          "script": str_prop("Optional explicit Mo Micro-REPL script (triggers Tier 2)"),
+          "max_depth": Json.Object({"type": Json.String("integer")})
         },
         ["question"]
       ),
@@ -1166,6 +1169,15 @@ fn handle_mcp_rlm_query(
     Some(s) if not s.trim.empty?: Some(s.trim)
     Some(_) | None: None
   end
+  tier_opt = case args.text_at("tier")
+    Some(t) if not t.trim.empty?: Some(t.trim)
+    Some(_) | None: None
+  end
+  script_opt = case args.text_at("script")
+    Some(sc) if not sc.trim.empty?: Some(sc.trim)
+    Some(_) | None: None
+  end
+  max_depth_opt = args.int_at("max_depth")
 
   inp = Ai.DeepResearchInput(
     question: question,
@@ -1177,9 +1189,12 @@ fn handle_mcp_rlm_query(
     max_blocks_per_page: max_b_opt,
     max_subcalls: max_sub_opt,
     max_rows_scanned: max_rows_opt,
-    session_id: sess_opt
+    session_id: sess_opt,
+    tier: tier_opt,
+    script: script_opt,
+    max_depth: max_depth_opt
   )
-  case Ai.execute_rlm_tier1(auth, inp, files, clock, env, net)
+  case Ai.execute_deep_research(auth, inp, files, clock, env, net)
     Ok(out): Ok(Mcp.tool_ok(id, out.answer, Some(Ai.deep_research_outcome_to_json(out))))
     Error(e): Ok(Mcp.tool_error(id, e.to_text))
   end

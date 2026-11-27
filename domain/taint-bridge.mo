@@ -7,12 +7,133 @@ sensitivity_label,
 map_views_error,
 map_taint_error,
 ensure_taint_session_locked,
-run_tainted_read_program_locked
+run_tainted_read_program_locked,
+fork_taint_session_locked,
+run_tainted_hybrid_search_locked,
+record_untrusted_read_locked,
+mark_block_untrusted_locked,
+get_taint_session
 use Domain.Types{AppError}
+use Json
+use Modb{Store}
+use Modb.Fts
 use Modb.Ledger{Schema}
 use Modb.Policy
+use Modb.Table
 use Modb.Taint
+use Modb.Vec
 use Modb.Views
+
+fn fork_taint_session_locked(
+  files: Files,
+  path: Text,
+  sc: Schema,
+  parent_session_id: Text,
+  child_session_id: Text,
+  child_principal: Text,
+  child_grant_opt: Option(Text),
+  now: Time
+) : Result(Taint.TaintSession, AppError)
+  Taint.fork_session_locked(
+    files,
+    path,
+    sc,
+    parent_session_id,
+    child_session_id,
+    child_principal,
+    child_grant_opt,
+    now
+  ).map_error(map_taint_error)
+end
+
+fn run_tainted_hybrid_search_locked(
+  files: Files,
+  path: Text,
+  sc: Schema,
+  session_id: Text,
+  fts_idx: Fts.FtsIndex,
+  vec_idx: Vec.VecIndex,
+  query_text: Text,
+  query_vec: Option(List(Float)),
+  opts: Vec.HybridOptions,
+  is_admin: Bool,
+  now: Time
+) : Result((List(Vec.HybridHit), Taint.TaintSession), AppError)
+  Taint.hybrid_search_tainted_locked(
+    files,
+    path,
+    sc,
+    default_sensitivity_policy(),
+    default_taint_policy(),
+    session_id,
+    fts_idx,
+    vec_idx,
+    query_text,
+    query_vec,
+    opts,
+    is_admin,
+    now
+  ).map_error(map_taint_error)
+end
+
+fn record_untrusted_read_locked(
+  files: Files,
+  path: Text,
+  sc: Schema,
+  session_id: Text,
+  source_label: Text,
+  now: Time
+) : Result(Taint.TaintSession, AppError)
+  Taint.record_untrusted_read_locked(files, path, sc, session_id, source_label, now).map_error(
+    map_taint_error
+  )
+end
+
+fn get_taint_session(store: Store, session_id: Text) : Result(Option(Taint.TaintSession), AppError)
+  Taint.get_session(store, session_id).map_error(map_taint_error)
+end
+
+fn mark_block_untrusted_locked(
+  files: Files,
+  path: Text,
+  sc: Schema,
+  block_id: Text,
+  writer: Text,
+  now: Time
+) : Result(Unit, AppError)
+  Ledger.locked(
+    files,
+    path,
+    sc,
+    now,
+    fn(e) map_taint_error(Taint.LedgerFailure(e)) end,
+    fn(db)
+      meta = Ledger.WriteMeta(
+        principal: writer,
+        action: "taint.mark_untrusted",
+        reason: "mark block #{block_id} untrusted provenance",
+        at: now
+      )
+      _next = try Ledger.write(
+        db,
+        meta,
+        "mark untrusted provenance on #{block_id}",
+        Json.Null,
+        fn(tx)
+          Taint.tx_mark_provenance(
+            tx,
+            "vlm_blocks",
+            block_id.bytes,
+            writer,
+            Taint.Untrusted,
+            now
+          ).map_error(fn(e) Table.DecodeKey(reason: Taint.to_text(e)) end)
+        end
+      ).map_error(fn(e) map_taint_error(Taint.LedgerFailure(e)) end)
+      Ok(Unit)
+    end
+  )
+end
 
 ## Default `Modb.Policy.SensitivityPolicy` (`Public` clearance baseline for Tier 1 RLM reads;
 ## Phase 4.1 layers workspace/collection sensitivity rules onto this policy).
