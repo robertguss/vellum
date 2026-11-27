@@ -217,7 +217,13 @@ fn prop_is_relation_target(kind: PropertyKind) : Option(Text)
     Relation(target_db_id: tdb_id, inverse_prop_id: _): Some(tdb_id)
     Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
       options: _
-    ) | Checkbox | Person | Url | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
+    ) | Status(options: _, done_option_ids: _) | Checkbox | Person | Email | FileList | Url | UniqueId(
+      prefix: _
+    ) | Formula(expression: _, format: _) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Rollup(
+      relation_prop_id: _,
+      target_prop_id: _,
+      agg: _
+    ) | AiDerived(
       prompt: _,
       source_prop_ids: _,
       include_row_body: _,
@@ -583,7 +589,7 @@ fn eval_metric_agg(agg: Text, cells: List(CellValue)) : Result((Option(Text), Op
         DateVal(start: dt, end_date: _): Ok((Some(dt.to_iso), None))
         Empty | TextVal(_) | SelectVal(option_id: _) | MultiSelectVal(option_ids: _) | BoolVal(_) | PrincipalVal(
           _
-        ) | UrlVal(_) | RelationVal(row_ids: _): Ok((None, None))
+        ) | FilesVal(attachment_ids: _) | UrlVal(_) | RelationVal(row_ids: _): Ok((None, None))
       end
     "avg":
       var sum_d = 0.0
@@ -595,7 +601,9 @@ fn eval_metric_agg(agg: Text, cells: List(CellValue)) : Result((Option(Text), Op
             count_n += 1
           Empty | TextVal(_) | DateVal(start: _, end_date: _) | SelectVal(option_id: _) | MultiSelectVal(
             option_ids: _
-          ) | BoolVal(_) | PrincipalVal(_) | UrlVal(_) | RelationVal(row_ids: _): Unit
+          ) | BoolVal(_) | PrincipalVal(_) | FilesVal(attachment_ids: _) | UrlVal(_) | RelationVal(
+            row_ids: _
+          ): Unit
         end
       end
       if count_n == 0
@@ -611,6 +619,12 @@ end
 fn metric_format_of_prop(kind: PropertyKind) : Text
   case kind
     Number(format: f): f
+    Formula(expression: _, format: f): if f.empty?: "plain" else: f
+    Rollup(relation_prop_id: _, target_prop_id: _, agg: agg):
+      case agg
+        PercentPerGroup: "percent_fraction"
+        CountAll | CountValues | SumValues | MinValue | MaxValue: "plain"
+      end
     AiDerived(
       prompt: _,
       source_prop_ids: _,
@@ -619,10 +633,13 @@ fn metric_format_of_prop(kind: PropertyKind) : Text
       mode: _,
       daily_call_cap: _
     ): f
-    Title | RichText | DateProp(include_time: _) | Select(options: _) | MultiSelect(options: _) | Checkbox | Person | Url | Relation(
+    Title | RichText | DateProp(include_time: _) | Select(options: _) | MultiSelect(options: _) | Status(
+      options: _,
+      done_option_ids: _
+    ) | Checkbox | Person | Email | FileList | Url | UniqueId(prefix: _) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
       target_db_id: _,
       inverse_prop_id: _
-    ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
+    ) | AiDerived(
       prompt: _,
       source_prop_ids: _,
       include_row_body: _,
@@ -1158,7 +1175,7 @@ fn show_collection(req: Api.Request, slug: Text, auth: Option(AuthContext), rf: 
     return Error(Missing(entity: "collection", id: slug))
   end
 
-  (cols, dbs, col, pages) = try Ledger.read_locked(
+  col_payload = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -1185,12 +1202,27 @@ fn show_collection(req: Api.Request, slug: Text, auth: Option(AuthContext), rf: 
       end
       c_list = try permitted_collections(store, a)
       d_list = try permitted_databases(store, a)
-      Ok((c_list, d_list, col, active_pages))
+      Ok(
+        Json.Object({
+          "collections": c_list.to_json,
+          "databases": d_list.to_json,
+          "collection": col.to_json,
+          "pages": active_pages.to_json
+        })
+      )
     end
   )
 
   if Auth.wants_json?(req)
-    return Ok(json_ok(200, Json.Object({"collection": col.to_json, "pages": pages.to_json})))
+    return Ok(
+      json_ok(
+        200,
+        Json.Object({
+          "collection": col_payload.get("collection") or Json.Null,
+          "pages": col_payload.get("pages") or Json.Null
+        })
+      )
+    )
   end
   render_inertia_page(
     req,
@@ -1199,10 +1231,10 @@ fn show_collection(req: Api.Request, slug: Text, auth: Option(AuthContext), rf: 
     env,
     "Workspace/Collection",
     {
-      "collections": cols.to_json,
-      "databases": dbs.to_json,
-      "collection": col.to_json,
-      "pages": pages.to_json
+      "collections": col_payload.get("collections") or Json.Null,
+      "databases": col_payload.get("databases") or Json.Null,
+      "collection": col_payload.get("collection") or Json.Null,
+      "pages": col_payload.get("pages") or Json.Null
     }
   )
 end
@@ -1255,7 +1287,7 @@ fn create_collection(
     at: now
   )
   audit_payload = Json.Object({"collection_id": Json.String(col.id), "slug": Json.String(col.slug)})
-  created = try Ledger.transact_locked(
+  try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -1266,10 +1298,10 @@ fn create_collection(
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "manage_schema", now)
       t2 = try Table.put(t1, Db.collections_table(), col.id, col).map_error(Db.map_table_error)
-      Ok((t2, col))
+      Ok((t2, Unit))
     end
   )
-  Ok(json_ok(201, created.to_json))
+  Ok(json_ok(201, col.to_json))
 end
 
 ## `GET /p/:id` and `GET /api/pages/:id` — Loads page, sorted blocks, anchored Markdown, comments, and attachments.
@@ -1399,69 +1431,67 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
         "untrusted_block_ids": untrusted_block_ids.to_json
       })
       cmt_list = cmt_rows.map(fn(x) x.1 end)
+      att_list = att_rows.map(fn(x) x.1 end)
       secret_hints = ErasureOps.scan_page_secret_hints(store, page, blks, cmt_list)
+      anchored_md = Blocks.to_anchored_markdown(blks)
+      yaml_fm = Blueprints.to_yaml_frontmatter(page, page_bp_opt, page_meta_opt, anchored_md)
 
-      Ok((
-        (c_list, d_list, col, page, blks, cmt_list, att_rows.map(fn(x) x.1 end)),
-        (
-          bps,
-          page_bp_opt,
-          page_meta_opt,
-          page_props,
-          scenarios,
-          page_audit,
-          citation_drifts,
-          explicit_backlinks,
-          semantic_backlinks
-        ),
-        (principals_json, rel_targets_json, metrics_json, taint_provenance_json, secret_hints)
-      ))
-    end
-  )
-
-  (
-    (cols, dbs, col, page, blocks, comments, attachments),
-    (
-      blueprints,
-      page_bp_opt,
-      page_meta_opt,
-      page_proposals,
-      open_scenarios,
-      page_audit,
-      citation_drifts,
-      explicit_backlinks,
-      semantic_backlinks
-    ),
-    (principals_json, rel_targets_json, resolved_metrics_json, taint_provenance_json, secret_hints)
-  ) = page_bundle
-  anchored_md = Blocks.to_anchored_markdown(blocks)
-  yaml_fm = Blueprints.to_yaml_frontmatter(page, page_bp_opt, page_meta_opt, anchored_md)
-  if Auth.wants_json?(req)
-    return Ok(
-      json_ok(
-        200,
+      Ok(
         Json.Object({
-          "page": page.to_json,
+          "collections": c_list.to_json,
+          "databases": d_list.to_json,
           "collection": col.to_json,
-          "blocks": blocks.to_json,
+          "page": page.to_json,
+          "blocks": blks.to_json,
           "anchored_markdown": Json.String(anchored_md),
           "yaml_frontmatter": Json.String(yaml_fm),
-          "comments": comments.to_json,
-          "attachments": attachments.to_json,
-          "blueprints": blueprints.to_json,
+          "comments": cmt_list.to_json,
+          "attachments": att_list.to_json,
+          "blueprints": bps.to_json,
           "page_blueprint": page_bp_opt.to_json,
           "page_meta": page_meta_opt.to_json,
-          "page_proposals": page_proposals.to_json,
+          "page_proposals": page_props.to_json,
           "principals": principals_json,
           "relation_targets": rel_targets_json,
-          "resolved_metrics": resolved_metrics_json,
-          "open_scenarios": open_scenarios.to_json,
+          "resolved_metrics": metrics_json,
+          "open_scenarios": scenarios.to_json,
           "page_audit": page_audit.to_json,
           "citation_drifts": citation_drifts.to_json,
           "explicit_backlinks": explicit_backlinks.to_json,
           "semantic_backlinks": semantic_backlinks.to_json,
           "taint_provenance": taint_provenance_json,
           "secret_hints": Json.Array(secret_hints)
+        })
+      )
+    end
+  )
+
+  if Auth.wants_json?(req)
+    return Ok(
+      json_ok(
+        200,
+        Json.Object({
+          "page": page_bundle.get("page") or Json.Null,
+          "collection": page_bundle.get("collection") or Json.Null,
+          "blocks": page_bundle.get("blocks") or Json.Null,
+          "anchored_markdown": page_bundle.get("anchored_markdown") or Json.Null,
+          "yaml_frontmatter": page_bundle.get("yaml_frontmatter") or Json.Null,
+          "comments": page_bundle.get("comments") or Json.Null,
+          "attachments": page_bundle.get("attachments") or Json.Null,
+          "blueprints": page_bundle.get("blueprints") or Json.Null,
+          "page_blueprint": page_bundle.get("page_blueprint") or Json.Null,
+          "page_meta": page_bundle.get("page_meta") or Json.Null,
+          "page_proposals": page_bundle.get("page_proposals") or Json.Null,
+          "principals": page_bundle.get("principals") or Json.Null,
+          "relation_targets": page_bundle.get("relation_targets") or Json.Null,
+          "resolved_metrics": page_bundle.get("resolved_metrics") or Json.Null,
+          "open_scenarios": page_bundle.get("open_scenarios") or Json.Null,
+          "page_audit": page_bundle.get("page_audit") or Json.Null,
+          "citation_drifts": page_bundle.get("citation_drifts") or Json.Null,
+          "explicit_backlinks": page_bundle.get("explicit_backlinks") or Json.Null,
+          "semantic_backlinks": page_bundle.get("semantic_backlinks") or Json.Null,
+          "taint_provenance": page_bundle.get("taint_provenance") or Json.Null,
+          "secret_hints": page_bundle.get("secret_hints") or Json.Null
         })
       )
     )
@@ -1474,29 +1504,29 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
     env,
     "Workspace/Page",
     {
-      "collections": cols.to_json,
-      "databases": dbs.to_json,
-      "collection": col.to_json,
-      "page": page.to_json,
-      "blocks": blocks.to_json,
-      "anchored_markdown": Json.String(anchored_md),
-      "yaml_frontmatter": Json.String(yaml_fm),
-      "comments": comments.to_json,
-      "attachments": attachments.to_json,
-      "blueprints": blueprints.to_json,
-      "page_blueprint": page_bp_opt.to_json,
-      "page_meta": page_meta_opt.to_json,
-      "page_proposals": page_proposals.to_json,
-      "principals": principals_json,
-      "relation_targets": rel_targets_json,
-      "resolved_metrics": resolved_metrics_json,
-      "open_scenarios": open_scenarios.to_json,
-      "page_audit": page_audit.to_json,
-      "citation_drifts": citation_drifts.to_json,
-      "explicit_backlinks": explicit_backlinks.to_json,
-      "semantic_backlinks": semantic_backlinks.to_json,
-      "taint_provenance": taint_provenance_json,
-      "secret_hints": Json.Array(secret_hints)
+      "collections": page_bundle.get("collections") or Json.Null,
+      "databases": page_bundle.get("databases") or Json.Null,
+      "collection": page_bundle.get("collection") or Json.Null,
+      "page": page_bundle.get("page") or Json.Null,
+      "blocks": page_bundle.get("blocks") or Json.Null,
+      "anchored_markdown": page_bundle.get("anchored_markdown") or Json.Null,
+      "yaml_frontmatter": page_bundle.get("yaml_frontmatter") or Json.Null,
+      "comments": page_bundle.get("comments") or Json.Null,
+      "attachments": page_bundle.get("attachments") or Json.Null,
+      "blueprints": page_bundle.get("blueprints") or Json.Null,
+      "page_blueprint": page_bundle.get("page_blueprint") or Json.Null,
+      "page_meta": page_bundle.get("page_meta") or Json.Null,
+      "page_proposals": page_bundle.get("page_proposals") or Json.Null,
+      "principals": page_bundle.get("principals") or Json.Null,
+      "relation_targets": page_bundle.get("relation_targets") or Json.Null,
+      "resolved_metrics": page_bundle.get("resolved_metrics") or Json.Null,
+      "open_scenarios": page_bundle.get("open_scenarios") or Json.Null,
+      "page_audit": page_bundle.get("page_audit") or Json.Null,
+      "citation_drifts": page_bundle.get("citation_drifts") or Json.Null,
+      "explicit_backlinks": page_bundle.get("explicit_backlinks") or Json.Null,
+      "semantic_backlinks": page_bundle.get("semantic_backlinks") or Json.Null,
+      "taint_provenance": page_bundle.get("taint_provenance") or Json.Null,
+      "secret_hints": page_bundle.get("secret_hints") or Json.Null
     }
   )
 end
@@ -1602,7 +1632,7 @@ fn create_page(
     "collection_id": Json.String(page.collection_id),
     "block_count": Json.int(blocks.size)
   })
-  (saved_page, saved_blocks) = try Ledger.transact_locked(
+  try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -1636,25 +1666,25 @@ fn create_page(
       end
       t2 = try Db.tx_save_page_and_blocks(t1, page, blocks)
       (t3, _jid) = try Jobs.tx_put(t2, job_rec).map_error(Db.map_table_error)
-      Ok((t3, (page, blocks)))
+      Ok((t3, Unit))
     end
   )
 
   page_ev = Json.Object({
-    "page_id": Json.String(saved_page.id),
-    "collection_id": Json.String(saved_page.collection_id),
-    "title": Json.String(saved_page.title),
+    "page_id": Json.String(page.id),
+    "collection_id": Json.String(page.collection_id),
+    "title": Json.String(page.title),
     "actor": Json.String(auth.principal.handle)
   })
   Ok(
     json_ok(
       201,
       Json.Object({
-        "page": saved_page.to_json,
-        "blocks": saved_blocks.to_json,
-        "anchored_markdown": Json.String(Blocks.to_anchored_markdown(saved_blocks))
+        "page": page.to_json,
+        "blocks": blocks.to_json,
+        "anchored_markdown": Json.String(Blocks.to_anchored_markdown(blocks))
       })
-    ).with_sse_publish_json("collection:#{saved_page.collection_id}", "page.created", page_ev)
+    ).with_sse_publish_json("collection:#{page.collection_id}", "page.created", page_ev)
   )
 end
 
@@ -1757,7 +1787,7 @@ fn patch_blocks(
   )
   audit_payload = Json.Object({"page_id": Json.String(id), "op_count": Json.int(input.ops.size)})
 
-  (next_page, next_blocks) = try Ledger.transact_locked(
+  patch_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -1815,14 +1845,25 @@ fn patch_blocks(
       )
       t2 = try Db.tx_save_page_and_blocks(t1, bumped_page, updated_blocks)
       (t3, _jid) = try Jobs.tx_put(t2, idx_job).map_error(Db.map_table_error)
-      Ok((t3, (bumped_page, updated_blocks)))
+      Ok((
+        t3,
+        Json.Object({
+          "page": bumped_page.to_json,
+          "blocks": updated_blocks.to_json,
+          "anchored_markdown": Json.String(Blocks.to_anchored_markdown(updated_blocks)),
+          "collection_id": Json.String(bumped_page.collection_id),
+          "version": Json.int(bumped_page.version)
+        })
+      ))
     end
   )
 
+  p_col_id = patch_json.text_at("collection_id") or ""
+  p_ver = patch_json.int_at("version") or 1
   blocks_ev = Json.Object({
-    "page_id": Json.String(next_page.id),
-    "collection_id": Json.String(next_page.collection_id),
-    "version": Json.int(next_page.version),
+    "page_id": Json.String(id),
+    "collection_id": Json.String(p_col_id),
+    "version": Json.int(p_ver),
     "actor": Json.String(auth.principal.handle),
     "reason": Json.String((input.reason or "update blocks").trim)
   })
@@ -1830,12 +1871,12 @@ fn patch_blocks(
     json_ok(
       200,
       Json.Object({
-        "page": next_page.to_json,
-        "blocks": next_blocks.to_json,
-        "anchored_markdown": Json.String(Blocks.to_anchored_markdown(next_blocks))
+        "page": patch_json.get("page") or Json.Null,
+        "blocks": patch_json.get("blocks") or Json.Null,
+        "anchored_markdown": patch_json.get("anchored_markdown") or Json.Null
       })
-    ).with_sse_publish_json("page:#{next_page.id}", "page.blocks_updated", blocks_ev)
-      .with_sse_publish_json("collection:#{next_page.collection_id}", "page.blocks_updated", blocks_ev)
+    ).with_sse_publish_json("page:#{id}", "page.blocks_updated", blocks_ev)
+      .with_sse_publish_json("collection:#{p_col_id}", "page.blocks_updated", blocks_ev)
   )
 end
 
@@ -1871,7 +1912,7 @@ fn verify_page(req: Api.Request, id: Text, auth: AuthContext, files: Files, cloc
     "verified_by": Json.String(auth.principal.id)
   })
 
-  updated = try Ledger.transact_locked(
+  upd_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -1910,19 +1951,28 @@ fn verify_page(req: Api.Request, id: Text, auth: AuthContext, files: Files, cloc
         version: old_page.version + 1
       )
       t2 = try Table.put(t1, Db.pages_table(), next_p.id, next_p).map_error(Db.map_table_error)
-      Ok((t2, next_p))
+      Ok((
+        t2,
+        Json.Object({
+          "page": next_p.to_json,
+          "collection_id": Json.String(next_p.collection_id),
+          "version": Json.int(next_p.version)
+        })
+      ))
     end
   )
+  v_col_id = upd_json.text_at("collection_id") or ""
+  v_ver = upd_json.int_at("version") or 1
   verify_ev = Json.Object({
-    "page_id": Json.String(updated.id),
-    "collection_id": Json.String(updated.collection_id),
-    "version": Json.int(updated.version),
+    "page_id": Json.String(id),
+    "collection_id": Json.String(v_col_id),
+    "version": Json.int(v_ver),
     "actor": Json.String(auth.principal.handle)
   })
   Ok(
-    json_ok(200, updated.to_json)
-      .with_sse_publish_json("page:#{updated.id}", "page.verified", verify_ev)
-      .with_sse_publish_json("collection:#{updated.collection_id}", "page.verified", verify_ev)
+    json_ok(200, upd_json.get("page") or Json.Null)
+      .with_sse_publish_json("page:#{id}", "page.verified", verify_ev)
+      .with_sse_publish_json("collection:#{v_col_id}", "page.verified", verify_ev)
   )
 end
 
@@ -2002,7 +2052,7 @@ fn create_comment(
   )
   audit_payload = Json.Object({"comment_id": Json.String(cmt.id), "page_id": Json.String(id)})
 
-  (created, col_id) = try Ledger.transact_locked(
+  col_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -2018,17 +2068,18 @@ fn create_comment(
       end
       try Policy.require_collection_access(auth, "comment", page.collection_id)
       t2 = try Table.put(t1, Db.comments_table(), cmt.id, cmt).map_error(Db.map_table_error)
-      Ok((t2, (cmt, page.collection_id)))
+      Ok((t2, Json.Object({"collection_id": Json.String(page.collection_id)})))
     end
   )
+  col_id = col_json.text_at("collection_id") or ""
   cmt_ev = Json.Object({
-    "comment_id": Json.String(created.id),
+    "comment_id": Json.String(cmt.id),
     "page_id": Json.String(id),
     "collection_id": Json.String(col_id),
     "actor": Json.String(auth.principal.handle)
   })
   Ok(
-    json_ok(201, created.to_json)
+    json_ok(201, cmt.to_json)
       .with_sse_publish_json("page:#{id}", "comment.created", cmt_ev)
       .with_sse_publish_json("collection:#{col_id}", "comment.created", cmt_ev)
   )
@@ -2126,7 +2177,7 @@ fn presign_attachment(
     "size_bytes": Json.int(input.size_bytes)
   })
 
-  saved = try Ledger.transact_locked(
+  try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -2144,7 +2195,7 @@ fn presign_attachment(
       end
       try Policy.require_collection_access(auth, upload_action, page.collection_id)
       t2 = try Table.put(t1, Db.attachments_table(), att.id, att).map_error(Db.map_table_error)
-      Ok((t2, att))
+      Ok((t2, Unit))
     end
   )
 
@@ -2152,7 +2203,7 @@ fn presign_attachment(
     json_ok(
       201,
       Json.Object({
-        "attachment": saved.to_json,
+        "attachment": att.to_json,
         "upload_url": Json.String(upload_url),
         "method": Json.String(method_str),
         "required_headers": hdrs_json,
@@ -2560,7 +2611,7 @@ fn mint_agent_token(
     "grant_id": Json.String(grant_id),
     "token_id": Json.String(token_id)
   })
-  (principal, grant, tok) = try Ledger.transact_locked(
+  mint_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -2587,15 +2638,27 @@ fn mint_agent_token(
         token_hash,
         now
       )
-      Ok((t1, (p, g, t)))
+      Ok((
+        t1,
+        Json.Object({
+          "grant_id": Json.String(g.id),
+          "parent_grant_id": g.parent_id.to_json,
+          "principal_handle": Json.String(p.handle),
+          "max_calls": Json.int(g.max_calls),
+          "principal": p.to_json,
+          "grant": g.to_json,
+          "token_id": Json.String(t.id),
+          "token_prefix": Json.String(t.prefix)
+        })
+      ))
     end
   )
 
   mint_ev = Json.Object({
-    "grant_id": Json.String(grant.id),
-    "parent_grant_id": grant.parent_id.to_json,
-    "principal_handle": Json.String(principal.handle),
-    "max_calls": Json.int(grant.max_calls),
+    "grant_id": mint_json.get("grant_id") or Json.Null,
+    "parent_grant_id": mint_json.get("parent_grant_id") or Json.Null,
+    "principal_handle": mint_json.get("principal_handle") or Json.Null,
+    "max_calls": mint_json.get("max_calls") or Json.Null,
     "actor": Json.String(auth.principal.handle)
   })
   Ok(
@@ -2603,10 +2666,10 @@ fn mint_agent_token(
       201,
       Json.Object({
         "raw_token": Json.String(raw_token),
-        "principal": principal.to_json,
-        "grant": grant.to_json,
-        "token_id": Json.String(tok.id),
-        "token_prefix": Json.String(tok.prefix)
+        "principal": mint_json.get("principal") or Json.Null,
+        "grant": mint_json.get("grant") or Json.Null,
+        "token_id": mint_json.get("token_id") or Json.Null,
+        "token_prefix": mint_json.get("token_prefix") or Json.Null
       })
     ).with_sse_publish_json("grants", "grant.minted", mint_ev)
   )
@@ -2634,7 +2697,7 @@ fn revoke_grant(req: Api.Request, id: Text, auth: AuthContext, files: Files, clo
   )
   audit_payload = Json.Object({"grant_id": Json.String(id)})
 
-  (revoked, subtree_ids) = try Ledger.transact_locked(
+  rev_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -2681,23 +2744,33 @@ fn revoke_grant(req: Api.Request, id: Text, auth: AuthContext, files: Files, clo
           )
         end
       end
-      Ok((cur, (rev_g, sub_ids)))
+      Ok((
+        cur,
+        Json.Object({
+          "grant_id": Json.String(rev_g.id),
+          "affected_grant_ids": sub_ids.to_json,
+          "cascaded_count": Json.int(sub_ids.size)
+        })
+      ))
     end
   )
+  rev_gid = rev_json.text_at("grant_id") or id
+  rev_aff = rev_json.get("affected_grant_ids") or Json.Array([])
+  rev_cnt = rev_json.get("cascaded_count") or Json.int(1)
   rev_ev = Json.Object({
-    "grant_id": Json.String(revoked.id),
-    "affected_grant_ids": subtree_ids.to_json,
-    "cascaded_count": Json.int(subtree_ids.size),
+    "grant_id": Json.String(rev_gid),
+    "affected_grant_ids": rev_aff,
+    "cascaded_count": rev_cnt,
     "actor": Json.String(auth.principal.handle)
   })
   Ok(
     json_ok(
       200,
       Json.Object({
-        "revoked_grant_id": Json.String(revoked.id),
+        "revoked_grant_id": Json.String(rev_gid),
         "revoked": Json.Boolean(true),
-        "affected_grant_ids": subtree_ids.to_json,
-        "cascaded_count": Json.int(subtree_ids.size)
+        "affected_grant_ids": rev_aff,
+        "cascaded_count": rev_cnt
       })
     ).with_sse_publish_json("grants", "grant.revoked", rev_ev)
   )
@@ -3766,7 +3839,7 @@ fn set_page_blueprint_meta(
     "blueprint_id": input.blueprint_id.to_json
   })
 
-  (next_page, next_blocks, next_bp_opt, next_meta_opt) = try Ledger.transact_locked(
+  meta_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -3858,31 +3931,38 @@ fn set_page_blueprint_meta(
       )
       t3 = try Db.tx_save_page_and_blocks(t2, bumped_page, out_blocks)
       (t4, _jid) = try Jobs.tx_put(t3, idx_job).map_error(Db.map_table_error)
-      Ok((t4, (bumped_page, out_blocks, bp_opt, pm_opt)))
+      anchored_md = Blocks.to_anchored_markdown(out_blocks)
+      yaml_fm = Blueprints.to_yaml_frontmatter(bumped_page, bp_opt, pm_opt, anchored_md)
+      Ok((
+        t4,
+        Json.Object({
+          "collection_id": Json.String(bumped_page.collection_id),
+          "version": Json.int(bumped_page.version),
+          "body": Json.Object({
+            "page": bumped_page.to_json,
+            "blocks": out_blocks.to_json,
+            "page_blueprint": bp_opt.to_json,
+            "page_meta": pm_opt.to_json,
+            "anchored_markdown": Json.String(anchored_md),
+            "yaml_frontmatter": Json.String(yaml_fm)
+          })
+        })
+      ))
     end
   )
 
-  anchored_md = Blocks.to_anchored_markdown(next_blocks)
-  yaml_fm = Blueprints.to_yaml_frontmatter(next_page, next_bp_opt, next_meta_opt, anchored_md)
+  m_col_id = meta_json.text_at("collection_id") or ""
+  m_ver = meta_json.int_at("version") or 1
   meta_ev = Json.Object({
-    "page_id": Json.String(next_page.id),
-    "collection_id": Json.String(next_page.collection_id),
-    "version": Json.int(next_page.version),
+    "page_id": Json.String(id),
+    "collection_id": Json.String(m_col_id),
+    "version": Json.int(m_ver),
     "actor": Json.String(auth.principal.handle)
   })
   Ok(
-    json_ok(
-      200,
-      Json.Object({
-        "page": next_page.to_json,
-        "blocks": next_blocks.to_json,
-        "page_blueprint": next_bp_opt.to_json,
-        "page_meta": next_meta_opt.to_json,
-        "anchored_markdown": Json.String(anchored_md),
-        "yaml_frontmatter": Json.String(yaml_fm)
-      })
-    ).with_sse_publish_json("page:#{next_page.id}", "page.meta_updated", meta_ev)
-      .with_sse_publish_json("collection:#{next_page.collection_id}", "page.meta_updated", meta_ev)
+    json_ok(200, meta_json.get("body") or Json.Null)
+      .with_sse_publish_json("page:#{id}", "page.meta_updated", meta_ev)
+      .with_sse_publish_json("collection:#{m_col_id}", "page.meta_updated", meta_ev)
   )
 end
 
@@ -3916,7 +3996,7 @@ fn sync_page_markdown(
     "expected_page_version": Json.int(input.expected_page_version)
   })
 
-  (next_page, next_blocks, page_bp_opt, page_meta_opt) = try Ledger.transact_locked(
+  sync_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -3986,30 +4066,37 @@ fn sync_page_markdown(
         )
         None: None
       end
-      Ok((t3, (bumped_page, reconciled, bp_opt, pm_opt)))
+      anchored_md = Blocks.to_anchored_markdown(reconciled)
+      yaml_fm = Blueprints.to_yaml_frontmatter(bumped_page, bp_opt, pm_opt, anchored_md)
+      Ok((
+        t3,
+        Json.Object({
+          "collection_id": Json.String(bumped_page.collection_id),
+          "version": Json.int(bumped_page.version),
+          "body": Json.Object({
+            "page": bumped_page.to_json,
+            "blocks": reconciled.to_json,
+            "anchored_markdown": Json.String(anchored_md),
+            "yaml_frontmatter": Json.String(yaml_fm)
+          })
+        })
+      ))
     end
   )
 
-  anchored_md = Blocks.to_anchored_markdown(next_blocks)
-  yaml_fm = Blueprints.to_yaml_frontmatter(next_page, page_bp_opt, page_meta_opt, anchored_md)
+  s_col_id = sync_json.text_at("collection_id") or ""
+  s_ver = sync_json.int_at("version") or 1
   blocks_ev = Json.Object({
-    "page_id": Json.String(next_page.id),
-    "collection_id": Json.String(next_page.collection_id),
-    "version": Json.int(next_page.version),
+    "page_id": Json.String(id),
+    "collection_id": Json.String(s_col_id),
+    "version": Json.int(s_ver),
     "actor": Json.String(auth.principal.handle),
     "reason": Json.String(reason_opt or "sync markdown")
   })
   Ok(
-    json_ok(
-      200,
-      Json.Object({
-        "page": next_page.to_json,
-        "blocks": next_blocks.to_json,
-        "anchored_markdown": Json.String(anchored_md),
-        "yaml_frontmatter": Json.String(yaml_fm)
-      })
-    ).with_sse_publish_json("page:#{next_page.id}", "page.blocks_updated", blocks_ev)
-      .with_sse_publish_json("collection:#{next_page.collection_id}", "page.blocks_updated", blocks_ev)
+    json_ok(200, sync_json.get("body") or Json.Null)
+      .with_sse_publish_json("page:#{id}", "page.blocks_updated", blocks_ev)
+      .with_sse_publish_json("collection:#{s_col_id}", "page.blocks_updated", blocks_ev)
   )
 end
 

@@ -222,7 +222,13 @@ export interface SelectOption {
   color: SelectOptionColor;
 }
 
-export type RollupAgg = "count_all" | "count_values" | "sum_values" | "min_value" | "max_value";
+export type RollupAgg =
+  | "count_all"
+  | "count_values"
+  | "sum_values"
+  | "min_value"
+  | "max_value"
+  | "percent_per_group";
 
 export type AiOutputKind =
   | "ai_text"
@@ -291,9 +297,18 @@ export type PropertyKind =
   | { date_prop: { include_time: boolean } }
   | { select: { options: SelectOption[] } }
   | { multi_select: { options: SelectOption[] } }
+  | { status: { options: SelectOption[]; done_option_ids: string[] } }
   | "checkbox"
   | "person"
+  | "email"
+  | "file_list"
   | "url"
+  | { unique_id: { prefix: string } }
+  | { formula: { expression: string; format: string } }
+  | "created_time"
+  | "created_by"
+  | "last_edited_time"
+  | "last_edited_by"
   | { relation: { target_db_id: string; inverse_prop_id: string | null } }
   | { rollup: { relation_prop_id: string; target_prop_id: string; agg: RollupAgg } }
   | {
@@ -334,6 +349,7 @@ export type CellValue =
   | { multi_select_val: { option_ids: string[] } }
   | { bool_val: boolean }
   | { principal_val: string[] }
+  | { files_val: { attachment_ids: string[] } }
   | { url_val: string }
   | { relation_val: { row_ids: string[] } };
 

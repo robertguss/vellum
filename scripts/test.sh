@@ -33,6 +33,7 @@ mo check domain/types.mo
 mo check domain/blocks.mo
 mo check domain/policy.mo
 mo check domain/database-model.mo
+mo check domain/formulas.mo
 mo check domain/blueprints.mo
 mo check domain/feed-bridge.mo
 mo check domain/taint-bridge.mo
@@ -72,21 +73,27 @@ mo check tests/phase3a.mo
 mo check tests/phase3b.mo
 mo check tests/phase4.mo
 mo check tests/v3m1.mo
+mo check tests/v3m1b.mo
+mo check tests/unit-database-model.mo
+mo check tests/unit-formulas.mo
+mo check tests/unit-db.mo
+mo check tests/unit-blocks.mo
+mo check tests/unit-packs.mo
+mo check tests/unit-domain-misc.mo
+mo check tests/unit-rlm.mo
+mo check tests/unit-sync-cli.mo
 
 mo test domain/blocks.mo
 mo test domain/policy.mo
-mo test domain/database-model.mo
-mo test domain/blueprints.mo
-mo test domain/packs.mo
-mo test domain/sync.mo
-mo test domain/rlm.mo
-mo test domain/rlm-vm.mo
-mo test domain/garden.mo
-mo test domain/collab.mo
-mo test domain/secrets.mo
 mo test domain/notion-import.mo
-mo test sync.mo
-mo test db.mo
+mo test tests/unit-database-model.mo
+mo test tests/unit-formulas.mo
+mo test tests/unit-db.mo
+mo test tests/unit-blocks.mo
+mo test tests/unit-packs.mo
+mo test tests/unit-domain-misc.mo
+mo test tests/unit-rlm.mo
+mo test tests/unit-sync-cli.mo
 mo test tests/stage1.mo
 mo test tests/stage2.mo
 mo test tests/stage3.mo
@@ -102,5 +109,6 @@ mo test tests/phase3a.mo
 mo test tests/phase3b.mo
 mo test tests/phase4.mo
 mo test tests/v3m1.mo
+mo test tests/v3m1b.mo
 
 echo "All Vellum Stage 1-5 checks, frontend build checks, and tests passed."

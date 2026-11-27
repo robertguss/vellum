@@ -183,7 +183,7 @@ fn sync_snapshot(req: Api.Request, auth: AuthContext, rf: ReadFiles) : Result(
     )
   end
 
-  (txid_val, cols, page_entries) = try Ledger.read_locked(
+  snap_json = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -221,20 +221,17 @@ fn sync_snapshot(req: Api.Request, auth: AuthContext, rf: ReadFiles) : Result(
           )
         end
       end
-      Ok((Modb.txid(store), selected, items))
+      Ok(
+        Json.Object({
+          "txid": Json.int(Modb.txid(store)),
+          "collections": selected.to_json,
+          "pages": Json.Array(items)
+        })
+      )
     end
   )
 
-  Ok(
-    json_ok(
-      200,
-      Json.Object({
-        "txid": Json.int(txid_val),
-        "collections": cols.to_json,
-        "pages": Json.Array(page_entries)
-      })
-    )
-  )
+  Ok(json_ok(200, snap_json))
 end
 
 fn infer_collection_token(

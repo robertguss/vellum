@@ -174,39 +174,3 @@ fn webhook_matches_event?(sub: WebhookSub, event: Text, collection_id: Option(Te
       end
   end
 end
-
-test "Collab claim resources and webhook subscription event/collection matching"
-  assert claim_resource_for_page("pg_1") == "page:pg_1"
-  assert claim_resource_for_block("pg_1", "blk_2") == "page:pg_1:block:blk_2"
-  assert claim_resource_for_row("db_1", "row_3") == "db:db_1:row:row_3"
-
-  t0 = Time.parse("2026-11-26T12:00:00Z") or stop "t0"
-  sub_scoped = WebhookSub(
-    id: "wh_1",
-    workspace_id: "ws_default",
-    collection_id: Some("col_eng"),
-    url: "https://agent.acme.io/hook",
-    secret: "whsec_test",
-    events: ["proposal.opened", "proposal.accepted"],
-    enabled: true,
-    created_by: "usr_1",
-    created_at: t0
-  )
-  assert webhook_matches_event?(sub_scoped, "proposal.opened", Some("col_eng"))
-  assert not webhook_matches_event?(sub_scoped, "proposal.opened", Some("col_other"))
-  assert not webhook_matches_event?(sub_scoped, "page.created", Some("col_eng"))
-  assert not webhook_matches_event?(sub_scoped, "proposal.opened", None)
-
-  sub_wildcard = WebhookSub(
-    id: "wh_2",
-    workspace_id: "ws_default",
-    collection_id: None,
-    url: "https://agent.acme.io/all",
-    secret: "whsec_all",
-    events: ["*"],
-    enabled: false,
-    created_by: "usr_1",
-    created_at: t0
-  )
-  assert not webhook_matches_event?(sub_wildcard, "proposal.opened", Some("col_eng"))
-end
