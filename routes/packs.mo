@@ -33,6 +33,7 @@ use Modb.Grants
 use Modb.Ledger
 use Modb.Table
 use Routes.Auth
+use VaultOps
 
 ## JSON payload for `POST /api/packs`.
 struct CreatePackInput
@@ -251,14 +252,29 @@ fn list_permitted_packs(store: Store, auth: AuthContext) : Result(List(ContextPa
   Ok(out.sort_by(fn(p) p.slug end))
 end
 
-## Builds the grant-filtered `/llms.txt` Layer 1 workspace index directly from `Store`.
+## Builds the grant-filtered `/llms.txt` Layer 1 workspace index directly from `Store`
+## (excluding all `ferpa_restricted` Vault collections).
 fn render_llms_txt_from_store(store: Store, auth: AuthContext) : Result(Text, AppError)
   if auth.principal.suspended or not Policy.action_permitted?(auth, "read")
     return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'read'"))
   end
-  cols = try permitted_collections(store, auth)
-  packs = try list_permitted_packs(store, auth)
-  sums = try list_permitted_summaries(store, auth, None, None)
+  all_policies = try VaultOps.list_vault_policies_json(store)
+  var ferpa_cids = Set.empty
+  for pol in all_policies
+    if pol.text_at("security_tier") == Some("ferpa_restricted")
+      case pol.text_at("collection_id")
+        Some(cid): ferpa_cids = ferpa_cids.add(cid)
+        None: Unit
+      end
+    end
+  end
+  cols = (try permitted_collections(store, auth)).filter(fn(c) not ferpa_cids.has?(c.id) end)
+  packs = (try list_permitted_packs(store, auth)).filter(fn(pk)
+    not pk.collection_ids.any?(fn(cid) ferpa_cids.has?(cid) end)
+  end)
+  sums = (try list_permitted_summaries(store, auth, None, None)).filter(fn(s)
+    not ferpa_cids.has?(s.collection_id)
+  end)
   Ok(Packs.render_llms_txt(cols, packs, sums))
 end
 

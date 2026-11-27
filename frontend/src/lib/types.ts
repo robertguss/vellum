@@ -1076,3 +1076,68 @@ export interface KillAllGrantsResponse {
   revoked_grant_ids: string[];
   reason: string;
 }
+
+export interface DeptGroup {
+  id: string;
+  slug: string;
+  name: string;
+  description: string | null;
+  member_principal_ids: string[];
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface VaultPolicy {
+  collection_id: string;
+  security_tier: "standard" | "ferpa_restricted" | string;
+  allowed_group_ids: string[];
+  allowed_principal_ids: string[];
+  allow_local_ai: boolean;
+  updated_by?: string | null;
+  updated_at?: string | null;
+}
+
+export interface CollectionSecuritySummary {
+  collection_id: string;
+  security_tier: "standard" | "ferpa_restricted" | string;
+  allowed_group_ids: string[];
+  allowed_principal_ids: string[];
+  allow_local_ai: boolean;
+}
+
+export interface FerpaAuditEntry {
+  id: string;
+  at: string;
+  action: string;
+  collection_id: string;
+  resource_kind: string;
+  resource_id: string;
+  principal_id: string;
+  principal_handle: string;
+  grant_id: string;
+  reason: string;
+}
+
+export interface VaultPrincipalSummary {
+  id: string;
+  handle: string;
+  display_name: string;
+  email: string | null;
+  role: WorkspaceRole | string;
+  kind: PrincipalKind | string;
+}
+
+export interface VaultCollectionSummary {
+  id: string;
+  slug: string;
+  name: string;
+}
+
+export interface VaultStatusResponse {
+  groups: DeptGroup[];
+  policies: VaultPolicy[];
+  collections: VaultCollectionSummary[];
+  principals: VaultPrincipalSummary[];
+  recent_audit: FerpaAuditEntry[];
+}

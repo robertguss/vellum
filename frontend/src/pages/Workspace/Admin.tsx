@@ -27,7 +27,9 @@ import type {
   ClaimRecord,
   Collection,
   DatabaseDef,
+  DeptGroup,
   ErasureStatusResponse,
+  FerpaAuditEntry,
   GardenReport,
   GrantTreeResponse,
   KillAllGrantsResponse,
@@ -35,6 +37,8 @@ import type {
   ReplayProposalSummary,
   ReplayStatusResponse,
   TaintStatusResponse,
+  VaultPolicy,
+  VaultStatusResponse,
   WebhookSubPublic,
 } from "../../lib/types";
 
@@ -59,6 +63,7 @@ export default function AdminConsole({
     | "replay"
     | "taint"
     | "erasure"
+    | "vault"
     | "webhooks"
   >("agents");
   const [error, setError] = useState<string | null>(null);
@@ -129,6 +134,24 @@ export default function AdminConsole({
     Array<{ id: string; event: string; detail: string; at: string }>
   >([]);
 
+  // FERPA / Restricted Vault & Department Groups
+  const [vaultStatus, setVaultStatus] = useState<VaultStatusResponse | null>(null);
+  const [vaultLoading, setVaultLoading] = useState(false);
+  const [vaultBusy, setVaultBusy] = useState(false);
+  const [newGroupName, setNewGroupName] = useState("");
+  const [newGroupSlug, setNewGroupSlug] = useState("");
+  const [newGroupDesc, setNewGroupDesc] = useState("");
+  const [newGroupMembers, setNewGroupMembers] = useState<string[]>([]);
+  const [selectedVaultColId, setSelectedVaultColId] = useState<string>("");
+  const [policyTier, setPolicyTier] = useState<"standard" | "ferpa_restricted">("standard");
+  const [policyGroupIds, setPolicyGroupIds] = useState<string[]>([]);
+  const [policyPrincipalIds, setPolicyPrincipalIds] = useState<string[]>([]);
+  const [policyAllowLocalAi, setPolicyAllowLocalAi] = useState(false);
+  const [policyReason, setPolicyReason] = useState("Configure collection security tier");
+  const [vaultAudit, setVaultAudit] = useState<FerpaAuditEntry[]>([]);
+  const [vaultAuditColFilter, setVaultAuditColFilter] = useState("");
+  const [vaultAuditActFilter, setVaultAuditActFilter] = useState("");
+
   // Webhooks
   const [webhooks, setWebhooks] = useState<WebhookSubPublic[]>(initialWebhooks);
   const [whUrl, setWhUrl] = useState("");
@@ -146,6 +169,8 @@ export default function AdminConsole({
       void loadTaintStatus();
     } else if (tab === "erasure") {
       void loadErasureStatus();
+    } else if (tab === "vault") {
+      void loadVaultStatus();
     } else if (tab === "delegation") {
       void loadGrantTree();
       const es = new EventSource("/api/events?scope=grants");
@@ -196,6 +221,138 @@ export default function AdminConsole({
     } finally {
       setGrantTreeLoading(false);
     }
+  }
+
+  function applyPolicyForm(colId: string, status: VaultStatusResponse | null) {
+    setSelectedVaultColId(colId);
+    const pol: VaultPolicy | undefined = status?.policies.find((p) => p.collection_id === colId);
+    setPolicyTier(pol?.security_tier === "ferpa_restricted" ? "ferpa_restricted" : "standard");
+    setPolicyGroupIds(pol?.allowed_group_ids ?? []);
+    setPolicyPrincipalIds(pol?.allowed_principal_ids ?? []);
+    setPolicyAllowLocalAi(Boolean(pol?.allow_local_ai));
+  }
+
+  async function loadVaultStatus(preferredColId?: string) {
+    setVaultLoading(true);
+    try {
+      const res = await apiFetch<VaultStatusResponse>("/api/admin/vault/status");
+      setVaultStatus(res);
+      setVaultAudit(res.recent_audit ?? []);
+      const targetCol =
+        preferredColId ||
+        (res.collections.some((c) => c.id === selectedVaultColId)
+          ? selectedVaultColId
+          : res.collections[0]?.id ?? "");
+      if (targetCol) {
+        applyPolicyForm(targetCol, res);
+      }
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not load FERPA Vault status");
+    } finally {
+      setVaultLoading(false);
+    }
+  }
+
+  async function loadFerpaAudit(colFilter = vaultAuditColFilter, actFilter = vaultAuditActFilter) {
+    setVaultLoading(true);
+    try {
+      const params = new URLSearchParams();
+      if (colFilter.trim()) params.set("collection_id", colFilter.trim());
+      if (actFilter.trim()) params.set("action", actFilter.trim());
+      params.set("limit", "100");
+      const res = await apiFetch<{ entries: FerpaAuditEntry[] }>(
+        `/api/admin/ferpa/audit?${params.toString()}`
+      );
+      setVaultAudit(res.entries ?? []);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not load FERPA read audit logs");
+    } finally {
+      setVaultLoading(false);
+    }
+  }
+
+  async function handleCreateGroup(e: React.FormEvent) {
+    e.preventDefault();
+    if (!newGroupName.trim()) return;
+    setVaultBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await apiFetch<{ group: DeptGroup }>("/api/admin/groups", {
+        method: "POST",
+        body: JSON.stringify({
+          name: newGroupName.trim(),
+          slug: newGroupSlug.trim() || null,
+          description: newGroupDesc.trim() || null,
+          member_principal_ids: newGroupMembers,
+        }),
+      });
+      setNotice(`Created Department Group "${res.group.name}" (${res.group.id})`);
+      setNewGroupName("");
+      setNewGroupSlug("");
+      setNewGroupDesc("");
+      setNewGroupMembers([]);
+      await loadVaultStatus();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not create Department Group");
+    } finally {
+      setVaultBusy(false);
+    }
+  }
+
+  async function handleDeleteGroup(groupId: string) {
+    setVaultBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await apiFetch<{ deleted: boolean; id: string }>(
+        `/api/admin/groups/${encodeURIComponent(groupId)}`,
+        { method: "DELETE" }
+      );
+      setNotice(`Deleted Department Group ${groupId}`);
+      await loadVaultStatus();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not delete Department Group");
+    } finally {
+      setVaultBusy(false);
+    }
+  }
+
+  async function handleSaveCollectionSecurity(e: React.FormEvent) {
+    e.preventDefault();
+    if (!selectedVaultColId) return;
+    setVaultBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await apiFetch<{ policy: VaultPolicy }>(
+        `/api/collections/${encodeURIComponent(selectedVaultColId)}/security`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({
+            security_tier: policyTier,
+            allowed_group_ids: policyGroupIds,
+            allowed_principal_ids: policyPrincipalIds,
+            allow_local_ai: policyAllowLocalAi,
+            reason: policyReason.trim() || null,
+          }),
+        }
+      );
+      setNotice(
+        `Saved security tier "${res.policy.security_tier}" on collection ${res.policy.collection_id}`
+      );
+      await loadVaultStatus(selectedVaultColId);
+    } catch (err) {
+      setError(
+        err instanceof ApiError ? err.message : "Could not update collection security policy"
+      );
+    } finally {
+      setVaultBusy(false);
+    }
+  }
+
+  function toggleId(list: string[], id: string, setList: (next: string[]) => void) {
+    setList(list.includes(id) ? list.filter((x) => x !== id) : [...list, id]);
   }
 
   async function handleRevokeTreeGrant(grantId: string) {
@@ -658,6 +815,7 @@ export default function AdminConsole({
                 ["replay", "Selective Undo", RotateCcw],
                 ["taint", "Taint & Safety", ShieldAlert],
                 ["erasure", "Secret Purge", Flame],
+                ["vault", "FERPA Vault", ShieldCheck],
                 ["webhooks", "Webhooks", Webhook],
               ] as const
             ).map(([key, label, Icon]) => (
@@ -2279,6 +2437,431 @@ export default function AdminConsole({
                       </div>
                     )}
                   </div>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* TAB 9: FERPA / RESTRICTED VAULT, DEPARTMENT GROUPS & AUDIT */}
+        {tab === "vault" && (
+          <div className="space-y-6">
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-stone-200 bg-white p-5">
+              <div>
+                <div className="flex items-center gap-2 text-sm font-semibold text-stone-900">
+                  <ShieldCheck className="h-4 w-4 text-rose-700" />
+                  Opt-In FERPA / Restricted Vault &amp; Department Groups
+                </div>
+                <p className="text-xs text-stone-500 mt-0.5">
+                  Enforces strict Department Group &amp; principal allowlists across pages, DBs,
+                  search, backlinks, MCP, and sync; locks external AI, webhooks, and{" "}
+                  <code className="font-mono">/llms.txt</code>; records hash-chained{" "}
+                  <code className="font-mono">Modb.Ledger</code> read/export audit trails.
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={vaultLoading}
+                onClick={() => void loadVaultStatus()}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-stone-200 bg-stone-50 px-3 py-1.5 text-xs font-medium text-stone-800 hover:bg-stone-100 disabled:opacity-50"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                {vaultLoading ? "Refreshing..." : "Refresh Vault"}
+              </button>
+            </div>
+
+            {vaultStatus && (
+              <>
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                  {/* CARD 1: DEPARTMENT GROUPS */}
+                  <div className="rounded-2xl border border-stone-200 bg-white p-5 space-y-4">
+                    <div>
+                      <h2 className="text-sm font-semibold text-stone-900">Department Groups</h2>
+                      <p className="text-xs text-stone-500">
+                        Manage reusable campus/department access groups referenced by Restricted
+                        Vault collection allowlists.
+                      </p>
+                    </div>
+
+                    {vaultStatus.groups.length === 0 ? (
+                      <p className="text-xs text-stone-400">No Department Groups created yet.</p>
+                    ) : (
+                      <div className="space-y-2.5">
+                        {vaultStatus.groups.map((grp) => (
+                          <div
+                            key={grp.id}
+                            className="rounded-xl border border-stone-200 bg-stone-50/60 p-3 flex items-start justify-between gap-3"
+                          >
+                            <div className="space-y-1">
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs font-semibold text-stone-900">
+                                  {grp.name}
+                                </span>
+                                <span className="rounded bg-stone-200 px-1.5 py-0.5 font-mono text-[10px] text-stone-700">
+                                  {grp.slug}
+                                </span>
+                                <span className="font-mono text-[10px] text-stone-400">
+                                  {grp.id}
+                                </span>
+                              </div>
+                              {grp.description && (
+                                <p className="text-xs text-stone-600">{grp.description}</p>
+                              )}
+                              <div className="flex flex-wrap gap-1 pt-0.5">
+                                {grp.member_principal_ids.length === 0 ? (
+                                  <span className="text-[11px] text-stone-400">No members</span>
+                                ) : (
+                                  grp.member_principal_ids.map((pid) => {
+                                    const pr = vaultStatus.principals.find((p) => p.id === pid);
+                                    return (
+                                      <span
+                                        key={pid}
+                                        className="rounded-full border border-stone-200 bg-white px-2 py-0.5 font-mono text-[10px] text-stone-700"
+                                      >
+                                        {pr ? `@${pr.handle}` : pid}
+                                      </span>
+                                    );
+                                  })
+                                )}
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              disabled={vaultBusy}
+                              onClick={() => void handleDeleteGroup(grp.id)}
+                              className="rounded-lg border border-red-200 bg-red-50 px-2.5 py-1 text-[11px] font-medium text-red-700 hover:bg-red-100 disabled:opacity-50"
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    <form
+                      onSubmit={handleCreateGroup}
+                      className="border-t border-stone-100 pt-4 space-y-3"
+                    >
+                      <div className="text-xs font-semibold text-stone-800">
+                        Create Department Group
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        <input
+                          type="text"
+                          required
+                          value={newGroupName}
+                          onChange={(e) => setNewGroupName(e.target.value)}
+                          placeholder="Group name (e.g. Registrar)"
+                          className="rounded-lg border border-stone-200 px-3 py-1.5 text-xs text-stone-900"
+                        />
+                        <input
+                          type="text"
+                          value={newGroupSlug}
+                          onChange={(e) => setNewGroupSlug(e.target.value)}
+                          placeholder="Slug (optional)"
+                          className="rounded-lg border border-stone-200 px-3 py-1.5 text-xs font-mono text-stone-900"
+                        />
+                      </div>
+                      <input
+                        type="text"
+                        value={newGroupDesc}
+                        onChange={(e) => setNewGroupDesc(e.target.value)}
+                        placeholder="Description (optional)"
+                        className="w-full rounded-lg border border-stone-200 px-3 py-1.5 text-xs text-stone-900"
+                      />
+                      <div className="space-y-1.5">
+                        <div className="text-[11px] font-medium text-stone-600">
+                          Initial Members
+                        </div>
+                        <div className="flex flex-wrap gap-2 max-h-28 overflow-y-auto">
+                          {vaultStatus.principals.map((pr) => (
+                            <label
+                              key={pr.id}
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-stone-200 bg-stone-50 px-2 py-1 text-[11px] text-stone-700"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={newGroupMembers.includes(pr.id)}
+                                onChange={() =>
+                                  toggleId(newGroupMembers, pr.id, setNewGroupMembers)
+                                }
+                              />
+                              <span className="font-mono">@{pr.handle}</span>
+                              <span className="text-stone-400">({pr.role})</span>
+                            </label>
+                          ))}
+                        </div>
+                      </div>
+                      <button
+                        type="submit"
+                        disabled={vaultBusy || !newGroupName.trim()}
+                        className="rounded-lg bg-stone-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-stone-800 disabled:opacity-50"
+                      >
+                        {vaultBusy ? "Saving..." : "Create Group"}
+                      </button>
+                    </form>
+                  </div>
+
+                  {/* CARD 2: COLLECTION SECURITY TIERS */}
+                  <div className="rounded-2xl border border-stone-200 bg-white p-5 space-y-4">
+                    <div>
+                      <h2 className="text-sm font-semibold text-stone-900">
+                        Collection Security Tiers
+                      </h2>
+                      <p className="text-xs text-stone-500">
+                        Configure <code className="font-mono">standard</code> vs{" "}
+                        <code className="font-mono">ferpa_restricted</code> Vault protection and
+                        zero-exfiltration locks per collection.
+                      </p>
+                    </div>
+
+                    <form onSubmit={handleSaveCollectionSecurity} className="space-y-3.5">
+                      <div>
+                        <label className="block text-[11px] font-medium text-stone-600 mb-1">
+                          Collection
+                        </label>
+                        <select
+                          value={selectedVaultColId}
+                          onChange={(e) => applyPolicyForm(e.target.value, vaultStatus)}
+                          className="w-full rounded-lg border border-stone-200 bg-white px-3 py-1.5 text-xs text-stone-900"
+                        >
+                          {vaultStatus.collections.map((c) => {
+                            const pol = vaultStatus.policies.find((p) => p.collection_id === c.id);
+                            const restricted = pol?.security_tier === "ferpa_restricted";
+                            return (
+                              <option key={c.id} value={c.id}>
+                                {c.name} ({c.slug}){restricted ? " [FERPA Restricted]" : ""}
+                              </option>
+                            );
+                          })}
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block text-[11px] font-medium text-stone-600 mb-1">
+                          Security Tier
+                        </label>
+                        <div className="grid grid-cols-2 gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setPolicyTier("standard")}
+                            className={`rounded-xl border px-3 py-2 text-left text-xs ${
+                              policyTier === "standard"
+                                ? "border-stone-900 bg-stone-900 text-white"
+                                : "border-stone-200 bg-white text-stone-700 hover:bg-stone-50"
+                            }`}
+                          >
+                            <div className="font-semibold">Standard</div>
+                            <div className="text-[11px] opacity-80">Normal workspace grants</div>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setPolicyTier("ferpa_restricted")}
+                            className={`rounded-xl border px-3 py-2 text-left text-xs ${
+                              policyTier === "ferpa_restricted"
+                                ? "border-rose-700 bg-rose-700 text-white"
+                                : "border-rose-200 bg-rose-50/50 text-rose-900 hover:bg-rose-50"
+                            }`}
+                          >
+                            <div className="inline-flex items-center gap-1 font-semibold">
+                              <Lock className="h-3 w-3" />
+                              FERPA / Restricted Vault
+                            </div>
+                            <div className="text-[11px] opacity-80">
+                              Allowlist + Zero-Exfil + Read Audit
+                            </div>
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <div className="text-[11px] font-medium text-stone-600">
+                          Allowed Department Groups
+                        </div>
+                        {vaultStatus.groups.length === 0 ? (
+                          <p className="text-[11px] text-stone-400">
+                            Create a Department Group first or allow specific principals below.
+                          </p>
+                        ) : (
+                          <div className="flex flex-wrap gap-2">
+                            {vaultStatus.groups.map((grp) => (
+                              <label
+                                key={grp.id}
+                                className="inline-flex items-center gap-1.5 rounded-lg border border-stone-200 bg-stone-50 px-2 py-1 text-[11px] text-stone-800"
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={policyGroupIds.includes(grp.id)}
+                                  onChange={() =>
+                                    toggleId(policyGroupIds, grp.id, setPolicyGroupIds)
+                                  }
+                                />
+                                <span>{grp.name}</span>
+                              </label>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <div className="text-[11px] font-medium text-stone-600">
+                          Allowed Principals (Direct Exception)
+                        </div>
+                        <div className="flex flex-wrap gap-2 max-h-28 overflow-y-auto">
+                          {vaultStatus.principals.map((pr) => (
+                            <label
+                              key={pr.id}
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-stone-200 bg-stone-50 px-2 py-1 text-[11px] text-stone-800"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={policyPrincipalIds.includes(pr.id)}
+                                onChange={() =>
+                                  toggleId(policyPrincipalIds, pr.id, setPolicyPrincipalIds)
+                                }
+                              />
+                              <span className="font-mono">@{pr.handle}</span>
+                            </label>
+                          ))}
+                        </div>
+                      </div>
+
+                      <label className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50/70 p-2.5 text-xs text-amber-950">
+                        <input
+                          type="checkbox"
+                          className="mt-0.5"
+                          checked={policyAllowLocalAi}
+                          onChange={(e) => setPolicyAllowLocalAi(e.target.checked)}
+                        />
+                        <span>
+                          <span className="font-medium">Allow approved local/campus AI only</span>{" "}
+                          (<code className="font-mono">http://127.0.0.1</code> /{" "}
+                          <code className="font-mono">localhost</code> /{" "}
+                          <code className="font-mono">VELLUM_AI_LOCAL_ONLY=1</code>). External
+                          cloud AI, outbound webhooks, and <code className="font-mono">/llms.txt</code>{" "}
+                          stay hard-blocked.
+                        </span>
+                      </label>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        <input
+                          type="text"
+                          value={policyReason}
+                          onChange={(e) => setPolicyReason(e.target.value)}
+                          placeholder="Ledger audit reason"
+                          className="flex-1 min-w-[180px] rounded-lg border border-stone-200 px-3 py-1.5 text-xs text-stone-900"
+                        />
+                        <button
+                          type="submit"
+                          disabled={vaultBusy || !selectedVaultColId}
+                          className="rounded-lg bg-rose-700 px-3.5 py-1.5 text-xs font-medium text-white hover:bg-rose-800 disabled:opacity-50"
+                        >
+                          {vaultBusy ? "Saving..." : "Save Security Policy"}
+                        </button>
+                      </div>
+                    </form>
+                  </div>
+                </div>
+
+                {/* CARD 3: MODB.LEDGER FERPA READ / EXPORT AUDIT */}
+                <div className="rounded-2xl border border-stone-200 bg-white p-5 space-y-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <h2 className="text-sm font-semibold text-stone-900">
+                        Modb.Ledger FERPA Read &amp; Export Audit
+                      </h2>
+                      <p className="text-xs text-stone-500">
+                        Hash-chained read, DB query, attachment download, and snapshot export events
+                        on <code className="font-mono">ferpa_restricted</code> collections.
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <select
+                        value={vaultAuditColFilter}
+                        onChange={(e) => {
+                          setVaultAuditColFilter(e.target.value);
+                          void loadFerpaAudit(e.target.value, vaultAuditActFilter);
+                        }}
+                        className="rounded-lg border border-stone-200 bg-white px-2.5 py-1 text-xs text-stone-800"
+                      >
+                        <option value="">All collections</option>
+                        {vaultStatus.collections.map((c) => (
+                          <option key={c.id} value={c.id}>
+                            {c.name}
+                          </option>
+                        ))}
+                      </select>
+                      <select
+                        value={vaultAuditActFilter}
+                        onChange={(e) => {
+                          setVaultAuditActFilter(e.target.value);
+                          void loadFerpaAudit(vaultAuditColFilter, e.target.value);
+                        }}
+                        className="rounded-lg border border-stone-200 bg-white px-2.5 py-1 text-xs text-stone-800"
+                      >
+                        <option value="">All actions</option>
+                        <option value="ferpa.page.viewed">ferpa.page.viewed</option>
+                        <option value="ferpa.db_row.viewed">ferpa.db_row.viewed</option>
+                        <option value="ferpa.attachment.downloaded">ferpa.attachment.downloaded</option>
+                        <option value="ferpa.export.requested">ferpa.export.requested</option>
+                      </select>
+                      <button
+                        type="button"
+                        disabled={vaultLoading}
+                        onClick={() => void loadFerpaAudit()}
+                        className="rounded-lg border border-stone-200 bg-stone-50 px-2.5 py-1 text-xs font-medium text-stone-800 hover:bg-stone-100"
+                      >
+                        Filter
+                      </button>
+                    </div>
+                  </div>
+
+                  {vaultAudit.length === 0 ? (
+                    <p className="text-xs text-stone-400">
+                      No FERPA read/export events recorded yet.
+                    </p>
+                  ) : (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left text-xs">
+                        <thead>
+                          <tr className="border-b border-stone-200 text-stone-500">
+                            <th className="py-2 pr-3 font-medium">Timestamp</th>
+                            <th className="py-2 pr-3 font-medium">Action</th>
+                            <th className="py-2 pr-3 font-medium">Collection</th>
+                            <th className="py-2 pr-3 font-medium">Resource</th>
+                            <th className="py-2 pr-3 font-medium">Principal</th>
+                            <th className="py-2 pr-3 font-medium">Grant</th>
+                            <th className="py-2 font-medium">Reason</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-stone-100">
+                          {vaultAudit.map((ev) => (
+                            <tr key={ev.id}>
+                              <td className="py-2 pr-3 font-mono text-[11px] text-stone-500 whitespace-nowrap">
+                                {ev.at}
+                              </td>
+                              <td className="py-2 pr-3 font-mono text-[11px] font-medium text-rose-800 whitespace-nowrap">
+                                {ev.action}
+                              </td>
+                              <td className="py-2 pr-3 font-mono text-[11px] text-stone-700">
+                                {ev.collection_id}
+                              </td>
+                              <td className="py-2 pr-3 font-mono text-[11px] text-stone-700">
+                                {ev.resource_kind}:{ev.resource_id}
+                              </td>
+                              <td className="py-2 pr-3 font-mono text-[11px] text-stone-800">
+                                @{ev.principal_handle}
+                              </td>
+                              <td className="py-2 pr-3 font-mono text-[11px] text-stone-500">
+                                {ev.grant_id}
+                              </td>
+                              <td className="py-2 text-stone-600">{ev.reason}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
                 </div>
               </>
             )}

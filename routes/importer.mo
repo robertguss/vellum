@@ -312,9 +312,7 @@ fn import_notion(
         end
       end
       for (def, host_pg, view_def, rows_and_pages) in prepared_dbs
-        cur = try Table.put(cur, Db.pages_table(), host_pg.id, host_pg).map_error(
-          Db.map_table_error
-        )
+        cur = try Db.tx_put_page_row(cur, host_pg)
         cur = try TaintBridge.tx_mark_provenance(
           cur,
           "vlm_pages",
@@ -323,10 +321,8 @@ fn import_notion(
           "untrusted",
           now
         )
-        cur = try Table.put(cur, Db.databases_table(), def.id, def).map_error(Db.map_table_error)
-        cur = try Table.put(cur, Db.db_views_table(), view_def.id, view_def).map_error(
-          Db.map_table_error
-        )
+        cur = try Db.tx_put_database(cur, def)
+        cur = try Db.tx_put_db_view(cur, view_def)
         for (r, rp) in rows_and_pages
           (next_cur, assigned_cells) = try Db.tx_assign_unique_ids(cur, def, r.cells)
           r_final = DbRow(
@@ -341,8 +337,7 @@ fn import_notion(
             version: r.version
           )
           cur = try Db.tx_put_db_row(next_cur, def, r_final, rp, [])
-          cur = try Table.put(cur, Db.db_row_editors_table(), r_final.id, auth.principal.id)
-            .map_error(Db.map_table_error)
+          cur = try Db.tx_put_db_row_editor(cur, r_final.id, auth.principal.id)
           cur = try TaintBridge.tx_mark_provenance(
             cur,
             "vlm_db_rows",

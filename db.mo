@@ -113,7 +113,30 @@ rlm_view_catalog,
 detect_page_citation_drifts,
 detect_duplicate_contradictions,
 compute_page_backlinks,
-reconstruct_page_from_replay_proposal
+reconstruct_page_from_replay_proposal,
+tx_put_collection,
+tx_put_page_row,
+tx_put_block_row,
+tx_put_comment,
+tx_put_principal,
+tx_put_agent_token,
+tx_put_database,
+tx_put_db_view,
+tx_put_db_row_editor,
+tx_put_proposal,
+tx_put_proposal_comment,
+tx_put_page_meta,
+tx_put_ai_cell_meta,
+tx_put_summary,
+tx_delete_page_row,
+tx_delete_block_row,
+tx_delete_page_meta,
+tx_delete_page_neural_dims,
+tx_delete_summary,
+tx_get_principal,
+tx_get_collection,
+scan_collections,
+scan_principals
 use Domain.Blocks
 use Domain.Blueprints{BlueprintDef, PageBlueprintMeta}
 use Domain.Formulas{FormulaRelatedRow}
@@ -1245,17 +1268,8 @@ fn load_page_blocks(store: Store, page_id: Text) : Result(List(Block), AppError)
 end
 
 fn make_allow_doc(auth: AuthContext) : fn(Text, Text) : Bool
-  allowed_cols = auth.allowed_collections
-  suspended = auth.principal.suspended
   fn(_doc_id, scope)
-    if suspended
-      false
-    else
-      case allowed_cols
-        None: true
-        Some(scopes): scopes.contains?("workspace:*") or scopes.contains?("collection:#{scope}")
-      end
-    end
+    Policy.collection_permitted?(auth, scope)
   end
 end
 
@@ -3691,4 +3705,99 @@ fn rlm_view_catalog(collection_ids: List(Text)) : Views.ViewCatalog
     end
   end
   cat
+end
+
+## Shared typed `Modb.Table` mutation/read wrappers hosted inside `Db` so route modules do not
+## duplicate per-caller `Modb.Table.put_specs` / `delete_specs` monomorphizations.
+
+fn tx_put_collection(tx: WriteTx, col: Collection) : Result(WriteTx, AppError)
+  Table.put(tx, collections_table(), col.id, col).map_error(map_table_error)
+end
+
+fn tx_put_page_row(tx: WriteTx, pg: Page) : Result(WriteTx, AppError)
+  Table.put(tx, pages_table(), pg.id, pg).map_error(map_table_error)
+end
+
+fn tx_put_block_row(tx: WriteTx, blk: Block) : Result(WriteTx, AppError)
+  Table.put(tx, blocks_table(), blk.id, blk).map_error(map_table_error)
+end
+
+fn tx_put_comment(tx: WriteTx, cmt: Comment) : Result(WriteTx, AppError)
+  Table.put(tx, comments_table(), cmt.id, cmt).map_error(map_table_error)
+end
+
+fn tx_put_principal(tx: WriteTx, p: Principal) : Result(WriteTx, AppError)
+  Table.put(tx, principals_table(), p.id, p).map_error(map_table_error)
+end
+
+fn tx_put_agent_token(tx: WriteTx, tok: AgentToken) : Result(WriteTx, AppError)
+  Table.put(tx, agent_tokens_table(), tok.id, tok).map_error(map_table_error)
+end
+
+fn tx_put_database(tx: WriteTx, def: DatabaseDef) : Result(WriteTx, AppError)
+  Table.put(tx, databases_table(), def.id, def).map_error(map_table_error)
+end
+
+fn tx_put_db_view(tx: WriteTx, v: DbViewDef) : Result(WriteTx, AppError)
+  Table.put(tx, db_views_table(), v.id, v).map_error(map_table_error)
+end
+
+fn tx_put_db_row_editor(tx: WriteTx, row_id: Text, editor_id: Text) : Result(WriteTx, AppError)
+  Table.put(tx, db_row_editors_table(), row_id, editor_id).map_error(map_table_error)
+end
+
+fn tx_put_proposal(tx: WriteTx, pm: ProposalMeta) : Result(WriteTx, AppError)
+  Table.put(tx, proposals_table(), pm.id, pm).map_error(map_table_error)
+end
+
+fn tx_put_proposal_comment(tx: WriteTx, pc: ProposalComment) : Result(WriteTx, AppError)
+  Table.put(tx, proposal_comments_table(), pc.id, pc).map_error(map_table_error)
+end
+
+fn tx_put_page_meta(tx: WriteTx, pm: PageBlueprintMeta) : Result(WriteTx, AppError)
+  Table.put(tx, page_meta_table(), pm.page_id, pm).map_error(map_table_error)
+end
+
+fn tx_put_ai_cell_meta(tx: WriteTx, cm: AiCellMeta) : Result(WriteTx, AppError)
+  Table.put(tx, ai_cell_meta_table(), cm.id, cm).map_error(map_table_error)
+end
+
+fn tx_put_summary(tx: WriteTx, s: LivingSummary) : Result(WriteTx, AppError)
+  Table.put(tx, summaries_table(), s.id, s).map_error(map_table_error)
+end
+
+fn tx_delete_page_row(tx: WriteTx, id: Text) : Result(WriteTx, AppError)
+  Table.delete(tx, pages_table(), id).map_error(map_table_error)
+end
+
+fn tx_delete_block_row(tx: WriteTx, id: Text) : Result(WriteTx, AppError)
+  Table.delete(tx, blocks_table(), id).map_error(map_table_error)
+end
+
+fn tx_delete_page_meta(tx: WriteTx, page_id: Text) : Result(WriteTx, AppError)
+  Table.delete(tx, page_meta_table(), page_id).map_error(map_table_error)
+end
+
+fn tx_delete_page_neural_dims(tx: WriteTx, page_id: Text) : Result(WriteTx, AppError)
+  Table.delete(tx, page_neural_dims_table(), page_id).map_error(map_table_error)
+end
+
+fn tx_delete_summary(tx: WriteTx, id: Text) : Result(WriteTx, AppError)
+  Table.delete(tx, summaries_table(), id).map_error(map_table_error)
+end
+
+fn tx_get_principal(tx: WriteTx, id: Text) : Result(Option(Principal), AppError)
+  Table.tx_get(tx, principals_table(), id).map_error(map_table_error)
+end
+
+fn tx_get_collection(tx: WriteTx, id: Text) : Result(Option(Collection), AppError)
+  Table.tx_get(tx, collections_table(), id).map_error(map_table_error)
+end
+
+fn scan_collections(store: Store, limit: Int) : Result(List((Text, Collection)), AppError)
+  Table.scan(store, collections_table(), None, None, limit).map_error(map_table_error)
+end
+
+fn scan_principals(store: Store, limit: Int) : Result(List((Text, Principal)), AppError)
+  Table.scan(store, principals_table(), None, None, limit).map_error(map_table_error)
 end

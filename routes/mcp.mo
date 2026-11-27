@@ -709,9 +709,7 @@ fn handle_mcp_db_create_row(
         version: 1
       )
       t2 = try Db.tx_put_db_row(t_seq, def, row, page, blocks)
-      t2b = try Table.put(t2, Db.db_row_editors_table(), row.id, auth.principal.id).map_error(
-        Db.map_table_error
-      )
+      t2b = try Db.tx_put_db_row_editor(t2, row.id, auth.principal.id)
       (t3, _jid) = try Jobs.tx_put(t2b, idx_job).map_error(Db.map_table_error)
       Ok((t3, (row, page)))
     end
@@ -870,8 +868,7 @@ fn handle_mcp_db_update_row(
         version: old_page.version + 1
       )
       t2 = try Db.tx_put_db_row(t1, def, bumped_row, bumped_page, existing_blocks)
-      t2b = try Table.put(t2, Db.db_row_editors_table(), bumped_row.id, auth.principal.id)
-        .map_error(Db.map_table_error)
+      t2b = try Db.tx_put_db_row_editor(t2, bumped_row.id, auth.principal.id)
       final_idx_job = Jobs.JobRecord(
         id: idx_job.id,
         queue: idx_job.queue,
@@ -1222,9 +1219,7 @@ fn handle_mcp_db_propose_changes(
         Db.map_ledger_error,
         fn(tx)
           t1 = try tx_authorize_if_agent(tx, auth, "propose", now)
-          t2 = try Table.put(t1, Db.proposals_table(), pm_new.id, pm_new).map_error(
-            Db.map_table_error
-          )
+          t2 = try Db.tx_put_proposal(t1, pm_new)
           Ok((t2, pm_new))
         end
       )
@@ -2031,7 +2026,7 @@ fn handle_tool_call(
       Db.map_ledger_error,
       fn(tx)
         t1 = try tx_authorize_if_agent(tx, auth, "propose", now)
-        t2 = try Table.put(t1, Db.proposals_table(), pm.id, pm).map_error(Db.map_table_error)
+        t2 = try Db.tx_put_proposal(t1, pm)
         Ok((t2, pm))
       end
     )
