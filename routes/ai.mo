@@ -34,8 +34,11 @@ build_ai_column_prompts,
 build_steer_prompts,
 build_rlm_subcall_prompts,
 build_rlm_synthesis_prompts,
+build_rlm_tier2_planner_prompts,
 deep_research_outcome_to_json,
 execute_rlm_tier1,
+execute_rlm_tier2,
+execute_deep_research,
 deep_research,
 run_ai_column,
 ai_columns_status,
@@ -62,6 +65,7 @@ use Domain.DatabaseModel{
 }
 use Domain.Policy
 use Domain.Rlm{RlmBlockSlice, RlmDbSlice, RlmTraceStep}
+use Domain.RlmVm
 use Domain.TaintBridge
 use Domain.Types{
   AppError,
@@ -2836,7 +2840,7 @@ fn steer_proposal(
   Ok(resp)
 end
 
-## JSON payload for `POST /api/ai/deep-research` and MCP `vellum.rlm_query` (RLM Tier 1).
+## JSON payload for `POST /api/ai/deep-research` and MCP `vellum.rlm_query` (RLM Tier 1 & Tier 2).
 struct DeepResearchInput
   question: Text
   collection_id: Option(Text)
@@ -2848,9 +2852,12 @@ struct DeepResearchInput
   max_subcalls: Option(Int)
   max_rows_scanned: Option(Int)
   session_id: Option(Text)
+  tier: Option(Text)
+  script: Option(Text)
+  max_depth: Option(Int)
 end
 
-## Structured Tier 1 RLM Deep Research result with inspectable `Modb.Views` trace & `Modb.Taint` state.
+## Structured Tier 1 / Tier 2 RLM Deep Research result with inspectable `Modb.Views` / VM trace & `Modb.Taint` state.
 struct DeepResearchOutcome
   tier: Text
   answer: Text
@@ -2866,6 +2873,11 @@ struct DeepResearchOutcome
   citations: List(Json)
   db_slices: List(RlmDbSlice)
   trace: List(RlmTraceStep)
+  executed_script: Option(Text)
+  depth_used: Int
+  max_depth: Int
+  child_sessions: List(Text)
+  grant_calls_debited: Int
 end
 
 fn rlm_clamp(opt: Option(Int), def_v: Int, lo: Int, hi: Int) : Int
@@ -3433,13 +3445,1315 @@ fn execute_rlm_tier1(
       max_subcalls: max_subcalls,
       citations: rlm_build_citations(slices),
       db_slices: db_slices,
-      trace: trace
+      trace: trace,
+      executed_script: None,
+      depth_used: 1,
+      max_depth: 1,
+      child_sessions: [],
+      grant_calls_debited: 0
     )
   )
 end
 
+## Debits 1 call from an `Agent` grant (`Modb.Grants.tx_authorize`) strictly inside a transaction
+## before invoking an external LLM call; humans pass with 0 debited.
+fn debit_agent_rlm_call(
+  files: Files,
+  auth: AuthContext,
+  reason: Text,
+  now: Time
+) : Result(Int, AppError)
+  if auth.principal.kind != Agent
+    return Ok(0)
+  end
+  meta = Ledger.WriteMeta(
+    principal: auth.principal.handle,
+    action: "rlm.tier2.llm_call",
+    reason: reason,
+    at: now
+  )
+  Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    meta,
+    reason,
+    Json.Object({"grant_id": Json.String(auth.grant_id)}),
+    Db.map_ledger_error,
+    fn(tx)
+      (tg, _g) = try Grants.tx_authorize(tx, auth.grant_id, "read", now).map_error(
+        Db.map_grants_error
+      )
+      Ok((tg, 1))
+    end
+  )
+end
+
+## Formats the Planner LLM prompt that emits a capability-confined Mo Micro-REPL script.
+fn build_rlm_tier2_planner_prompts(
+  question: Text,
+  col_opt: Option(Text),
+  heading_opt: Option(Text),
+  allowed_kinds: List(Text),
+  include_dbs?: Bool,
+  max_pages: Int,
+  max_blocks_per_page: Int,
+  max_subcalls: Int,
+  max_depth: Int
+) : (Text, Text)
+  sys = "You are Vellum Tier 2 RLM Planner. Write ONLY a safe Mo Micro-REPL script wrapped in ```mo ... ``` using ONLY: ws.summaries(col_or_null), ws.search(query, col_or_null), ws.blocks(page_ids, block_kinds, heading_or_null), ws.db_rows(db_ids), llm.ask(prompt, context), rlm.sub(sub_q, sub_script_or_null), and pure helpers len/take/join/map_field/filter_contains/dedup_text/contains/append/concat/str. Variables: let/var, for x in xs ... end, if ... else ... end, return expr. Do NOT use Files, Http, Env, Net, or Os."
+  col_s = col_opt or "null"
+  hd_s = heading_opt or "null"
+  kinds_s = if allowed_kinds.empty?: "[]" else: allowed_kinds.join(", ")
+  usr = "Question: #{question}\nScope collection: #{col_s}\nHeading filter: #{hd_s}\nBlock kinds: #{kinds_s}\nInclude databases: #{if include_dbs?: "true" else: "false"}\nBudgets: max_pages=#{max_pages}, max_blocks_per_page=#{max_blocks_per_page}, max_subcalls=#{max_subcalls}, max_depth=#{max_depth}\nReturn the Mo Micro-REPL script ending with `return answer`."
+  (sys, usr)
+end
+
+fn extract_planned_script(raw: Text) : Text
+  trimmed = raw.trim
+  case Json.decode_strict[Json](trimmed.bytes)
+    Ok(j):
+      case j.text_at("script")
+        Some(sc) if not sc.trim.empty?: return sc.trim
+        Some(_) | None: Unit
+      end
+    Error(_): Unit
+  end
+  parts = trimmed.split("```")
+  if parts.size >= 3
+    body = (parts.get(1) or "").trim
+    body_lines = body.split("\n")
+    first = (body_lines.first or "").trim.ascii_lowercase
+    if first == "mo" or first == "rlm" or first == "script" or first == "vellum"
+      return body_lines.drop(1).join("\n").trim
+    end
+    return body
+  end
+  trimmed
+end
+
+fn rlm_vm_opt_text(v: RlmVm.RlmVal) : Option(Text)
+  case v
+    RlmVm.VNull: None
+    RlmVm.VText(s):
+      c = s.trim
+      if c.empty?: None else: Some(c)
+    RlmVm.VBool(_) | RlmVm.VInt(_) | RlmVm.VList(_) | RlmVm.VRecord(_): None
+  end
+end
+
+fn rlm_vm_text_list(v: RlmVm.RlmVal) : List(Text)
+  case v
+    RlmVm.VList(xs):
+      var out = []
+      for x in xs
+        s = RlmVm.rlm_val_to_text(x).trim
+        if not s.empty?
+          out = out.append(s)
+        end
+      end
+      out
+    RlmVm.VText(s):
+      if s.trim.empty?: [] else: [s.trim]
+    RlmVm.VNull | RlmVm.VBool(_) | RlmVm.VInt(_) | RlmVm.VRecord(_): []
+  end
+end
+
+fn rlm_merge_cids(auth: AuthContext, col_opt: Option(Text), rf: ReadFiles) : Result(
+  (List(Text), List(Text)),
+  AppError
+)
+  rlm_target_collections(rf, auth, col_opt)
+end
+
+struct TaintMerge
+  tainted?: Bool
+  max_sens: Text
+  untrusted_srcs: List(Text)
+end
+
+fn taint_merge_init() : TaintMerge
+  TaintMerge(tainted?: false, max_sens: "public", untrusted_srcs: [])
+end
+
+fn merge_taint_fields(
+  tm: TaintMerge,
+  u_tainted: Bool,
+  sens_label: Text,
+  srcs: List(Text)
+) : TaintMerge
+  var merged = tm.untrusted_srcs
+  for src in srcs
+    if not merged.contains?(src)
+      merged = merged.append(src)
+    end
+  end
+  TaintMerge(
+    tainted?: tm.tainted? or u_tainted,
+    max_sens: RlmVm.max_sensitivity_label(tm.max_sens, sens_label),
+    untrusted_srcs: merged
+  )
+end
+
+fn make_read_delta(
+  val: RlmVm.RlmVal,
+  rows_scanned: Int,
+  views_ops: Int,
+  block_slices: List(RlmBlockSlice),
+  db_slices: List(RlmDbSlice),
+  traces: List(RlmTraceStep),
+  tm: TaintMerge
+) : RlmVm.RlmHostDelta
+  RlmVm.RlmHostDelta(
+    value: val,
+    rows_scanned: rows_scanned,
+    views_ops: views_ops,
+    subcalls_delta: 0,
+    depth_reached: 0,
+    grant_calls_debited: 0,
+    block_slices: block_slices,
+    db_slices: db_slices,
+    trace: traces,
+    child_sessions: [],
+    untrusted_tainted: tm.tainted?,
+    max_sensitivity_read: tm.max_sens,
+    untrusted_sources: tm.untrusted_srcs
+  )
+end
+
+fn rlm_vm_run_summaries(
+  files: Files,
+  auth: AuthContext,
+  sess_id: Text,
+  is_admin: Bool,
+  limits: Views.ReadLimits,
+  default_col_opt: Option(Text),
+  arg_col: RlmVm.RlmVal,
+  now: Time
+) : Result(RlmVm.RlmHostDelta, RlmVm.RlmVmError)
+  eff_col = case rlm_vm_opt_text(arg_col)
+    Some(c): Some(c)
+    None: default_col_opt
+  end
+  (catalog_cids, target_cids) = try rlm_merge_cids(auth, eff_col, files.read_only).map_error(fn(e)
+    RlmVm.HostAppError(err: e)
+  end)
+  cat = Db.rlm_view_catalog(catalog_cids)
+  var out_vals = []
+  var total_rows = 0
+  var total_ops = 0
+  var traces = []
+  var tm = taint_merge_init()
+
+  for cid in target_cids
+    prog = Views.ReadProgram(
+      view: "rlm_summaries:#{cid}",
+      where_clause: None,
+      select: None,
+      group_by: None,
+      aggregates: None,
+      order_by: None,
+      limit: Some(200)
+    )
+    tr = try TaintBridge.run_tainted_read_program_locked(
+      files,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      cat,
+      sess_id,
+      prog,
+      is_admin,
+      limits,
+      now
+    ).map_error(fn(e) RlmVm.HostAppError(err: e) end)
+    res = tr.governed.result
+    total_rows += res.rows_scanned
+    total_ops += res.ops_used
+    tm = merge_taint_fields(
+      tm,
+      tr.session.untrusted_tainted,
+      TaintBridge.sensitivity_label(tr.session.max_sensitivity_read),
+      tr.session.untrusted_sources
+    )
+    traces = traces.append(
+      RlmTraceStep(
+        step: 1,
+        op: "read_program",
+        target: prog.view,
+        detail: "VM ws.summaries scanned #{res.result_count} rows in #{cid}",
+        rows_scanned: res.rows_scanned,
+        ops_used: res.ops_used,
+        result_count: res.result_count,
+        answer_hash: Some(res.answer_hash)
+      )
+    )
+    for r in res.rows
+      out_vals = out_vals.append(
+        RlmVm.VRecord({
+          "entity_kind": RlmVm.VText(r.text_at("entity_kind") or ""),
+          "entity_id": RlmVm.VText(r.text_at("entity_id") or ""),
+          "collection_id": RlmVm.VText(cid),
+          "title": RlmVm.VText(r.text_at("title") or ""),
+          "summary_text": RlmVm.VText(r.text_at("summary_text") or "")
+        })
+      )
+    end
+  end
+
+  Ok(make_read_delta(RlmVm.VList(out_vals), total_rows, total_ops, [], [], traces, tm))
+end
+
+fn rlm_vm_search_vec_setup(
+  rf: ReadFiles,
+  q: Text,
+  env: Env,
+  net: Network
+) : Result((Option(List(Float)), Vec.VecIndex, Option(Float)), AppError)
+  case embed_config(env)
+    None: Ok(
+      (
+        Some(Vec.text_sketch_embedding(q, Db.sketch_vec_dims)),
+        Db.sketch_vec_index(),
+        Some(Db.sketch_min_vec_score)
+      )
+    )
+    Some(ecfg):
+      has_neural = try Ledger.read_locked(
+        rf,
+        Db.ledger_db_path,
+        Db.vellum_schema(),
+        Db.map_ledger_error,
+        fn(db) Db.neural_vec_populated(Ledger.store(db), ecfg.dimensions) end
+      )
+      if has_neural
+        case fetch_embedding(ecfg, q, net)
+          Ok(qv): Ok((Some(qv), Db.neural_vec_index(ecfg.dimensions), Some(ecfg.min_score)))
+          Error(_): Ok(
+            (
+              Some(Vec.text_sketch_embedding(q, Db.sketch_vec_dims)),
+              Db.sketch_vec_index(),
+              Some(Db.sketch_min_vec_score)
+            )
+          )
+        end
+      else
+        Ok(
+          (
+            Some(Vec.text_sketch_embedding(q, Db.sketch_vec_dims)),
+            Db.sketch_vec_index(),
+            Some(Db.sketch_min_vec_score)
+          )
+        )
+      end
+  end
+end
+
+fn rlm_vm_run_search(
+  files: Files,
+  auth: AuthContext,
+  sess_id: Text,
+  is_admin: Bool,
+  default_col_opt: Option(Text),
+  q_val: RlmVm.RlmVal,
+  col_val: RlmVm.RlmVal,
+  env: Env,
+  net: Network,
+  now: Time
+) : Result(RlmVm.RlmHostDelta, RlmVm.RlmVmError)
+  q = RlmVm.rlm_val_to_text(q_val).trim
+  if q.empty?
+    return Ok(RlmVm.plain_delta(RlmVm.VList([])))
+  end
+  eff_col = case rlm_vm_opt_text(col_val)
+    Some(c): Some(c)
+    None: default_col_opt
+  end
+  (_cat_cids, target_cids) = try rlm_merge_cids(auth, eff_col, files.read_only).map_error(fn(e)
+    RlmVm.HostAppError(err: e)
+  end)
+  if target_cids.empty? or not files.read_only.exists?(Db.ledger_db_path)
+    return Ok(RlmVm.plain_delta(RlmVm.VList([])))
+  end
+
+  (qv_opt, vec_idx, min_vec) = try rlm_vm_search_vec_setup(files.read_only, q, env, net).map_error(
+    fn(e) RlmVm.HostAppError(err: e) end
+  )
+
+  var raw_hits = []
+  var tm = taint_merge_init()
+  for cid in target_cids
+    opts = Vec.HybridOptions(
+      limit: 6,
+      prefix_last_term?: true,
+      required_scope: Some(cid),
+      rrf_k: 60,
+      fts_weight: 1.0.to_float,
+      vec_weight: 1.0.to_float,
+      candidate_limit: 18,
+      min_vec_score: min_vec
+    )
+    (hhits, upd_sess) = try TaintBridge.run_tainted_hybrid_search_locked(
+      files,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      sess_id,
+      Db.fts_index(),
+      vec_idx,
+      q,
+      qv_opt,
+      opts,
+      is_admin,
+      now
+    ).map_error(fn(e) RlmVm.HostAppError(err: e) end)
+    tm = merge_taint_fields(
+      tm,
+      upd_sess.untrusted_tainted,
+      TaintBridge.sensitivity_label(upd_sess.max_sensitivity_read),
+      upd_sess.untrusted_sources
+    )
+    for hh in hhits
+      if hh.scope == cid and Policy.collection_permitted?(auth, hh.scope)
+        raw_hits = raw_hits.append(hh)
+      end
+    end
+  end
+
+  sorted_hits = raw_hits.sort_by(fn(h) -h.score end).take(12)
+  out_vals = try Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      ptbl = Db.pages_table()
+      var list_out = []
+      for (i, hh) in sorted_hits.enumerate
+        case try Table.get(store, ptbl, hh.doc_id).map_error(Db.map_table_error)
+          Some(p) if p.archived_at == None and Policy.collection_permitted?(auth, p.collection_id):
+            list_out = list_out.append(
+              RlmVm.VRecord({
+                "page_id": RlmVm.VText(p.id),
+                "collection_id": RlmVm.VText(p.collection_id),
+                "title": RlmVm.VText(p.title),
+                "rank": RlmVm.VInt(i + 1)
+              })
+            )
+          Some(_) | None: Unit
+        end
+      end
+      Ok(list_out)
+    end
+  ).map_error(fn(e) RlmVm.HostAppError(err: e) end)
+
+  tr_step = RlmTraceStep(
+    step: 1,
+    op: "hybrid_search",
+    target: q,
+    detail: "VM ws.search found #{out_vals.size} permitted hits across #{target_cids.size} collections",
+    rows_scanned: out_vals.size,
+    ops_used: target_cids.size,
+    result_count: out_vals.size,
+    answer_hash: None
+  )
+  Ok(make_read_delta(RlmVm.VList(out_vals), out_vals.size, target_cids.size, [], [], [tr_step], tm))
+end
+
+fn rlm_vm_run_blocks(
+  files: Files,
+  auth: AuthContext,
+  sess_id: Text,
+  is_admin: Bool,
+  limits: Views.ReadLimits,
+  catalog_cids: List(Text),
+  keywords: List(Text),
+  page_ids_val: RlmVm.RlmVal,
+  kinds_val: RlmVm.RlmVal,
+  heading_val: RlmVm.RlmVal,
+  default_kinds: List(Text),
+  default_heading: Option(Text),
+  max_blocks_per_page: Int,
+  now: Time
+) : Result(RlmVm.RlmHostDelta, RlmVm.RlmVmError)
+  req_pids = rlm_vm_text_list(page_ids_val)
+  if req_pids.empty? or not files.read_only.exists?(Db.ledger_db_path)
+    return Ok(RlmVm.plain_delta(RlmVm.VList([])))
+  end
+  raw_kinds = rlm_vm_text_list(kinds_val)
+  eff_kinds = if not raw_kinds.empty?
+    Rlm.normalize_block_kinds(Some(raw_kinds))
+  else
+    default_kinds
+  end
+  eff_heading = case rlm_vm_opt_text(heading_val)
+    Some(h): Some(h)
+    None: default_heading
+  end
+  has_heading? = eff_heading != None
+
+  col_pids = try Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      ptbl = Db.pages_table()
+      var by_col = {}
+      var col_order = []
+      for pid in req_pids
+        case try Table.get(store, ptbl, pid).map_error(Db.map_table_error)
+          Some(p) if p.archived_at == None:
+            if not Policy.collection_permitted?(auth, p.collection_id)
+              return Error(
+                Forbidden(reason: "collection '#{p.collection_id}' is not permitted by grant")
+              )
+            end
+            case by_col.get(p.collection_id)
+              Some(xs): by_col = by_col.set(p.collection_id, xs.append(pid))
+              None:
+                col_order = col_order.append(p.collection_id)
+                by_col = by_col.set(p.collection_id, [pid])
+            end
+          Some(_) | None: Unit
+        end
+      end
+      Ok(col_order.map(fn(cid) (cid, by_col.get(cid) or []) end))
+    end
+  ).map_error(fn(e) RlmVm.HostAppError(err: e) end)
+
+  cat = Db.rlm_view_catalog(catalog_cids)
+  var raw_rows = []
+  var total_rows = 0
+  var total_ops = 0
+  var traces = []
+  var tm = taint_merge_init()
+
+  for (cid, pids) in col_pids
+    if not pids.empty?
+      pid_pred = Views.InList(field: "page_id", values: pids.map(fn(x) Json.String(x) end))
+      where_pred = if (not has_heading?) and (not eff_kinds.empty?)
+        Views.And(
+          preds: [
+            pid_pred,
+            Views.InList(field: "kind_tag", values: eff_kinds.map(fn(k) Json.String(k) end))
+          ]
+        )
+      else
+        pid_pred
+      end
+      bprog = Views.ReadProgram(
+        view: "rlm_blocks:#{cid}",
+        where_clause: Some(where_pred),
+        select: None,
+        group_by: None,
+        aggregates: None,
+        order_by: None,
+        limit: Some(200)
+      )
+      btr = try TaintBridge.run_tainted_read_program_locked(
+        files,
+        Db.ledger_db_path,
+        Db.vellum_schema(),
+        cat,
+        sess_id,
+        bprog,
+        is_admin,
+        limits,
+        now
+      ).map_error(fn(e) RlmVm.HostAppError(err: e) end)
+      bres = btr.governed.result
+      total_rows += bres.rows_scanned
+      total_ops += bres.ops_used
+      tm = merge_taint_fields(
+        tm,
+        btr.session.untrusted_tainted,
+        TaintBridge.sensitivity_label(btr.session.max_sensitivity_read),
+        btr.session.untrusted_sources
+      )
+      traces = traces.append(
+        RlmTraceStep(
+          step: 1,
+          op: "read_program",
+          target: bprog.view,
+          detail: "VM ws.blocks sliced #{bres.result_count} candidate blocks across #{pids.size} pages",
+          rows_scanned: bres.rows_scanned,
+          ops_used: bres.ops_used,
+          result_count: bres.result_count,
+          answer_hash: Some(bres.answer_hash)
+        )
+      )
+      for brow in bres.rows
+        raw_rows = raw_rows.append(brow)
+      end
+    end
+  end
+
+  slices = Rlm.slice_block_rows(raw_rows, keywords, eff_heading, eff_kinds, max_blocks_per_page)
+  vals = slices.map(fn(s)
+    hp_s = s.heading_path or ""
+    ex = "[#{s.page_title} §#{s.block_id}] (#{s.kind_tag}) #{Rlm.format_slice_excerpt(s)}"
+    RlmVm.VRecord({
+      "page_id": RlmVm.VText(s.page_id),
+      "page_title": RlmVm.VText(s.page_title),
+      "collection_id": RlmVm.VText(s.collection_id),
+      "block_id": RlmVm.VText(s.block_id),
+      "kind_tag": RlmVm.VText(s.kind_tag),
+      "heading_path": RlmVm.VText(hp_s),
+      "markdown": RlmVm.VText(s.markdown),
+      "excerpt": RlmVm.VText(ex)
+    })
+  end)
+
+  Ok(make_read_delta(RlmVm.VList(vals), total_rows, total_ops, slices, [], traces, tm))
+end
+
+fn rlm_vm_run_db_rows(
+  files: Files,
+  auth: AuthContext,
+  sess_id: Text,
+  is_admin: Bool,
+  limits: Views.ReadLimits,
+  catalog_cids: List(Text),
+  db_ids_val: RlmVm.RlmVal,
+  now: Time
+) : Result(RlmVm.RlmHostDelta, RlmVm.RlmVmError)
+  req_dids = rlm_vm_text_list(db_ids_val)
+  if req_dids.empty? or not files.read_only.exists?(Db.ledger_db_path)
+    return Ok(RlmVm.plain_delta(RlmVm.VList([])))
+  end
+
+  col_dids = try Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      dtbl = Db.databases_table()
+      var by_col = {}
+      var col_order = []
+      for did in req_dids
+        case try Table.get(store, dtbl, did).map_error(Db.map_table_error)
+          Some(d):
+            if not Policy.collection_permitted?(auth, d.collection_id)
+              return Error(
+                Forbidden(reason: "database collection '#{d.collection_id}' is not permitted by grant")
+              )
+            end
+            case by_col.get(d.collection_id)
+              Some(xs): by_col = by_col.set(d.collection_id, xs.append(did))
+              None:
+                col_order = col_order.append(d.collection_id)
+                by_col = by_col.set(d.collection_id, [did])
+            end
+          Some(_) | None: Unit
+        end
+      end
+      Ok(col_order.map(fn(cid) (cid, by_col.get(cid) or []) end))
+    end
+  ).map_error(fn(e) RlmVm.HostAppError(err: e) end)
+
+  cat = Db.rlm_view_catalog(catalog_cids)
+  var db_slices = []
+  var total_rows = 0
+  var total_ops = 0
+  var traces = []
+  var tm = taint_merge_init()
+
+  for (cid, dids) in col_dids
+    if not dids.empty?
+      prog = Views.ReadProgram(
+        view: "rlm_db_rows:#{cid}",
+        where_clause: Some(
+          Views.InList(field: "database_id", values: dids.map(fn(x) Json.String(x) end))
+        ),
+        select: None,
+        group_by: None,
+        aggregates: None,
+        order_by: None,
+        limit: Some(40)
+      )
+      tr = try TaintBridge.run_tainted_read_program_locked(
+        files,
+        Db.ledger_db_path,
+        Db.vellum_schema(),
+        cat,
+        sess_id,
+        prog,
+        is_admin,
+        limits,
+        now
+      ).map_error(fn(e) RlmVm.HostAppError(err: e) end)
+      res = tr.governed.result
+      total_rows += res.rows_scanned
+      total_ops += res.ops_used
+      tm = merge_taint_fields(
+        tm,
+        tr.session.untrusted_tainted,
+        TaintBridge.sensitivity_label(tr.session.max_sensitivity_read),
+        tr.session.untrusted_sources
+      )
+      traces = traces.append(
+        RlmTraceStep(
+          step: 1,
+          op: "read_program",
+          target: prog.view,
+          detail: "VM ws.db_rows sliced #{res.result_count} rows from #{dids.size} databases",
+          rows_scanned: res.rows_scanned,
+          ops_used: res.ops_used,
+          result_count: res.result_count,
+          answer_hash: Some(res.answer_hash)
+        )
+      )
+      for r in res.rows
+        db_slices = db_slices.append(
+          RlmDbSlice(
+            database_id: r.text_at("database_id") or "",
+            database_title: r.text_at("database_title") or "",
+            collection_id: r.text_at("collection_id") or cid,
+            row_id: r.text_at("row_id") or "",
+            page_id: r.text_at("page_id") or "",
+            title: r.text_at("title") or "",
+            cells_summary: r.text_at("cells_summary") or ""
+          )
+        )
+      end
+    end
+  end
+
+  vals = db_slices.map(fn(d)
+    ex = "[DB: #{d.database_title} ##{d.row_id}] #{d.title} — #{d.cells_summary}"
+    RlmVm.VRecord({
+      "database_id": RlmVm.VText(d.database_id),
+      "database_title": RlmVm.VText(d.database_title),
+      "collection_id": RlmVm.VText(d.collection_id),
+      "row_id": RlmVm.VText(d.row_id),
+      "page_id": RlmVm.VText(d.page_id),
+      "title": RlmVm.VText(d.title),
+      "cells_summary": RlmVm.VText(d.cells_summary),
+      "excerpt": RlmVm.VText(ex)
+    })
+  end)
+
+  Ok(make_read_delta(RlmVm.VList(vals), total_rows, total_ops, [], db_slices, traces, tm))
+end
+
+fn rlm_vm_run_llm_ask(
+  cfg: AiConfig,
+  files: Files,
+  auth: AuthContext,
+  depth: Int,
+  prompt_val: RlmVm.RlmVal,
+  ctx_val: RlmVm.RlmVal,
+  net: Network,
+  now: Time
+) : Result(RlmVm.RlmHostDelta, RlmVm.RlmVmError)
+  prompt_txt = RlmVm.rlm_val_to_text(prompt_val).trim
+  ctx_txt = RlmVm.rlm_val_to_text(ctx_val)
+  sys = "You are Vellum RLM Tier 2 sub-agent at recursion depth #{depth}. Answer strictly using the inspected MoDB context provided and preserve every [Title §block_id] and [DB: Title #row_id] citation."
+  usr = if ctx_txt.trim.empty?: prompt_txt else: "#{prompt_txt}\n\nContext:\n#{ctx_txt}"
+
+  debited = try debit_agent_rlm_call(files, auth, "RLM Tier 2 llm.ask at depth #{depth}", now)
+    .map_error(fn(e) RlmVm.HostAppError(err: e) end)
+  http_res = try Http.send(build_llm_request(cfg, sys, usr), net).map_error(fn(e)
+    RlmVm.HostAppError(err: ServerFailed(reason: "RLM Tier 2 llm.ask failed: #{e.to_text}"))
+  end)
+  if http_res.status < 200 or http_res.status >= 300
+    return Error(
+      RlmVm.HostAppError(
+        err: ServerFailed(reason: "RLM Tier 2 llm.ask returned HTTP #{http_res.status}")
+      )
+    )
+  end
+  answer = try extract_llm_text(cfg, http_res.body).map_error(fn(e) RlmVm.HostAppError(err: e) end)
+  tr_step = RlmTraceStep(
+    step: 1,
+    op: "vm_llm_ask",
+    target: cfg.model,
+    detail: "VM llm.ask at depth #{depth} (#{usr.byte_count} bytes context)",
+    rows_scanned: 0,
+    ops_used: 0,
+    result_count: 1,
+    answer_hash: None
+  )
+  Ok(
+    RlmVm.RlmHostDelta(
+      value: RlmVm.VText(answer),
+      rows_scanned: 0,
+      views_ops: 0,
+      subcalls_delta: 1,
+      depth_reached: depth,
+      grant_calls_debited: debited,
+      block_slices: [],
+      db_slices: [],
+      trace: [tr_step],
+      child_sessions: [],
+      untrusted_tainted: false,
+      max_sensitivity_read: "public",
+      untrusted_sources: []
+    )
+  )
+end
+
+struct RlmFrameConfig
+  cfg: AiConfig
+  auth: AuthContext
+  default_col_opt: Option(Text)
+  catalog_cids: List(Text)
+  default_kinds: List(Text)
+  default_heading: Option(Text)
+  include_dbs?: Bool
+  max_pages: Int
+  max_blocks_per_page: Int
+  limits: Views.ReadLimits
+  grant_opt: Option(Text)
+  is_admin?: Bool
+  max_depth: Int
+end
+
+fn rlm_vm_sync_parent_taint(
+  files: Files,
+  parent_sess_id: Text,
+  child_sess_id: Text,
+  child_tainted?: Bool,
+  now: Time
+) : Result(Unit, RlmVm.RlmVmError)
+  if not child_tainted?
+    return Ok(Unit)
+  end
+  already_tainted? = try Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      case try TaintBridge.get_taint_session(Ledger.store(db), parent_sess_id)
+        Some(ps): Ok(ps.untrusted_tainted)
+        None: Ok(false)
+      end
+    end
+  ).map_error(fn(e) RlmVm.HostAppError(err: e) end)
+  if not already_tainted?
+    _upd = try TaintBridge.record_untrusted_read_locked(
+      files,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      parent_sess_id,
+      "rlm_sub:#{child_sess_id}",
+      now
+    ).map_error(fn(e) RlmVm.HostAppError(err: e) end)
+  end
+  Ok(Unit)
+end
+
+fn next_child_session_id(files: Files, base: Text) : Result(Text, RlmVm.RlmVmError)
+  Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      var seq = 1
+      while seq < 64
+        cand = "#{base}:#{seq}"
+        if (try TaintBridge.get_taint_session(store, cand)) is None
+          return Ok(cand)
+        end
+        seq += 1
+      end
+      Ok("#{base}:64")
+    end
+  ).map_error(fn(err) RlmVm.HostAppError(err: err) end)
+end
+
+fn run_rlm_tier2_frame(
+  fcfg: RlmFrameConfig,
+  sess_id: Text,
+  question: Text,
+  script_src: Text,
+  depth: Int,
+  max_subcalls: Int,
+  files: Files,
+  env: Env,
+  net: Network,
+  now: Time
+) : Result(RlmVm.RlmEvalOutcome, AppError)
+  stmts = try RlmVm.parse_script(script_src).map_error(RlmVm.vm_error_to_app_error)
+  try RlmVm.validate_program(stmts).map_error(RlmVm.vm_error_to_app_error)
+  keywords = Rlm.extract_query_keywords(question)
+  vm_limits = RlmVm.default_vm_limits(max_subcalls, fcfg.max_depth)
+
+  host = RlmVm.RlmHostFns(
+    on_summaries: fn(f, col_v)
+      rlm_vm_run_summaries(
+        f,
+        fcfg.auth,
+        sess_id,
+        fcfg.is_admin?,
+        fcfg.limits,
+        fcfg.default_col_opt,
+        col_v,
+        now
+      )
+    end,
+    on_blocks: fn(f, pids_v, kinds_v, hd_v)
+      rlm_vm_run_blocks(
+        f,
+        fcfg.auth,
+        sess_id,
+        fcfg.is_admin?,
+        fcfg.limits,
+        fcfg.catalog_cids,
+        keywords,
+        pids_v,
+        kinds_v,
+        hd_v,
+        fcfg.default_kinds,
+        fcfg.default_heading,
+        fcfg.max_blocks_per_page,
+        now
+      )
+    end,
+    on_db_rows: fn(f, db_ids_v)
+      rlm_vm_run_db_rows(
+        f,
+        fcfg.auth,
+        sess_id,
+        fcfg.is_admin?,
+        fcfg.limits,
+        fcfg.catalog_cids,
+        db_ids_v,
+        now
+      )
+    end,
+    on_search: fn(f, e, nt, qv, cv)
+      rlm_vm_run_search(
+        f,
+        fcfg.auth,
+        sess_id,
+        fcfg.is_admin?,
+        fcfg.default_col_opt,
+        qv,
+        cv,
+        e,
+        nt,
+        now
+      )
+    end,
+    on_llm_ask: fn(f, nt, pv, cv)
+      rlm_vm_run_llm_ask(fcfg.cfg, f, fcfg.auth, depth, pv, cv, nt, now)
+    end,
+    on_rlm_sub: fn(f, e, nt, sub_q_v, sub_script_v, next_depth, rem_subcalls)
+      sub_q = RlmVm.rlm_val_to_text(sub_q_v).trim
+      if sub_q.empty?
+        return Error(RlmVm.TypeMismatch(reason: "rlm.sub requires a non-empty sub-question"))
+      end
+      child_sess_id = try next_child_session_id(f, "#{sess_id}:d#{next_depth}:s#{rem_subcalls}")
+      _forked = try TaintBridge.fork_taint_session_locked(
+        f,
+        Db.ledger_db_path,
+        Db.vellum_schema(),
+        sess_id,
+        child_sess_id,
+        fcfg.auth.principal.id,
+        fcfg.grant_opt,
+        now
+      ).map_error(fn(err) RlmVm.HostAppError(err: err) end)
+
+      child_script = case rlm_vm_opt_text(sub_script_v)
+        Some(sc): sc
+        None: RlmVm.default_tier2_script(
+          sub_q,
+          fcfg.default_col_opt,
+          fcfg.default_heading,
+          fcfg.default_kinds,
+          fcfg.include_dbs?,
+          fcfg.max_pages,
+          fcfg.max_blocks_per_page,
+          rem_subcalls,
+          next_depth,
+          fcfg.max_depth
+        )
+      end
+
+      child_out = try run_rlm_tier2_frame(
+        fcfg,
+        child_sess_id,
+        sub_q,
+        child_script,
+        next_depth,
+        rem_subcalls,
+        f,
+        e,
+        nt,
+        now
+      ).map_error(fn(err) RlmVm.HostAppError(err: err) end)
+
+      try rlm_vm_sync_parent_taint(f, sess_id, child_sess_id, child_out.untrusted_tainted, now)
+      sub_sc = if child_out.subcalls_used > 0: child_out.subcalls_used else: 1
+      sub_trace = [
+        RlmTraceStep(
+          step: 1,
+          op: "rlm_sub",
+          target: child_sess_id,
+          detail: "Forked child depth=#{next_depth} for '#{sub_q}' (#{child_out.block_slices.size} blocks, taint=#{if child_out.untrusted_tainted: "true" else: "false"})",
+          rows_scanned: child_out.rows_scanned,
+          ops_used: child_out.views_ops,
+          result_count: child_out.block_slices.size + child_out.db_slices.size,
+          answer_hash: None
+        )
+      ].concat(child_out.trace)
+
+      Ok(
+        RlmVm.RlmHostDelta(
+          value: child_out.value,
+          rows_scanned: child_out.rows_scanned,
+          views_ops: child_out.views_ops,
+          subcalls_delta: sub_sc,
+          depth_reached: child_out.max_depth_reached,
+          grant_calls_debited: child_out.grant_calls_debited,
+          block_slices: child_out.block_slices,
+          db_slices: child_out.db_slices,
+          trace: sub_trace,
+          child_sessions: [child_sess_id].concat(child_out.child_sessions),
+          untrusted_tainted: child_out.untrusted_tainted,
+          max_sensitivity_read: child_out.max_sensitivity_read,
+          untrusted_sources: child_out.untrusted_sources
+        )
+      )
+    end
+  )
+
+  col_init = case fcfg.default_col_opt
+    Some(c): RlmVm.VText(c)
+    None: RlmVm.VNull
+  end
+  init_vars = {
+    "question": RlmVm.VText(question),
+    "collection_id": col_init,
+    "depth": RlmVm.VInt(depth),
+    "max_depth": RlmVm.VInt(fcfg.max_depth),
+    "max_subcalls": RlmVm.VInt(max_subcalls),
+    "max_pages": RlmVm.VInt(fcfg.max_pages)
+  }
+  RlmVm.eval_program(stmts, init_vars, vm_limits, depth, files, env, net, host).map_error(
+    RlmVm.vm_error_to_app_error
+  )
+end
+
+fn resolve_tier2_root_script(
+  cfg: AiConfig,
+  files: Files,
+  auth: AuthContext,
+  question: Text,
+  script_opt: Option(Text),
+  col_opt: Option(Text),
+  heading_opt: Option(Text),
+  allowed_kinds: List(Text),
+  include_dbs?: Bool,
+  max_pages: Int,
+  max_blocks_per_page: Int,
+  max_subcalls: Int,
+  max_depth: Int,
+  net: Network,
+  now: Time
+) : Result((Text, Int, List(RlmTraceStep)), AppError)
+  case script_opt
+    Some(raw) if not raw.trim.empty?:
+      clean = raw.trim
+      stmts = try RlmVm.parse_script(clean).map_error(RlmVm.vm_error_to_app_error)
+      try RlmVm.validate_program(stmts).map_error(RlmVm.vm_error_to_app_error)
+      step = RlmTraceStep(
+        step: 1,
+        op: "custom_script",
+        target: "mo_micro_repl",
+        detail: "Validated explicit Tier 2 Mo Micro-REPL script (#{clean.byte_count} bytes)",
+        rows_scanned: 0,
+        ops_used: 0,
+        result_count: stmts.size,
+        answer_hash: None
+      )
+      Ok((clean, 0, [step]))
+    Some(_) | None:
+      plan_deb = try debit_agent_rlm_call(
+        files,
+        auth,
+        "RLM Tier 2 Planner script generation",
+        now
+      )
+      (p_sys, p_usr) = build_rlm_tier2_planner_prompts(
+        question,
+        col_opt,
+        heading_opt,
+        allowed_kinds,
+        include_dbs?,
+        max_pages,
+        max_blocks_per_page,
+        max_subcalls,
+        max_depth
+      )
+      p_res = try Http.send(build_llm_request(cfg, p_sys, p_usr), net).map_error(fn(e)
+        ServerFailed(reason: "RLM Tier 2 planner request failed: #{e.to_text}")
+      end)
+      if p_res.status < 200 or p_res.status >= 300
+        return Error(ServerFailed(reason: "RLM Tier 2 planner returned HTTP #{p_res.status}"))
+      end
+      raw_plan = try extract_llm_text(cfg, p_res.body)
+      cand = extract_planned_script(raw_plan)
+      parsed_ok? = case RlmVm.parse_script(cand)
+        Ok(ast):
+          case RlmVm.validate_program(ast)
+            Ok(_): true
+            Error(_): false
+          end
+        Error(_): false
+      end
+      if parsed_ok?
+        step = RlmTraceStep(
+          step: 1,
+          op: "plan_script",
+          target: cfg.model,
+          detail: "Planner emitted valid Mo Micro-REPL script (#{cand.byte_count} bytes)",
+          rows_scanned: 0,
+          ops_used: 0,
+          result_count: 1,
+          answer_hash: None
+        )
+        Ok((cand, plan_deb, [step]))
+      else
+        fallback = RlmVm.default_tier2_script(
+          question,
+          col_opt,
+          heading_opt,
+          allowed_kinds,
+          include_dbs?,
+          max_pages,
+          max_blocks_per_page,
+          max_subcalls,
+          1,
+          max_depth
+        )
+        step = RlmTraceStep(
+          step: 1,
+          op: "plan_fallback",
+          target: "default_tier2_script",
+          detail: "Planner output did not parse/validate cleanly; executing canonical Mo Micro-REPL script",
+          rows_scanned: 0,
+          ops_used: 0,
+          result_count: 1,
+          answer_hash: None
+        )
+        Ok((fallback, plan_deb, [step]))
+      end
+  end
+end
+
+## Executes Tier 2 RLM Deep Research via the capability-confined Mo Micro-REPL VM (`Domain.RlmVm`),
+## monotonic `Modb.Taint` child forks (`rlm.sub`), grant call debits, and tainted hybrid search.
+fn execute_rlm_tier2(
+  auth: AuthContext,
+  input: DeepResearchInput,
+  files: Files,
+  clock: Clock,
+  env: Env,
+  net: Network
+) : Result(DeepResearchOutcome, AppError)
+  if not Policy.action_permitted?(auth, "read")
+    return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'read'"))
+  end
+  q = input.question.trim
+  if q.empty?
+    return Error(BadInput(reason: "question must not be empty"))
+  end
+  cfg = try ai_config(env)
+
+  max_pages = rlm_clamp(input.max_pages, 6, 1, 12)
+  max_b_per_p = rlm_clamp(input.max_blocks_per_page, 6, 1, 15)
+  max_subcalls = rlm_clamp(input.max_subcalls, 3, 0, 12)
+  max_depth = rlm_clamp(input.max_depth, 2, 1, 4)
+  max_rows = rlm_clamp(input.max_rows_scanned, 500, 1, 2000)
+  raw_ops = max_rows * 40
+  max_ops = if raw_ops < 100: 100 else if raw_ops > 20000: 20000 else: raw_ops
+  limits = Views.ReadLimits(max_rows_scanned: max_rows, max_ops: max_ops, max_result_rows: 200)
+  allowed_kinds = Rlm.normalize_block_kinds(input.block_kinds)
+  include_dbs? = input.include_databases != Some(false)
+  now = clock.now
+
+  col_opt = case input.collection_id
+    Some(c) if not c.trim.empty?: Some(c.trim)
+    Some(_) | None: None
+  end
+  heading_opt = case input.heading_contains
+    Some(h) if not h.trim.empty?: Some(h.trim)
+    Some(_) | None: None
+  end
+  (grant_opt, is_admin) = rlm_auth_mode(auth)
+  (catalog_cids, _query_cids) = try rlm_target_collections(files.read_only, auth, col_opt)
+
+  sess_id = case input.session_id
+    Some(raw) if not raw.trim.empty?: "rlm2:#{auth.grant_id}:#{raw.trim}"
+    Some(_) | None: "rlm2:#{auth.grant_id}"
+  end
+  sess = if files.read_only.exists?(Db.ledger_db_path)
+    try TaintBridge.ensure_taint_session_locked(
+      files,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      sess_id,
+      auth.principal.id,
+      grant_opt,
+      now
+    )
+  else
+    return Error(Missing(entity: "collection", id: "none"))
+  end
+
+  (exec_script, plan_deb, pre_trace) = try resolve_tier2_root_script(
+    cfg,
+    files,
+    auth,
+    q,
+    input.script,
+    col_opt,
+    heading_opt,
+    allowed_kinds,
+    include_dbs?,
+    max_pages,
+    max_b_per_p,
+    max_subcalls,
+    max_depth,
+    net,
+    now
+  )
+
+  fcfg = RlmFrameConfig(
+    cfg: cfg,
+    auth: auth,
+    default_col_opt: col_opt,
+    catalog_cids: catalog_cids,
+    default_kinds: allowed_kinds,
+    default_heading: heading_opt,
+    include_dbs?: include_dbs?,
+    max_pages: max_pages,
+    max_blocks_per_page: max_b_per_p,
+    limits: limits,
+    grant_opt: grant_opt,
+    is_admin?: is_admin,
+    max_depth: max_depth
+  )
+
+  vm_out = try run_rlm_tier2_frame(
+    fcfg,
+    sess.id,
+    q,
+    exec_script,
+    1,
+    max_subcalls,
+    files,
+    env,
+    net,
+    now
+  )
+
+  persisted_sess_opt = try Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db) TaintBridge.get_taint_session(Ledger.store(db), sess.id) end
+  )
+  (db_tainted, db_sens, db_srcs) = case persisted_sess_opt
+    Some(ps): (
+      ps.untrusted_tainted,
+      TaintBridge.sensitivity_label(ps.max_sensitivity_read),
+      ps.untrusted_sources
+    )
+    None: (sess.untrusted_tainted, TaintBridge.sensitivity_label(sess.max_sensitivity_read), [])
+  end
+  final_tainted = db_tainted or vm_out.untrusted_tainted
+  final_sens = RlmVm.max_sensitivity_label(db_sens, vm_out.max_sensitivity_read)
+  var final_srcs = db_srcs
+  for s in vm_out.untrusted_sources
+    if not final_srcs.contains?(s)
+      final_srcs = final_srcs.append(s)
+    end
+  end
+
+  var full_trace = pre_trace
+  for st in vm_out.trace
+    full_trace = full_trace.append(
+      RlmTraceStep(
+        step: full_trace.size + 1,
+        op: st.op,
+        target: st.target,
+        detail: st.detail,
+        rows_scanned: st.rows_scanned,
+        ops_used: st.ops_used,
+        result_count: st.result_count,
+        answer_hash: st.answer_hash
+      )
+    )
+  end
+
+  Ok(
+    DeepResearchOutcome(
+      tier: "tier2_micro_repl",
+      answer: RlmVm.rlm_val_to_text(vm_out.value),
+      model: cfg.model,
+      session_id: sess.id,
+      untrusted_tainted: final_tainted,
+      max_sensitivity_read: final_sens,
+      untrusted_sources: final_srcs,
+      rows_scanned: vm_out.rows_scanned,
+      ops_used: vm_out.views_ops + vm_out.vm_ops,
+      subcalls_used: vm_out.subcalls_used,
+      max_subcalls: max_subcalls,
+      citations: rlm_build_citations(vm_out.block_slices),
+      db_slices: vm_out.db_slices,
+      trace: full_trace,
+      executed_script: Some(exec_script),
+      depth_used: vm_out.max_depth_reached,
+      max_depth: max_depth,
+      child_sessions: vm_out.child_sessions,
+      grant_calls_debited: plan_deb + vm_out.grant_calls_debited
+    )
+  )
+end
+
+## Unified dispatcher between Tier 1 (`Modb.Views.ReadProgram`) and Tier 2 (`Domain.RlmVm`).
+fn execute_deep_research(
+  auth: AuthContext,
+  input: DeepResearchInput,
+  files: Files,
+  clock: Clock,
+  env: Env,
+  net: Network
+) : Result(DeepResearchOutcome, AppError)
+  tier_norm = case input.tier
+    Some(t): t.trim.ascii_lowercase
+    None:
+      case input.script
+        Some(sc) if not sc.trim.empty?: "tier2"
+        Some(_) | None: "tier1"
+      end
+  end
+  if tier_norm.empty? or tier_norm == "tier1" or tier_norm == "tier1_read_program"
+    execute_rlm_tier1(auth, input, files, clock, env, net)
+  else if tier_norm == "tier2" or tier_norm == "tier2_micro_repl"
+    execute_rlm_tier2(auth, input, files, clock, env, net)
+  else
+    Error(BadInput(reason: "tier must be 'tier1' or 'tier2'"))
+  end
+end
+
 ## Serializes `DeepResearchOutcome` into the canonical JSON API & MCP structuredContent shape.
 fn deep_research_outcome_to_json(out: DeepResearchOutcome) : Json
+  exec_sc_json = case out.executed_script
+    Some(s): Json.String(s)
+    None: Json.Null
+  end
   Json.Object({
     "tier": Json.String(out.tier),
     "answer": Json.String(out.answer),
@@ -3452,6 +4766,11 @@ fn deep_research_outcome_to_json(out: DeepResearchOutcome) : Json
     "citations": Json.Array(out.citations),
     "db_slices": out.db_slices.to_json,
     "trace": out.trace.to_json,
+    "executed_script": exec_sc_json,
+    "depth_used": Json.int(out.depth_used),
+    "max_depth": Json.int(out.max_depth),
+    "child_sessions": out.child_sessions.to_json,
+    "grant_calls_debited": Json.int(out.grant_calls_debited),
     "taint": Json.Object({
       "session_id": Json.String(out.session_id),
       "untrusted_tainted": Json.Boolean(out.untrusted_tainted),
@@ -3461,18 +4780,21 @@ fn deep_research_outcome_to_json(out: DeepResearchOutcome) : Json
   })
 end
 
-## `POST /api/ai/deep-research` — Executes Tier 1 RLM Deep Research via sandboxed `Modb.Views.ReadProgram`
-## and returns synthesized findings, block/DB citations, inspectable trace, and `Modb.Taint` state.
+## `POST /api/ai/deep-research` — Executes Tier 1 (`Modb.Views.ReadProgram`) or Tier 2 (`Domain.RlmVm`)
+## RLM Deep Research and returns synthesized findings, citations, trace, and `Modb.Taint` state.
 fn deep_research(
   req: Api.Request,
   auth: AuthContext,
-  input: DeepResearchInput,
+  body: Json,
   files: Files,
   clock: Clock,
   env: Env,
   net: Network
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
-  out = try execute_rlm_tier1(auth, input, files, clock, env, net)
+  input = try Json.decode_strict[DeepResearchInput](body.to_text.bytes).map_error(fn(e)
+    BadInput(reason: "invalid deep-research payload: #{e.to_text}")
+  end)
+  out = try execute_deep_research(auth, input, files, clock, env, net)
   Ok(json_ok(200, deep_research_outcome_to_json(out)))
 end

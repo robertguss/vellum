@@ -630,6 +630,11 @@ export interface DeepResearchResponse {
   citations: AiCitation[];
   db_slices: RlmDbSlice[];
   trace: RlmTraceStep[];
+  executed_script?: string | null;
+  depth_used?: number;
+  max_depth?: number;
+  child_sessions?: string[];
+  grant_calls_debited?: number;
   taint: RlmTaintSummary;
 }
 

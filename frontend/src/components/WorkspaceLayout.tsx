@@ -4,6 +4,7 @@ import {
   BookOpen,
   ChevronDown,
   ChevronRight,
+  Code2,
   Cpu,
   Database as DbIcon,
   Filter,
@@ -98,12 +99,22 @@ export default function WorkspaceLayout({
   const [rlmHeadingContains, setRlmHeadingContains] = useState("");
   const [rlmMaxSubcalls, setRlmMaxSubcalls] = useState<number>(3);
   const [rlmIncludeDbs, setRlmIncludeDbs] = useState(true);
+  const [rlmTier, setRlmTier] = useState<"tier1" | "tier2">("tier1");
+  const [rlmMaxDepth, setRlmMaxDepth] = useState<number>(2);
+  const [rlmScript, setRlmScript] = useState("");
+  const [rlmScriptOpen, setRlmScriptOpen] = useState(false);
+  const [rlmExecutedScript, setRlmExecutedScript] = useState<string | null>(null);
+  const [rlmExecutedScriptOpen, setRlmExecutedScriptOpen] = useState(false);
   const [rlmTelemetry, setRlmTelemetry] = useState<{
     tier: string;
     rowsScanned: number;
     opsUsed: number;
     subcallsUsed: number;
     maxSubcalls: number;
+    depthUsed: number;
+    maxDepth: number;
+    childSessions: string[];
+    grantCallsDebited: number;
     taint: RlmTaintSummary;
   } | null>(null);
   const [rlmTrace, setRlmTrace] = useState<RlmTraceStep[]>([]);
@@ -193,6 +204,7 @@ export default function WorkspaceLayout({
     setRlmTelemetry(null);
     setRlmTrace([]);
     setRlmDbSlices([]);
+    setRlmExecutedScript(null);
     try {
       if (aiMode === "deep") {
         const res = await apiFetch<DeepResearchResponse>("/api/ai/deep-research", {
@@ -205,6 +217,9 @@ export default function WorkspaceLayout({
             heading_contains: rlmHeadingContains.trim() ? rlmHeadingContains.trim() : null,
             include_databases: rlmIncludeDbs,
             max_subcalls: rlmMaxSubcalls,
+            tier: rlmTier,
+            max_depth: rlmTier === "tier2" ? rlmMaxDepth : null,
+            script: rlmTier === "tier2" && rlmScript.trim() ? rlmScript.trim() : null,
           }),
         });
         setAiAnswer(res.answer);
@@ -212,12 +227,17 @@ export default function WorkspaceLayout({
         setAiCitations(res.citations ?? []);
         setRlmDbSlices(res.db_slices ?? []);
         setRlmTrace(res.trace ?? []);
+        setRlmExecutedScript(res.executed_script ?? null);
         setRlmTelemetry({
           tier: res.tier,
           rowsScanned: res.rows_scanned,
           opsUsed: res.ops_used,
           subcallsUsed: res.subcalls_used,
           maxSubcalls: res.max_subcalls,
+          depthUsed: res.depth_used ?? 1,
+          maxDepth: res.max_depth ?? 1,
+          childSessions: res.child_sessions ?? [],
+          grantCallsDebited: res.grant_calls_debited ?? 0,
           taint: res.taint,
         });
       } else {
@@ -689,7 +709,9 @@ export default function WorkspaceLayout({
                 onChange={(e) => setAiQuestion(e.target.value)}
                 placeholder={
                   aiMode === "deep"
-                    ? "Run inspectable RLM Tier 1 ReadProgram slicing across summaries, blocks & DBs..."
+                    ? rlmTier === "tier2"
+                      ? "Run sandboxed Tier 2 Mo Micro-REPL research across summaries, search, blocks, DBs & rlm.sub..."
+                      : "Run inspectable RLM Tier 1 ReadProgram slicing across summaries, blocks & DBs..."
                     : "Ask a question answered strictly from pages you can access..."
                 }
                 className="w-full rounded-xl border border-stone-200 p-3 text-sm focus:border-teal-600 outline-none"
@@ -697,9 +719,35 @@ export default function WorkspaceLayout({
 
               {aiMode === "deep" && (
                 <div className="rounded-xl border border-stone-200 bg-stone-50/70 p-3 space-y-2.5">
-                  <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-stone-500">
-                    <Filter className="h-3 w-3" />
-                    ReadProgram Slice Filters
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-stone-500">
+                      <Filter className="h-3 w-3" />
+                      {rlmTier === "tier2" ? "Tier 2 Mo Micro-REPL" : "ReadProgram Slice Filters"}
+                    </div>
+                    <div className="inline-flex rounded-md border border-stone-200 bg-white p-0.5 text-[10px] font-medium">
+                      <button
+                        type="button"
+                        onClick={() => setRlmTier("tier1")}
+                        className={`rounded px-2 py-0.5 transition ${
+                          rlmTier === "tier1"
+                            ? "bg-indigo-700 text-white"
+                            : "text-stone-500 hover:text-stone-800"
+                        }`}
+                      >
+                        Tier 1 ReadProgram
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setRlmTier("tier2")}
+                        className={`rounded px-2 py-0.5 transition ${
+                          rlmTier === "tier2"
+                            ? "bg-indigo-700 text-white"
+                            : "text-stone-500 hover:text-stone-800"
+                        }`}
+                      >
+                        Tier 2 Micro-REPL
+                      </button>
+                    </div>
                   </div>
                   <div className="flex flex-wrap gap-1.5">
                     {(
@@ -759,6 +807,42 @@ export default function WorkspaceLayout({
                     />
                     Inspect matching relational database rows (`rlm_db_rows`)
                   </label>
+                  {rlmTier === "tier2" && (
+                    <div className="space-y-2 pt-1 border-t border-stone-200/80">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <label className="text-[11px] text-stone-500 shrink-0">Max Depth</label>
+                          <select
+                            value={rlmMaxDepth}
+                            onChange={(e) => setRlmMaxDepth(Number.parseInt(e.target.value, 10))}
+                            className="rounded-lg border border-stone-200 bg-white px-2 py-1 text-xs"
+                          >
+                            <option value={1}>1 (Root VM only)</option>
+                            <option value={2}>2 (Recursive rlm.sub)</option>
+                            <option value={3}>3 (Deep fork)</option>
+                            <option value={4}>4 (Max depth)</option>
+                          </select>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setRlmScriptOpen((prev) => !prev)}
+                          className="inline-flex items-center gap-1 text-[11px] font-medium text-indigo-700 hover:underline"
+                        >
+                          <Code2 className="h-3 w-3" />
+                          {rlmScriptOpen ? "Hide script override" : "Custom Mo script (optional)"}
+                        </button>
+                      </div>
+                      {rlmScriptOpen && (
+                        <textarea
+                          rows={4}
+                          value={rlmScript}
+                          onChange={(e) => setRlmScript(e.target.value)}
+                          placeholder={`let hits = ws.search(question, collection_id)\nlet blks = ws.blocks(map_field(hits, "page_id"), [], null)\nreturn llm.ask("Summarize strictly with citations", join(map_field(blks, "excerpt"), "\\n"))`}
+                          className="w-full rounded-lg border border-stone-200 bg-white p-2 font-mono text-[11px] leading-relaxed outline-none focus:border-indigo-600"
+                        />
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -819,8 +903,15 @@ export default function WorkspaceLayout({
                     <span className="rounded-full border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-[10px] font-medium text-indigo-800">
                       {rlmTelemetry.tier === "tier1_read_program"
                         ? "Tier 1 ReadProgram"
-                        : rlmTelemetry.tier}
+                        : rlmTelemetry.tier === "tier2_micro_repl"
+                          ? "Tier 2 Mo Micro-REPL"
+                          : rlmTelemetry.tier}
                     </span>
+                    {rlmTelemetry.tier === "tier2_micro_repl" && (
+                      <span className="rounded-full border border-purple-200 bg-purple-50 px-2 py-0.5 font-mono text-[10px] text-purple-800">
+                        depth {rlmTelemetry.depthUsed}/{rlmTelemetry.maxDepth}
+                      </span>
+                    )}
                     <span className="rounded-full border border-stone-200 bg-stone-50 px-2 py-0.5 font-mono text-[10px] text-stone-600">
                       {rlmTelemetry.rowsScanned} rows
                     </span>
@@ -830,6 +921,16 @@ export default function WorkspaceLayout({
                     <span className="rounded-full border border-stone-200 bg-stone-50 px-2 py-0.5 font-mono text-[10px] text-stone-600">
                       {rlmTelemetry.subcallsUsed}/{rlmTelemetry.maxSubcalls} sub-calls
                     </span>
+                    {rlmTelemetry.childSessions.length > 0 && (
+                      <span className="rounded-full border border-stone-200 bg-stone-50 px-2 py-0.5 font-mono text-[10px] text-stone-600">
+                        {rlmTelemetry.childSessions.length} child forks
+                      </span>
+                    )}
+                    {rlmTelemetry.grantCallsDebited > 0 && (
+                      <span className="rounded-full border border-stone-200 bg-stone-50 px-2 py-0.5 font-mono text-[10px] text-stone-600">
+                        {rlmTelemetry.grantCallsDebited} grant calls
+                      </span>
+                    )}
                     <span
                       className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium ${
                         rlmTelemetry.taint.untrusted_tainted
@@ -855,6 +956,31 @@ export default function WorkspaceLayout({
                       <div className="mt-2 text-[11px] text-stone-400 font-mono">
                         Model: {aiModel}
                       </div>
+                    )}
+                  </div>
+                )}
+
+                {rlmExecutedScript && (
+                  <div className="rounded-xl border border-stone-200 bg-white overflow-hidden">
+                    <button
+                      type="button"
+                      onClick={() => setRlmExecutedScriptOpen((prev) => !prev)}
+                      className="w-full flex items-center justify-between px-3 py-2 text-xs font-semibold text-stone-700 hover:bg-stone-50 transition"
+                    >
+                      <span className="inline-flex items-center gap-1.5">
+                        <Code2 className="h-3.5 w-3.5 text-indigo-700" />
+                        Executed Mo Micro-REPL Script
+                      </span>
+                      <ChevronDown
+                        className={`h-3.5 w-3.5 transition-transform ${
+                          rlmExecutedScriptOpen ? "rotate-180" : ""
+                        }`}
+                      />
+                    </button>
+                    {rlmExecutedScriptOpen && (
+                      <pre className="border-t border-stone-100 bg-stone-900 p-3 font-mono text-[11px] leading-relaxed text-stone-100 overflow-x-auto">
+                        {rlmExecutedScript}
+                      </pre>
                     )}
                   </div>
                 )}
