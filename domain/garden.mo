@@ -8,7 +8,8 @@ parse_block_citation_ref,
 detect_contradiction_signal,
 verify_github_signature,
 parse_github_pr_webhook,
-build_pr_search_query
+build_pr_search_query,
+extract_text_backlink_refs
 use Crypto
 use Json
 
@@ -231,4 +232,74 @@ fn build_pr_search_query(ev: GithubPrEvent) : Text
     ev.body
   end
   "#{ev.title} #{files_txt} #{body_snip}".trim
+end
+
+fn scan_leading_id_token(raw: Text) : Option(Text)
+  var chars = []
+  for ch in raw.chars
+    if ch.ascii_letter? or ch.ascii_digit? or ch == '_' or ch == '-'
+      chars = chars.append(ch)
+    else
+      break
+    end
+  end
+  if chars.empty?: None else: Some(Text.from_chars(chars))
+end
+
+## Extracts deduplicated `(page_refs, bare_block_ids)` from block markdown links and citation refs.
+fn extract_text_backlink_refs(markdown: Text, citation_refs: List(Text)) : (
+  List(Text),
+  List(Text)
+)
+  var raw_pages = []
+  var bare_bids = []
+
+  if markdown.contains?("[[")
+    for seg in markdown.split("[[").drop(1)
+      if seg.contains?("]]")
+        raw_inner = seg.split("]]").first or ""
+        raw_pages = raw_pages.append(raw_inner.split("|").first or "")
+      end
+    end
+  end
+
+  if markdown.contains?("/p/")
+    for seg in markdown.split("/p/").drop(1)
+      case scan_leading_id_token(seg)
+        Some(tid): raw_pages = raw_pages.append(tid)
+        None: Unit
+      end
+    end
+  end
+
+  for raw_sr in citation_refs
+    sr = raw_sr.trim
+    if sr.starts_with?("/p/")
+      case scan_leading_id_token(sr.drop_prefix("/p/") or "")
+        Some(tid): raw_pages = raw_pages.append(tid)
+        None: Unit
+      end
+    else
+      case parse_block_citation_ref(sr)
+        Some((Some(pg_id), _bid)): raw_pages = raw_pages.append(pg_id)
+        Some((None, bid)):
+          if not bid.empty? and not bare_bids.contains?(bid)
+            bare_bids = bare_bids.append(bid)
+          end
+        None: raw_pages = raw_pages.append(sr)
+      end
+    end
+  end
+
+  var page_refs = []
+  for r in raw_pages
+    c = r.trim
+    if not c.empty? and not c.contains?("|") and not c.contains?(" ") and not c.contains?("\n") and
+      not c.contains?("\r") and
+      not c.contains?("\t") and
+      not page_refs.contains?(c)
+      page_refs = page_refs.append(c)
+    end
+  end
+  (page_refs, bare_bids)
 end

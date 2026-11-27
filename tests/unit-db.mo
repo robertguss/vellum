@@ -5,6 +5,8 @@ use Db{
   blocks_table,
   blueprints_table,
   collections_table,
+  compute_page_backlinks,
+  lookup_backlink_sources,
   databases_table,
   default_collection_id,
   default_workspace_id,
@@ -62,6 +64,7 @@ use Domain.Types{
   AuthorKind,
   Block,
   BlockKind,
+  Citation,
   Collection,
   CollectionWritePolicy,
   Page,
@@ -1658,4 +1661,344 @@ test "RLM Tier 1 Modb.Views catalog enforces grant ViewDenied isolation, TaintSe
     t0
   )
   assert over is Error(BadInput(reason: _))
+end
+
+fn mk_backlink_test_doc(
+  pid: Text,
+  cid: Text,
+  title: Text,
+  t0: Time,
+  arch: Option(Time)
+) : Page
+  Page(
+    id: pid,
+    collection_id: cid,
+    parent_page_id: None,
+    title: title,
+    icon: None,
+    cover_attachment_id: None,
+    kind: Document,
+    sort_order: "a",
+    database_id: None,
+    freshness_ttl_days: None,
+    verified_at: None,
+    verified_by: None,
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: arch,
+    version: 1
+  )
+end
+
+test "vlm_backlink_edges indexes links and citations, filters grants, and cleans up edits and archives"
+  files = Files.in_memory({})
+  schema = vellum_schema()
+  t0 = Time.parse("2026-11-27T12:00:00Z") or stop "t0"
+  t1 = Time.parse("2026-11-27T12:01:00Z") or stop "t1"
+  meta = Ledger.WriteMeta(
+    principal: "@ada",
+    action: "db.backlink_edges",
+    reason: "verify materialized backlink index",
+    at: t0
+  )
+  prov = Provenance(
+    author_id: "usr_ada",
+    author_kind: HumanAuthor,
+    grant_id: None,
+    proposal_id: None,
+    reason: None,
+    citations: [],
+    updated_at: t0
+  )
+  prov_blk_cit = Provenance(
+    author_id: "usr_ada",
+    author_kind: HumanAuthor,
+    grant_id: None,
+    proposal_id: None,
+    reason: None,
+    citations: [
+      Citation(source_kind: "block", source_ref: "blk_bl_tgt", label: "Target Block", excerpt: None)
+    ],
+    updated_at: t0
+  )
+  prov_pg_cit = Provenance(
+    author_id: "usr_ada",
+    author_kind: HumanAuthor,
+    grant_id: None,
+    proposal_id: None,
+    reason: None,
+    citations: [
+      Citation(
+        source_kind: "block",
+        source_ref: "pg_bl_tgt:blk_bl_tgt",
+        label: "Target Page Block",
+        excerpt: None
+      )
+    ],
+    updated_at: t0
+  )
+
+  col_sec = Collection(
+    id: "col_bl_sec",
+    workspace_id: default_workspace_id,
+    slug: "sec-notes",
+    name: "Secret Notes",
+    description: "Restricted collection",
+    icon: None,
+    write_policy: DirectWithAudit,
+    freshness_ttl_days: None,
+    sort_order: "z",
+    archived_at: None
+  )
+
+  pg_tgt = mk_backlink_test_doc("pg_bl_tgt", default_collection_id, "Target Spec", t0, None)
+  blk_tgt = Block(
+    id: "blk_bl_tgt",
+    page_id: pg_tgt.id,
+    parent_block_id: None,
+    rank: "i0001",
+    kind: Paragraph,
+    markdown: "Canonical target paragraph.",
+    provenance: prov,
+    version: 1
+  )
+
+  pg_src_pub = mk_backlink_test_doc(
+    "pg_bl_src_pub",
+    default_collection_id,
+    "Public Source",
+    t0,
+    None
+  )
+  b_wiki = Block(
+    id: "blk_wiki",
+    page_id: pg_src_pub.id,
+    parent_block_id: None,
+    rank: "i0001",
+    kind: Paragraph,
+    markdown: "See [[pg_bl_tgt]] for baseline.",
+    provenance: prov,
+    version: 1
+  )
+  b_titled = Block(
+    id: "blk_titled",
+    page_id: pg_src_pub.id,
+    parent_block_id: None,
+    rank: "i0002",
+    kind: Paragraph,
+    markdown: "Continued in [[pg_bl_tgt|Part 2]] below.",
+    provenance: prov,
+    version: 1
+  )
+  b_path = Block(
+    id: "blk_path",
+    page_id: pg_src_pub.id,
+    parent_block_id: None,
+    rank: "i0003",
+    kind: Paragraph,
+    markdown: "Open [spec](/p/pg_bl_tgt) directly.",
+    provenance: prov,
+    version: 1
+  )
+  b_plink = Block(
+    id: "blk_plink",
+    page_id: pg_src_pub.id,
+    parent_block_id: None,
+    rank: "i0004",
+    kind: PageLink(target_page_id: pg_tgt.id),
+    markdown: "Target Link",
+    provenance: prov,
+    version: 1
+  )
+  b_cit_blk = Block(
+    id: "blk_cit_b",
+    page_id: pg_src_pub.id,
+    parent_block_id: None,
+    rank: "i0005",
+    kind: Paragraph,
+    markdown: "Citing block ref.",
+    provenance: prov_blk_cit,
+    version: 1
+  )
+  b_cit_pg = Block(
+    id: "blk_cit_p",
+    page_id: pg_src_pub.id,
+    parent_block_id: None,
+    rank: "i0006",
+    kind: Paragraph,
+    markdown: "Citing page:block ref.",
+    provenance: prov_pg_cit,
+    version: 1
+  )
+
+  pg_src_arch = mk_backlink_test_doc(
+    "pg_bl_src_arch",
+    default_collection_id,
+    "Archivable Source",
+    t0,
+    None
+  )
+  b_arch_src = Block(
+    id: "blk_arch_src",
+    page_id: pg_src_arch.id,
+    parent_block_id: None,
+    rank: "i0001",
+    kind: Paragraph,
+    markdown: "Ref [[pg_bl_tgt|Arch Source Link]].",
+    provenance: prov,
+    version: 1
+  )
+
+  pg_src_sec = mk_backlink_test_doc("pg_bl_src_sec", col_sec.id, "Restricted Source", t0, None)
+  b_sec = Block(
+    id: "blk_sec_src",
+    page_id: pg_src_sec.id,
+    parent_block_id: None,
+    rank: "i0001",
+    kind: Paragraph,
+    markdown: "Secret ref [[pg_bl_tgt]].",
+    provenance: prov,
+    version: 1
+  )
+
+  seed = Ledger.transact_locked(
+    files,
+    ledger_db_path,
+    schema,
+    meta,
+    "seed backlink graph",
+    Json.Null,
+    map_ledger_error,
+    fn(tx)
+      t_c = try Table.put(tx, collections_table(), col_sec.id, col_sec).map_error(map_table_error)
+      t_t = try tx_save_page_and_blocks(t_c, pg_tgt, [blk_tgt])
+      t_p = try tx_save_page_and_blocks(
+        t_t,
+        pg_src_pub,
+        [b_wiki, b_titled, b_path, b_plink, b_cit_blk, b_cit_pg]
+      )
+      t_a = try tx_save_page_and_blocks(t_p, pg_src_arch, [b_arch_src])
+      t_s = try tx_save_page_and_blocks(t_a, pg_src_sec, [b_sec])
+      Ok((t_s, Unit))
+    end
+  )
+  assert seed is Ok(Unit)
+
+  ada_p = Principal(
+    id: "usr_ada",
+    kind: Human,
+    handle: "ada",
+    display_name: "Ada",
+    email: Some("ada@example.com"),
+    avatar_url: None,
+    role: Owner,
+    model_id: None,
+    root_grant_id: "gr_root",
+    suspended: false,
+    created_at: t0,
+    last_seen_at: None
+  )
+  scoped_auth = AuthContext(
+    principal: ada_p,
+    grant_id: "gr_scoped",
+    session: None,
+    allowed_collections: Some(["collection:#{default_collection_id}"]),
+    allowed_actions: ["read"]
+  )
+  full_auth = AuthContext(
+    principal: ada_p,
+    grant_id: "gr_root",
+    session: None,
+    allowed_collections: None,
+    allowed_actions: ["read"]
+  )
+
+  chk1 = Ledger.read_locked(
+    files.read_only,
+    ledger_db_path,
+    schema,
+    map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      edges = try lookup_backlink_sources(store, pg_tgt.id)
+      return Error(BadInput(reason: "expected 8 materialized edges")) if edges.size != 8
+
+      (exp_scoped, _s1) = try compute_page_backlinks(store, scoped_auth, pg_tgt, [blk_tgt], 20)
+      if exp_scoped.size != 7
+        return Error(BadInput(reason: "expected 7 scoped explicit backlinks, got #{exp_scoped.size}"))
+      end
+      if exp_scoped.any?(fn(x) x.source_collection_id == col_sec.id end)
+        return Error(BadInput(reason: "restricted collection leaked into scoped backlinks"))
+      end
+
+      (exp_full, _s2) = try compute_page_backlinks(store, full_auth, pg_tgt, [blk_tgt], 20)
+      return Error(BadInput(reason: "expected 8 full explicit backlinks")) if exp_full.size != 8
+      Ok(Unit)
+    end
+  )
+  assert chk1 is Ok(Unit)
+
+  # Edit public source to keep only [[pg_bl_tgt|Part 2]] and archive pg_src_arch -> edges updated
+  pg_src_pub_v2 = Page(
+    id: pg_src_pub.id,
+    collection_id: pg_src_pub.collection_id,
+    parent_page_id: None,
+    title: pg_src_pub.title,
+    icon: None,
+    cover_attachment_id: None,
+    kind: Document,
+    sort_order: "a",
+    database_id: None,
+    freshness_ttl_days: None,
+    verified_at: None,
+    verified_by: None,
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t1,
+    archived_at: None,
+    version: 2
+  )
+  pg_src_arch_v2 = mk_backlink_test_doc(
+    pg_src_arch.id,
+    pg_src_arch.collection_id,
+    pg_src_arch.title,
+    t0,
+    Some(t1)
+  )
+
+  upd = Ledger.transact_locked(
+    files,
+    ledger_db_path,
+    schema,
+    meta,
+    "prune links and archive source",
+    Json.Null,
+    map_ledger_error,
+    fn(tx)
+      t_u1 = try tx_save_page_and_blocks(tx, pg_src_pub_v2, [b_titled])
+      t_u2 = try tx_save_page_and_blocks(t_u1, pg_src_arch_v2, [b_arch_src])
+      Ok((t_u2, Unit))
+    end
+  )
+  assert upd is Ok(Unit)
+
+  chk2 = Ledger.read_locked(
+    files.read_only,
+    ledger_db_path,
+    schema,
+    map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      edges = try lookup_backlink_sources(store, pg_tgt.id)
+      return Error(BadInput(reason: "expected 2 edges after edit+archive")) if edges.size != 2
+      (exp_scoped, _s1) = try compute_page_backlinks(store, scoped_auth, pg_tgt, [blk_tgt], 20)
+      return Error(BadInput(reason: "expected 1 scoped backlink after edit+archive")) if exp_scoped.size != 1
+      return Error(BadInput(reason: "expected blk_titled to remain")) if (exp_scoped.first.map(fn(x) x.block_id end)) != Some(
+        "blk_titled"
+      )
+      Ok(Unit)
+    end
+  )
+  assert chk2 is Ok(Unit)
 end

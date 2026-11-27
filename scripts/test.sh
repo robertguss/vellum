@@ -70,10 +70,13 @@ mo check tests/phase2a.mo
 mo check tests/phase2b.mo
 mo check tests/phase2c.mo
 mo check tests/phase3a.mo
+mo check tests/phase3a2.mo
 mo check tests/phase3b.mo
+mo check tests/phase3b2.mo
 mo check tests/phase4.mo
 mo check tests/v3m1.mo
 mo check tests/v3m1b.mo
+mo check tests/v3m1c.mo
 mo check tests/unit-database-model.mo
 mo check tests/unit-formulas.mo
 mo check tests/unit-db.mo
@@ -106,9 +109,12 @@ mo test tests/phase2a.mo
 mo test tests/phase2b.mo
 mo test tests/phase2c.mo
 mo test tests/phase3a.mo
+mo test tests/phase3a2.mo
 mo test tests/phase3b.mo
+mo test tests/phase3b2.mo
 mo test tests/phase4.mo
 mo test tests/v3m1.mo
 mo test tests/v3m1b.mo
+mo test tests/v3m1c.mo
 
 echo "All Vellum Stage 1-5 checks, frontend build checks, and tests passed."

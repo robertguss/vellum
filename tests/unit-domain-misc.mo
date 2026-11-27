@@ -28,11 +28,17 @@ use Domain.Garden{
   verify_github_signature
 }
 use Domain.NotionImport{
+  NotionCsvImport,
   NotionPageImport,
+  extract_notion_id,
   infer_database_from_csv,
+  infer_page_parent_indices,
   notion_page_title,
   parse_csv,
-  rewrite_notion_links
+  rewrite_notion_links,
+  rewrite_notion_links_and_embeds,
+  select_canonical_csvs,
+  strip_notion_id_suffix
 }
 use Domain.Secrets{finding_to_public_json, redact_tokens, scan_text}
 use Domain.Sync{
@@ -351,4 +357,69 @@ test "NotionImport ID stripping, internal link rewriting, RFC 4180 CSV parsing, 
   assert row0.get("title") == Some(TextVal("API, 502 spike"))
   assert row0.get("cost") == Some(NumberVal("125.50".to_decimal or stop "dec"))
   assert row0.get("resolved") == Some(BoolVal(true))
+
+  # M1.3: extract_notion_id, _all.csv stripping, depth-6 parent inference, CSV dedup, DB embed rewrite, Status/Email inference
+  id1 = "0123456789abcdef0123456789abcdef"
+  id2 = "fedcba9876543210fedcba9876543210"
+  assert extract_notion_id("export/Tasks%20#{id1}_all.csv") == Some(id1)
+  assert strip_notion_id_suffix("export/Tasks%20#{id1}_all.csv") == "Tasks"
+  assert extract_notion_id("plain.md") == None
+
+  nested_pages = [
+    NotionPageImport(path: "L6 #{id1}.md", title: None, markdown: ""),
+    NotionPageImport(path: "Root/L2/L3/L4/L5/L6 #{id1}.md", title: None, markdown: "leaf"),
+    NotionPageImport(path: "Root/L2.md", title: None, markdown: ""),
+    NotionPageImport(path: "Root/L2/L3.md", title: None, markdown: ""),
+    NotionPageImport(path: "Root/L2/L3/L4.md", title: None, markdown: ""),
+    NotionPageImport(path: "Root/L2/L3/L4/L5.md", title: None, markdown: ""),
+    NotionPageImport(path: "Root.md", title: None, markdown: "")
+  ]
+  parents = infer_page_parent_indices(nested_pages)
+  assert parents.get(1) == Some(5)
+  assert parents.get(5) == Some(4)
+  assert parents.get(4) == Some(3)
+  assert parents.get(3) == Some(2)
+  assert parents.get(2) == Some(6)
+  assert parents.get(6) == None
+
+  csv_list = [
+    NotionCsvImport(title: "Tasks #{id1}.csv", csv_text: "Name,Status\nAlpha,Done\n"),
+    NotionCsvImport(
+      title: "Tasks #{id1}_all.csv",
+      csv_text: "\u{FEFF}Name,Status,Owner Email\nAlpha,Done,alpha@acme.io\nBeta,Open,beta@acme.io\n"
+    ),
+    NotionCsvImport(
+      title: "Untitled #{id2}.csv",
+      csv_text: "Name,Status,Owner Email\nAlpha,Done,alpha@acme.io\n"
+    )
+  ]
+  (canon_csvs, skipped_cnt) = select_canonical_csvs(csv_list)
+  assert skipped_cnt == 2
+  assert canon_csvs.size == 1
+  assert (canon_csvs.first or stop "c0").title.contains?("_all.csv")
+
+  parsed_canon = case parse_csv((canon_csvs.first or stop "c0").csv_text)
+    Ok(t): t
+    Error(_m): stop "parsed_canon failed"
+  end
+  inf_canon = case infer_database_from_csv(parsed_canon)
+    Ok(inf): inf
+    Error(_m): stop "infer_canon failed"
+  end
+  assert inf_canon.properties.size == 3
+  st_ok = if (inf_canon.properties.get(1) or stop "p1").kind is Status(
+    options: _,
+    done_option_ids: dids
+  )
+    dids.contains?("done")
+  else
+    false
+  end
+  assert st_ok
+  assert (inf_canon.properties.get(2) or stop "p2").kind == Email
+
+  emb_md = "# Hub\n\n[Tasks](Tasks%20#{id1}.csv)\n\n[Sub](Subpage%20#{id2}.md)"
+  rewritten2 = rewrite_notion_links_and_embeds(emb_md, {id2: "pg_sub"}, {id1: "db_tasks"})
+  assert rewritten2.contains?("<!-- db_embed:db_tasks -->")
+  assert rewritten2.contains?("[[pg_sub|Sub]]")
 end

@@ -25,6 +25,8 @@ pages_by_collection,
 pages_by_parent,
 blocks_table,
 blocks_by_page,
+backlinks_bucket,
+lookup_backlink_sources,
 comments_table,
 comments_by_page,
 attachments_table,
@@ -116,7 +118,13 @@ use Domain.Blocks
 use Domain.Blueprints{BlueprintDef, PageBlueprintMeta}
 use Domain.Formulas{FormulaRelatedRow}
 use Domain.FeedBridge
-use Domain.Garden{GardenCitationDrift, GardenDuplicatePair, detect_contradiction_signal, parse_block_citation_ref}
+use Domain.Garden{
+  GardenCitationDrift,
+  GardenDuplicatePair,
+  detect_contradiction_signal,
+  extract_text_backlink_refs,
+  parse_block_citation_ref
+}
 use Domain.Packs{ContextPack, LivingSummary}
 use Domain.Rlm
 use Domain.Collab{
@@ -286,6 +294,7 @@ fn attachments_table() : Table.Table(Text, Attachment)
 end
 
 db_cells_bucket = "vlm_db_cells"
+backlinks_bucket = "vlm_backlinks"
 
 fn databases_by_collection() : Table.Index(Text, DatabaseDef, Text)
   Table.text_index[Text, DatabaseDef]("vlm_databases_by_collection", fn(d) d.collection_id end)
@@ -936,12 +945,13 @@ fn tx_index_page_with_extra(
   else
     "#{extra_trimmed}\n#{body_plain}"
   end
+  fts_body = truncate_text_bytes(combined_body, 16384)
   doc = Fts.DocumentInput(
     doc_id: page.id,
     scope: page.collection_id,
     fields: [
       Fts.FieldInput(name: "title", text: page.title, weight: 3),
-      Fts.FieldInput(name: "body", text: combined_body, weight: 1)
+      Fts.FieldInput(name: "body", text: fts_body, weight: 1)
     ]
   )
   t1 = try Fts.tx_index_document(tx, fts_index(), doc).map_error(map_fts_error)
@@ -1020,13 +1030,133 @@ fn tx_refresh_page_summary(tx: WriteTx, page: Page, blocks: List(Block)) : Resul
   Table.put(tx, summaries_table(), summary.id, summary).map_error(map_table_error)
 end
 
-## Atomically persists `page`, replaces its blocks, and updates `Modb.Fts`, `Modb.Vec`, and `LivingSummary` inside `tx`.
+fn scan_composite_text_values(store: Store, bucket: Text, prefix: Bytes) : Result(
+  List(Text),
+  AppError
+)
+  tcodec = Table.text_codec()
+  lo = Table.encode_composite_key(prefix, Bytes.empty)
+  ff = 255.to_byte or stop "ff byte"
+  hi = Table.encode_composite_key(prefix, Bytes.from_list([ff]))
+  rows = try Modb.scan(store, bucket, Some(lo), Some(hi), 0).map_error(fn(e)
+    ServerFailed(reason: e.to_text)
+  end)
+  var out = []
+  for (raw_k, _v) in rows
+    (ik, pk_bytes) = try Table.decode_composite_key(raw_k).map_error(map_table_error)
+    if ik == prefix
+      out = out.append(try tcodec.decode(pk_bytes).map_error(map_table_error))
+    end
+  end
+  Ok(out)
+end
+
+fn encode_backlink_key(target_ref: Text, src_pid: Text, src_bid: Text) : Bytes
+  tcodec = Table.text_codec()
+  Table.encode_composite_key(tcodec.encode(target_ref), tcodec.encode("#{src_pid}|#{src_bid}"))
+end
+
+## Queries `vlm_backlinks` by `target_page_id` and returns matching `"<source_page_id>|<source_block_id>"` entries.
+fn lookup_backlink_sources(store: Store, target_page_id: Text) : Result(List(Text), AppError)
+  scan_composite_text_values(store, backlinks_bucket, Table.text_codec().encode(target_page_id))
+end
+
+fn block_page_link_target(kind: BlockKind) : Option(Text)
+  case kind
+    PageLink(target_page_id: tid): Some(tid)
+    Paragraph | Heading(level: _) | BulletListItem | OrderedListItem(start: _) | TaskItem(
+      checked: _
+    ) | Quote | Callout(tone: _, icon: _) | CodeBlock(language: _) | Divider | TableBlock(
+      has_header: _
+    ) | Toggle(summary: _, open: _) | TableOfContents | Image(
+      attachment_id: _,
+      caption: _
+    ) | FileEmbed(attachment_id: _, filename: _) | DatabaseViewEmbed(
+      database_id: _,
+      view_id: _
+    ) | AiBrief(prompt: _, source_scope: _, refreshed_at: _): None
+  end
+end
+
+fn tx_collect_backlink_pairs(
+  tx: WriteTx,
+  page_id: Text,
+  blocks: List(Block)
+) : Result(List(Text), AppError)
+  var pairs = []
+  btbl = blocks_table()
+  for blk in blocks
+    var refs = case block_page_link_target(blk.kind)
+      Some(tid): [tid]
+      None: []
+    end
+    if blk.markdown.contains?("[[") or blk.markdown.contains?("/p/") or not blk.provenance.citations.empty?
+      cit_refs = blk.provenance.citations.map(fn(c) c.source_ref end)
+      (page_refs, bare_bids) = extract_text_backlink_refs(blk.markdown, cit_refs)
+      for tref in page_refs
+        refs = refs.append(tref)
+      end
+      for bid in bare_bids
+        case try Table.tx_get(tx, btbl, bid).map_error(map_table_error)
+          Some(cited_blk): refs = refs.append(cited_blk.page_id)
+          None: Unit
+        end
+      end
+    end
+    for raw_ref in refs
+      clean = raw_ref.trim
+      if not clean.empty? and clean != page_id and not clean.contains?("|")
+        pair = "#{clean}|#{blk.id}"
+        if not pairs.contains?(pair)
+          pairs = pairs.append(pair)
+        end
+      end
+    end
+  end
+  Ok(pairs)
+end
+
+fn tx_touch_backlink_pairs(
+  tx: WriteTx,
+  page_id: Text,
+  pairs: List(Text),
+  skip_pairs: List(Text),
+  put?: Bool
+) : Result(WriteTx, AppError)
+  var cur = tx
+  for p in pairs
+    if not skip_pairs.contains?(p)
+      parts = p.split("|")
+      if parts.size == 2
+        k = encode_backlink_key(parts.first or "", page_id, parts.get(1) or "")
+        cur = if put?
+          try Modb.tx_put(cur, backlinks_bucket, k, Bytes.empty).map_error(fn(e)
+            ServerFailed(reason: e.to_text)
+          end)
+        else
+          try Modb.tx_delete(cur, backlinks_bucket, k).map_error(fn(e)
+            ServerFailed(reason: e.to_text)
+          end)
+        end
+      end
+    end
+  end
+  Ok(cur)
+end
+
+## Atomically persists `page`, replaces its blocks, and updates `Modb.Fts`, `Modb.Vec`, `LivingSummary`,
+## and `vlm_backlinks` inside `tx`.
 fn tx_save_page_and_blocks(tx: WriteTx, page: Page, blocks: List(Block)) : Result(WriteTx, AppError)
   btbl = blocks_table()
   bidx = blocks_by_page()
   existing = try Table.tx_lookup(tx, btbl, bidx, page.id).map_error(map_table_error)
   new_ids = blocks.map(fn(b) b.id end).to_set
   existing_by_id = existing.to_map
+  old_pairs = if page.kind == Document
+    try tx_collect_backlink_pairs(tx, page.id, existing.map(fn(x) x.1 end))
+  else
+    []
+  end
 
   var cur = try Table.put(tx, pages_table(), page.id, page).map_error(map_table_error)
   for (old_id, _old_blk) in existing
@@ -1042,6 +1172,17 @@ fn tx_save_page_and_blocks(tx: WriteTx, page: Page, blocks: List(Block)) : Resul
     if changed?
       cur = try Table.put(cur, btbl, blk.id, blk).map_error(map_table_error)
     end
+  end
+  new_pairs = if page.archived_at == None and page.kind == Document
+    try tx_collect_backlink_pairs(cur, page.id, blocks)
+  else
+    []
+  end
+  cur = if old_pairs.empty? and new_pairs.empty?
+    cur
+  else
+    t_del = try tx_touch_backlink_pairs(cur, page.id, old_pairs, new_pairs, false)
+    try tx_touch_backlink_pairs(t_del, page.id, new_pairs, old_pairs, true)
   end
   if page.archived_at == None
     t_idx = try tx_index_page(cur, page, blocks)
@@ -1062,14 +1203,18 @@ fn tx_save_page_and_blocks(tx: WriteTx, page: Page, blocks: List(Block)) : Resul
 end
 
 ## Atomically removes `page_id`, any attached blueprint metadata, its living summary, all of its blocks,
-## its FTS entry, and its vector index entries inside `tx`.
+## its backlink edges, its FTS entry, and its vector index entries inside `tx`.
 fn tx_delete_page_and_blocks(tx: WriteTx, page_id: Text) : Result(WriteTx, AppError)
   btbl = blocks_table()
   bidx = blocks_by_page()
   existing = try Table.tx_lookup(tx, btbl, bidx, page_id).map_error(map_table_error)
+  old_pairs = try tx_collect_backlink_pairs(tx, page_id, existing.map(fn(x) x.1 end))
   var cur = tx
   for (bid, _b) in existing
     cur = try Table.delete(cur, btbl, bid).map_error(map_table_error)
+  end
+  if not old_pairs.empty?
+    cur = try tx_touch_backlink_pairs(cur, page_id, old_pairs, [], false)
   end
   case try Table.tx_get(cur, page_meta_table(), page_id).map_error(map_table_error)
     Some(_pm): cur = try Table.delete(cur, page_meta_table(), page_id).map_error(map_table_error)
@@ -1456,23 +1601,11 @@ fn lookup_row_ids_by_cell(store: Store, db_id: Text, prop_id: Text, encoded_val:
   List(Text),
   AppError
 )
-  tcodec = Table.text_codec()
-  prefix = encode_db_cell_prefix(db_id, prop_id, encoded_val)
-  lo = Table.encode_composite_key(prefix, Bytes.empty)
-  ff = 255.to_byte or stop "ff byte"
-  hi = Table.encode_composite_key(prefix, Bytes.from_list([ff]))
-  rows = try Modb.scan(store, db_cells_bucket, Some(lo), Some(hi), 0).map_error(fn(e)
-    ServerFailed(reason: e.to_text)
-  end)
-  var out = []
-  for (raw_k, _v) in rows
-    (ik, pk_bytes) = try Table.decode_composite_key(raw_k).map_error(map_table_error)
-    if ik == prefix
-      rid = try tcodec.decode(pk_bytes).map_error(map_table_error)
-      out = out.append(rid)
-    end
-  end
-  Ok(out)
+  scan_composite_text_values(
+    store,
+    db_cells_bucket,
+    encode_db_cell_prefix(db_id, prop_id, encoded_val)
+  )
 end
 
 fn tx_update_db_cell_index(tx: WriteTx, db_id: Text, old_row: Option(DbRow), new_row: Option(DbRow)) : Result(
@@ -3260,23 +3393,10 @@ fn detect_duplicate_contradictions(
 end
 
 fn block_backlink_kind(ob: Block, target_page_id: Text, target_block_ids: Set(Text)) : Option(Text)
-  matched_link = case ob.kind
-    PageLink(target_page_id: tid): tid == target_page_id
-    Paragraph | Heading(level: _) | BulletListItem | OrderedListItem(start: _) | TaskItem(
-      checked: _
-    ) | Quote | Callout(tone: _, icon: _) | CodeBlock(language: _) | Divider | TableBlock(
-      has_header: _
-    ) | Toggle(summary: _, open: _) | TableOfContents | Image(
-      attachment_id: _,
-      caption: _
-    ) | FileEmbed(attachment_id: _, filename: _) | DatabaseViewEmbed(
-      database_id: _,
-      view_id: _
-    ) | AiBrief(prompt: _, source_scope: _, refreshed_at: _): false
-  end
+  matched_link = block_page_link_target(ob.kind) == Some(target_page_id)
   if matched_link or ob.markdown.contains?("[[#{target_page_id}]]") or ob.markdown.contains?(
-    "/p/#{target_page_id}"
-  )
+    "[[#{target_page_id}|"
+  ) or ob.markdown.contains?("/p/#{target_page_id}")
     return Some("page_link")
   end
   for c in ob.provenance.citations
@@ -3292,18 +3412,19 @@ fn block_backlink_kind(ob: Block, target_page_id: Text, target_block_ids: Set(Te
   None
 end
 
-fn load_summary_snippet(store: Store, pg: Page, blks: List(Block)) : Result(Text, AppError)
+fn load_summary_snippet(store: Store, pg: Page) : Result(Text, AppError)
   case try Table.get(store, summaries_table(), page_summary_key(pg.id)).map_error(map_table_error)
     Some(sum):
       sem = (sum.semantic_summary or "").trim
       st = sum.structural_summary.trim
       if not sem.empty?: Ok(sem) else if not st.empty?: Ok(st) else: Ok(pg.title)
     None:
+      blks = try load_page_blocks(store, pg.id)
       plain = Blocks.blocks_plain_text(blks).trim
       if plain.empty?
         Ok(pg.title)
       else if plain.byte_count > 160
-        Ok("#{plain.bytes.slice(0, 160).decode_utf8 or plain}...")
+        Ok("#{truncate_text_bytes(plain, 160)}...")
       else
         Ok(plain)
       end
@@ -3324,40 +3445,51 @@ fn compute_page_backlinks(
     target_bids = target_bids.add(b.id)
   end
 
-  # 1. Explicit backlinks across grant-permitted active Documents
-  page_rows = try Table.scan(store, pages_table(), None, None, 400).map_error(map_table_error)
+  # 1. Explicit backlinks via raw `vlm_backlinks` bucket index (grant-filtered, O(backlinks))
+  raw_sources = try lookup_backlink_sources(store, page.id)
   var explicit = []
   var seen_exp = Set.empty
-  for (_pid, other) in page_rows
-    if other.id != page.id and other.archived_at == None and other.kind == Document and Policy
-      .collection_permitted?(auth, other.collection_id)
-      other_blks = try load_page_blocks(store, other.id)
-      for ob in other_blks
-        case block_backlink_kind(ob, page.id, target_bids)
-          Some(bkind):
-            ek = "#{other.id}:#{ob.id}"
-            if not seen_exp.has?(ek)
-              seen_exp = seen_exp.add(ek)
-              raw_ex = ob.markdown.trim
-              excerpt = if raw_ex.byte_count > 140
-                "#{raw_ex.bytes.slice(0, 140).decode_utf8 or raw_ex}..."
-              else
-                raw_ex
-              end
-              explicit = explicit.append(
-                ExplicitBacklink(
-                  source_page_id: other.id,
-                  source_title: other.title,
-                  source_collection_id: other.collection_id,
-                  block_id: ob.id,
-                  kind: bkind,
-                  excerpt: excerpt
-                )
-              )
-            end
-          None: Unit
+  ptbl = pages_table()
+  btbl = blocks_table()
+  for entry in raw_sources
+    break if explicit.size >= lim
+    continue if seen_exp.has?(entry)
+    parts = entry.split("|")
+    continue if parts.size != 2
+    src_pid = parts.first or ""
+    src_bid = parts.get(1) or ""
+    continue if src_pid.empty? or src_bid.empty? or src_pid == page.id
+    other = case try Table.get(store, ptbl, src_pid).map_error(map_table_error)
+      Some(p) if p.archived_at == None and p.kind == Document and Policy.collection_permitted?(
+        auth,
+        p.collection_id
+      ): p
+      Some(_) | None: continue
+    end
+    ob = case try Table.get(store, btbl, src_bid).map_error(map_table_error)
+      Some(b) if b.page_id == other.id: b
+      Some(_) | None: continue
+    end
+    case block_backlink_kind(ob, page.id, target_bids)
+      Some(bkind):
+        seen_exp = seen_exp.add(entry)
+        raw_ex = ob.markdown.trim
+        excerpt = if raw_ex.byte_count > 140
+          "#{truncate_text_bytes(raw_ex, 140)}..."
+        else
+          raw_ex
         end
-      end
+        explicit = explicit.append(
+          ExplicitBacklink(
+            source_page_id: other.id,
+            source_title: other.title,
+            source_collection_id: other.collection_id,
+            block_id: ob.id,
+            kind: bkind,
+            excerpt: excerpt
+          )
+        )
+      None: Unit
     end
   end
 
@@ -3385,19 +3517,29 @@ fn compute_page_backlinks(
     Some(_) | None: Unit
   end
 
-  emb_txt = page_embedding_text(page, blks, None)
-  sketch_hits = if emb_txt.byte_count >= 6
-    qvec = Vec.text_sketch_embedding(emb_txt, sketch_vec_dims)
-    sopts = Vec.VecSearchOptions(
-      limit: lim + 6,
-      required_scope: None,
-      min_score: Some(0.15.to_float)
-    )
-    try Vec.search_filtered(store, sketch_vec_index(), qvec, sopts, allow_doc).map_error(
-      map_vec_error
-    )
-  else
-    []
+  sketch_qvec_opt = case try Vec.get_vector(store, sketch_vec_index(), page.id).map_error(
+    map_vec_error
+  )
+    Some(sv): Some(sv)
+    None:
+      emb_txt = truncate_text_bytes(page_embedding_text(page, blks, None), 4096)
+      if emb_txt.byte_count >= 6
+        Some(Vec.text_sketch_embedding(emb_txt, sketch_vec_dims))
+      else
+        None
+      end
+  end
+  sketch_hits = case sketch_qvec_opt
+    Some(qvec):
+      sopts = Vec.VecSearchOptions(
+        limit: lim + 6,
+        required_scope: None,
+        min_score: Some(0.15.to_float)
+      )
+      try Vec.search_filtered(store, sketch_vec_index(), qvec, sopts, allow_doc).map_error(
+        map_vec_error
+      )
+    None: []
   end
 
   # Interleave top neural + sketch hits so both async neural topics and synchronous new pages surface
@@ -3422,8 +3564,7 @@ fn compute_page_backlinks(
       Some(hit_pg) if hit_pg.archived_at == None and hit_pg.kind == Document and Policy
         .collection_permitted?(auth, hit_pg.collection_id):
         seen_sem = seen_sem.add(hit_pg.id)
-        hit_blks = try load_page_blocks(store, hit_pg.id)
-        snip = try load_summary_snippet(store, hit_pg, hit_blks)
+        snip = try load_summary_snippet(store, hit_pg)
         semantic = semantic.append(
           SemanticBacklink(
             page_id: hit_pg.id,

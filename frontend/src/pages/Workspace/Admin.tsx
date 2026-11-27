@@ -482,7 +482,9 @@ export default function AdminConsole({
           : [];
       const res = await apiFetch<{
         page_count: number;
+        nested_page_count?: number;
         database_count: number;
+        skipped_duplicate_databases?: number;
         row_count: number;
       }>("/api/import/notion", {
         method: "POST",
@@ -492,8 +494,16 @@ export default function AdminConsole({
           databases: databasesPayload,
         }),
       });
+      const extraParts: string[] = [];
+      if ((res.nested_page_count ?? 0) > 0) {
+        extraParts.push(`${res.nested_page_count} nested`);
+      }
+      if ((res.skipped_duplicate_databases ?? 0) > 0) {
+        extraParts.push(`${res.skipped_duplicate_databases} duplicate CSV view(s) skipped`);
+      }
+      const extraSuffix = extraParts.length > 0 ? ` (${extraParts.join(", ")})` : "";
       setImpResult(
-        `Imported ${res.page_count} page(s), ${res.database_count} database(s), and ${res.row_count} row(s).`
+        `Imported ${res.page_count} page(s), ${res.database_count} database(s), and ${res.row_count} row(s)${extraSuffix}.`
       );
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Notion import failed");
@@ -1042,79 +1052,103 @@ export default function AdminConsole({
 
         {/* TAB 3: NOTION IMPORTER */}
         {tab === "importer" && (
-          <form
-            onSubmit={handleNotionImport}
-            className="rounded-2xl border border-stone-200 bg-white p-6 space-y-4"
-          >
-            <h2 className="text-base font-semibold text-stone-900">
-              Notion Markdown &amp; CSV Importer
-            </h2>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
-              <div>
-                <label className="font-medium text-stone-700">Target Collection</label>
-                <select
-                  value={impColId}
-                  onChange={(e) => setImpColId(e.target.value)}
-                  className="mt-1 w-full rounded-lg border border-stone-200 px-3 py-2 bg-white"
-                >
-                  {collections.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <label className="font-medium text-stone-700">Notion Page Path</label>
-                <input
-                  value={impPath}
-                  onChange={(e) => setImpPath(e.target.value)}
-                  className="mt-1 w-full rounded-lg border border-stone-200 px-3 py-2 font-mono"
-                />
-              </div>
-            </div>
-            <div className="text-xs">
-              <label className="font-medium text-stone-700">Page Markdown Content</label>
-              <textarea
-                rows={4}
-                value={impMd}
-                onChange={(e) => setImpMd(e.target.value)}
-                className="mt-1 w-full rounded-lg border border-stone-200 p-3 font-mono"
-              />
-            </div>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
-              <div>
-                <label className="font-medium text-stone-700">Optional CSV Filename</label>
-                <input
-                  value={impCsvTitle}
-                  onChange={(e) => setImpCsvTitle(e.target.value)}
-                  placeholder="Incidents 0123456789abcdef0123456789abcdef.csv"
-                  className="mt-1 w-full rounded-lg border border-stone-200 px-3 py-2 font-mono"
-                />
-              </div>
-              <div className="md:col-span-2">
-                <label className="font-medium text-stone-700">Optional CSV Rows</label>
-                <textarea
-                  rows={2}
-                  value={impCsvText}
-                  onChange={(e) => setImpCsvText(e.target.value)}
-                  placeholder="Title,Status,Cost&#10;Auth 502,Open,12.50"
-                  className="mt-1 w-full rounded-lg border border-stone-200 p-2 font-mono"
-                />
-              </div>
-            </div>
-            <button
-              type="submit"
-              className="rounded-lg bg-stone-900 px-4 py-2 text-xs font-medium text-white hover:bg-stone-800"
+          <div className="space-y-4">
+            <form
+              onSubmit={handleNotionImport}
+              className="rounded-2xl border border-stone-200 bg-white p-6 space-y-4"
             >
-              Run Notion Import into MoDB
-            </button>
-            {impResult && (
-              <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3.5 py-2 text-xs text-emerald-800">
-                {impResult}
+              <h2 className="text-base font-semibold text-stone-900">
+                Notion Markdown &amp; CSV Importer
+              </h2>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                <div>
+                  <label className="font-medium text-stone-700">Target Collection</label>
+                  <select
+                    value={impColId}
+                    onChange={(e) => setImpColId(e.target.value)}
+                    className="mt-1 w-full rounded-lg border border-stone-200 px-3 py-2 bg-white"
+                  >
+                    {collections.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="font-medium text-stone-700">Notion Page Path</label>
+                  <input
+                    value={impPath}
+                    onChange={(e) => setImpPath(e.target.value)}
+                    className="mt-1 w-full rounded-lg border border-stone-200 px-3 py-2 font-mono"
+                  />
+                </div>
               </div>
-            )}
-          </form>
+              <div className="text-xs">
+                <label className="font-medium text-stone-700">Page Markdown Content</label>
+                <textarea
+                  rows={4}
+                  value={impMd}
+                  onChange={(e) => setImpMd(e.target.value)}
+                  className="mt-1 w-full rounded-lg border border-stone-200 p-3 font-mono"
+                />
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+                <div>
+                  <label className="font-medium text-stone-700">Optional CSV Filename</label>
+                  <input
+                    value={impCsvTitle}
+                    onChange={(e) => setImpCsvTitle(e.target.value)}
+                    placeholder="Incidents 0123456789abcdef0123456789abcdef.csv"
+                    className="mt-1 w-full rounded-lg border border-stone-200 px-3 py-2 font-mono"
+                  />
+                </div>
+                <div className="md:col-span-2">
+                  <label className="font-medium text-stone-700">Optional CSV Rows</label>
+                  <textarea
+                    rows={2}
+                    value={impCsvText}
+                    onChange={(e) => setImpCsvText(e.target.value)}
+                    placeholder="Title,Status,Cost&#10;Auth 502,Open,12.50"
+                    className="mt-1 w-full rounded-lg border border-stone-200 p-2 font-mono"
+                  />
+                </div>
+              </div>
+              <button
+                type="submit"
+                className="rounded-lg bg-stone-900 px-4 py-2 text-xs font-medium text-white hover:bg-stone-800"
+              >
+                Run Notion Import into MoDB
+              </button>
+              {impResult && (
+                <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3.5 py-2 text-xs text-emerald-800">
+                  {impResult}
+                </div>
+              )}
+            </form>
+
+            <div className="rounded-2xl border border-stone-200 bg-stone-50 p-6 space-y-2.5">
+              <h3 className="text-sm font-semibold text-stone-900">
+                Full Workspace Migration (API-First + Hybrid ZIP CLI)
+              </h3>
+              <p className="text-xs text-stone-600">
+                For full institutional Notion workspaces with deep nesting, dual/self relations,
+                rollups, formulas, covers, and large media attachments (up to 500 MiB chunked), run
+                the resumable 3-pass migration engine:
+              </p>
+              <pre className="overflow-x-auto rounded-lg border border-stone-200 bg-white p-3 text-[11px] font-mono text-stone-800">
+                {`node scripts/notion-migrate.mjs \\
+  --api-token-file /path/to/notion.tok \\
+  --zip /path/to/notion-export.zip \\
+  --vellum-url http://127.0.0.1:8080 \\
+  --state /tmp/vellum-migrate-state.json`}
+              </pre>
+              <p className="text-[11px] text-stone-500">
+                Supports <code>--dry-run</code> validation, <code>--solo-login</code> or{" "}
+                <code>--vellum-token</code> auth, and idempotent resumes via <code>--state</code>.
+              </p>
+            </div>
+          </div>
         )}
 
         {/* TAB 4: SELECTIVE UNDO / VISUAL MODB.REPLAY */}

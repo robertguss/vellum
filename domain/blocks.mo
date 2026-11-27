@@ -22,10 +22,13 @@ use Json
 alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
 
 fn char_rank_idx(ch: Char) : Int
-  for (i, c) in alphabet.chars.enumerate
-    return i if c == ch
+  if ch.code >= 48 and ch.code <= 57
+    ch.code - 48
+  else if ch.code >= 97 and ch.code <= 122
+    ch.code - 87
+  else
+    18
   end
-  18
 end
 
 fn rank_char_at(idx: Int) : Char
@@ -990,6 +993,25 @@ fn reconcile_blocks_from_markdown(
 ) : List(Block)
   parsed = parse_markdown_blocks(page_id, body_markdown, prov, "tmp_#{id_prefix}")
   return [] if parsed.empty?
+  if existing_blocks.empty?
+    var out = []
+    for (idx, p) in parsed.enumerate
+      seq = idx + 1
+      out = out.append(
+        Block(
+          id: "blk_#{id_prefix}_#{sync_zero_pad4(seq)}",
+          page_id: page_id,
+          parent_block_id: None,
+          rank: "i#{sync_zero_pad4(seq)}",
+          kind: p.kind,
+          markdown: p.markdown,
+          provenance: prov,
+          version: 1
+        )
+      )
+    end
+    return out
+  end
 
   sorted_old = sort_blocks(existing_blocks)
   var old_by_id = {}

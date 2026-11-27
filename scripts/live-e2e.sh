@@ -3147,6 +3147,479 @@ const m12BadFormula = await apiJson("/api/databases", {
 });
 assert.equal(m12BadFormula.res.status, 422);
 console.log("✓ Live v3 M1.2 Database Schema Parity & Deterministic Notion Formula Engine verified");
+
+// 21. Live v3 Milestone 1 Slice 1.3: API-First + Hybrid ZIP Resumable Notion Migration Engine & PATCH /api/pages/:id
+{
+  const http = await import("node:http");
+  const { execFileSync, spawn } = await import("node:child_process");
+  const runAsync = (cmd, args) =>
+    new Promise((resolve) => {
+      const child = spawn(cmd, args, { encoding: "utf8" });
+      let stdout = "";
+      let stderr = "";
+      child.stdout?.on("data", (d) => { stdout += d; });
+      child.stderr?.on("data", (d) => { stderr += d; });
+      child.on("close", (status) => resolve({ status, stdout, stderr }));
+    });
+  const m13Tmp = fs.mkdtempSync(path.join(process.env.TMPDIR || "/tmp", "vellum-e2e-m13-"));
+  try {
+    // 21a. Mint admin agent token for CLI migration runs against live VELLUM_MODE=team server
+    const migTokRes = await apiJson("/api/admin/agents", {
+      method: "POST",
+      body: JSON.stringify({
+        handle: "notion-migrator-e2e",
+        display_name: "Notion Migrator E2E",
+        model_id: null,
+        label: "e2e-migration",
+        allowed_actions: ["read", "write_direct", "manage_schema", "write_db", "query_db", "upload_attachment"],
+        allowed_collections: null,
+        max_calls: 2000,
+        ttl_days: 7,
+      }),
+    });
+    assert.equal(migTokRes.res.status, 201, migTokRes.text);
+    const migToken = migTokRes.json.raw_token;
+
+    // 21b. Build synthetic nested Notion export ZIP (with inner part ZIP, depth-4 tree, *_all.csv + Untitled dup CSV, binary PNG)
+    const zipSrcDir = path.join(m13Tmp, "zip_src");
+    const innerSrcDir = path.join(m13Tmp, "inner_src");
+    const zipDbId = "11112222333344445555666677778888";
+    const zipDupId = "9999aaaabbbbccccddddeeeeffff0000";
+    const idL1 = "aaaa0000000000000000000000000001";
+    const idL2 = "aaaa0000000000000000000000000002";
+    const idL3 = "aaaa0000000000000000000000000003";
+    const idL4 = "aaaa0000000000000000000000000004";
+    const assetPageNid = "bbbb0000000000000000000000000099";
+
+    fs.mkdirSync(path.join(zipSrcDir, `Root Hub ${idL1}`, `Area ${idL2}`, `Runbook ${idL3}`), { recursive: true });
+    fs.mkdirSync(path.join(innerSrcDir, `Nested Media ${assetPageNid}`), { recursive: true });
+
+    const pngBytes = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 1, 77, 49, 51]);
+    fs.writeFileSync(path.join(zipSrcDir, `Root Hub ${idL1}`, "diagram.png"), pngBytes);
+    fs.writeFileSync(path.join(innerSrcDir, `Nested Media ${assetPageNid}`, "hybrid-asset.png"), pngBytes);
+    fs.writeFileSync(path.join(innerSrcDir, `Nested Media ${assetPageNid}`, "cover.png"), pngBytes);
+
+    fs.writeFileSync(
+      path.join(zipSrcDir, `Root Hub ${idL1}.md`),
+      [
+        "# Root Hub",
+        "",
+        "![Diagram](diagram.png)",
+        "",
+        `[Work Items](Work%20Items%20${zipDbId}.csv)`,
+        "",
+        `[[Area ${idL2}]]`,
+      ].join("\n")
+    );
+    fs.writeFileSync(
+      path.join(zipSrcDir, `Root Hub ${idL1}`, `Area ${idL2}.md`),
+      "| Col | Val |\n| --- | --- |\n| Zone | East |\n"
+    );
+    fs.writeFileSync(
+      path.join(zipSrcDir, `Root Hub ${idL1}`, `Area ${idL2}`, `Runbook ${idL3}.md`),
+      "<details>\n<summary>Zip Toggle</summary>\nInner zip toggle body\n</details>\n"
+    );
+    fs.writeFileSync(
+      path.join(zipSrcDir, `Root Hub ${idL1}`, `Area ${idL2}`, `Runbook ${idL3}`, `Deep Step ${idL4}.md`),
+      "Depth 4 leaf step.\n"
+    );
+    fs.writeFileSync(
+      path.join(zipSrcDir, `Work Items ${zipDbId}.csv`),
+      "\uFEFFItem,Status\nShort item,Done\n"
+    );
+    fs.writeFileSync(
+      path.join(zipSrcDir, `Work Items ${zipDbId}_all.csv`),
+      "\uFEFFItem,Status,Owner Email\nLaunch migration,Done,lead@example.test\nVerify resume,In Progress,qa@example.test\n"
+    );
+    fs.writeFileSync(
+      path.join(zipSrcDir, `Untitled ${zipDupId}.csv`),
+      "\uFEFFItem,Status,Owner Email\nLaunch migration,Done,lead@example.test\n"
+    );
+
+    const innerZipPath = path.join(zipSrcDir, "ExportPart-1.zip");
+    const outerZipPath = path.join(m13Tmp, "synthetic-notion-export.zip");
+    execFileSync(
+      "python3",
+      [
+        "-c",
+        `import os, sys, zipfile
+def pack(src, out_zip):
+    with zipfile.ZipFile(out_zip, 'w') as zf:
+        for r, _, files in os.walk(src):
+            for fn in files:
+                p = os.path.join(r, fn)
+                zf.write(p, os.path.relpath(p, src))
+pack(sys.argv[1], sys.argv[2])
+pack(sys.argv[3], sys.argv[4])`,
+        innerSrcDir,
+        innerZipPath,
+        zipSrcDir,
+        outerZipPath,
+      ],
+      { stdio: "pipe" }
+    );
+
+    const zipStatePath = path.join(m13Tmp, "zip-state.json");
+    const runZip1 = await runAsync(
+      "node",
+      [
+        "scripts/notion-migrate.mjs",
+        "--zip",
+        outerZipPath,
+        "--vellum-url",
+        BASE,
+        "--vellum-token",
+        migToken,
+        "--collection-slug",
+        "live-m13-zip",
+        "--collection-name",
+        "Live M13 ZIP",
+        "--state",
+        zipStatePath,
+      ]
+    );
+    assert.equal(runZip1.status, 0, `ZIP migrate failed: ${runZip1.stderr}\n${runZip1.stdout}`);
+    const zipSum1 = JSON.parse(runZip1.stdout);
+    assert.equal(zipSum1.pages_created, 4);
+    assert.equal(zipSum1.nested_pages, 3);
+    assert.equal(zipSum1.databases_created, 1);
+    assert.equal(zipSum1.skipped_duplicate_csvs, 2);
+    assert.equal(zipSum1.rows_created, 2);
+    assert.equal(zipSum1.attachments_uploaded, 1);
+
+    // Verify idempotent resume creates 0 duplicates
+    const runZip2 = await runAsync(
+      "node",
+      [
+        "scripts/notion-migrate.mjs",
+        "--zip",
+        outerZipPath,
+        "--vellum-url",
+        BASE,
+        "--vellum-token",
+        migToken,
+        "--collection-slug",
+        "live-m13-zip",
+        "--collection-name",
+        "Live M13 ZIP",
+        "--state",
+        zipStatePath,
+      ]
+    );
+    assert.equal(runZip2.status, 0, runZip2.stderr);
+    const zipSum2 = JSON.parse(runZip2.stdout);
+    assert.equal(zipSum2.pages_created, 0);
+    assert.equal(zipSum2.databases_created, 0);
+    assert.equal(zipSum2.rows_created, 0);
+    assert.equal(zipSum2.markdown_synced, 0);
+
+    const zipColCheck = await apiJson("/api/collections/live-m13-zip");
+    assert.equal(zipColCheck.res.status, 200, zipColCheck.text);
+    const zipDocs = (zipColCheck.json.pages ?? []).filter((p) => p.kind === "document" && !p.database_id);
+    assert.equal(zipDocs.length, 4, "ZIP collection has 4 document pages without duplicates");
+    const rootDoc = zipDocs.find((p) => p.title === "Root Hub");
+    assert.ok(rootDoc, "Root Hub page exists");
+    const rootDetail = await apiJson(`/api/pages/${rootDoc.id}`);
+    assert.equal(rootDetail.res.status, 200);
+    assert.ok((rootDetail.json.blocks ?? []).some((b) => b.kind?.image?.attachment_id), "Uploaded ZIP image block present");
+    assert.ok((rootDetail.json.blocks ?? []).some((b) => b.kind?.database_view_embed?.database_id), "DatabaseViewEmbed block present");
+
+    // 21c. Mock Notion REST API Server + Hybrid ZIP Migration (21 DB props, dual+self relations, rollup, formula, cover, all blocks)
+    const mockDbProj = "cccc0000-0000-0000-0000-000000000001";
+    const mockDbTask = "cccc0000-0000-0000-0000-000000000002";
+    const mockPgRoot = assetPageNid.replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, "$1-$2-$3-$4-$5");
+    const mockPgChild = "dddd0000-0000-0000-0000-000000000002";
+    const mockRowProj = "eeee0000-0000-0000-0000-000000000001";
+    const mockRowTask1 = "ffff0000-0000-0000-0000-000000000001";
+    const mockRowTask2 = "ffff0000-0000-0000-0000-000000000002";
+
+    const mockDatabases = {
+      [mockDbProj]: {
+        object: "database",
+        id: mockDbProj,
+        parent: { type: "page_id", page_id: mockPgRoot },
+        title: [{ type: "text", plain_text: "Mock Initiatives" }],
+        properties: {
+          Title: { id: "title", type: "title", title: {} },
+          Tasks: {
+            id: "rel_tasks",
+            type: "relation",
+            relation: { database_id: mockDbTask, type: "dual_property", dual_property: { synced_property_id: "rel_proj" } },
+          },
+          Completion: {
+            id: "roll_comp",
+            type: "rollup",
+            rollup: { relation_property_id: "rel_tasks", relation_property_name: "Tasks", rollup_property_id: "st_prop", rollup_property_name: "Status", function: "percent_per_group" },
+          },
+          ProgressLabel: {
+            id: "frm_prog",
+            type: "formula",
+            formula: { expression: 'format(round(prop("Completion") * 100, 0)) + "%"' },
+          },
+        },
+      },
+      [mockDbTask]: {
+        object: "database",
+        id: mockDbTask,
+        parent: { type: "workspace", workspace: true },
+        title: [{ type: "text", plain_text: "Mock Tasks" }],
+        properties: {
+          Title: { id: "title", type: "title", title: {} },
+          Status: {
+            id: "st_prop",
+            type: "status",
+            status: {
+              options: [
+                { id: "o_todo", name: "Not Started", color: "gray" },
+                { id: "o_done", name: "Done", color: "green" },
+              ],
+              groups: [{ id: "g_done", name: "Complete", option_ids: ["o_done"] }],
+            },
+          },
+          Email: { id: "em_prop", type: "email", email: {} },
+          Ticket: { id: "uid_prop", type: "unique_id", unique_id: { prefix: "MIG" } },
+          Project: {
+            id: "rel_proj",
+            type: "relation",
+            relation: { database_id: mockDbProj, type: "dual_property", dual_property: { synced_property_id: "rel_tasks" } },
+          },
+          DependsOn: {
+            id: "rel_self",
+            type: "relation",
+            relation: { database_id: mockDbTask, type: "single_property", single_property: {} },
+          },
+          Location: { id: "plc_prop", type: "place", place: {} },
+          Attachments: { id: "fil_prop", type: "files", files: {} },
+          Created: { id: "ct_prop", type: "created_time", created_time: {} },
+        },
+      },
+    };
+
+    const mockPages = [
+      {
+        object: "page",
+        id: mockPgRoot,
+        parent: { type: "workspace", workspace: true },
+        icon: { type: "emoji", emoji: "compass" },
+        cover: { type: "file", file: { url: "https://invalid.example.test/expired/cover.png" } },
+        properties: { Title: { id: "title", type: "title", title: [{ plain_text: "Mock Root" }] } },
+      },
+      {
+        object: "page",
+        id: mockPgChild,
+        parent: { type: "page_id", page_id: mockPgRoot },
+        icon: null,
+        cover: null,
+        properties: { Title: { id: "title", type: "title", title: [{ plain_text: "Mock Child" }] } },
+      },
+    ];
+
+    const mockRowsByDb = {
+      [mockDbProj]: [
+        {
+          object: "page",
+          id: mockRowProj,
+          parent: { type: "database_id", database_id: mockDbProj },
+          properties: {
+            Title: { type: "title", title: [{ plain_text: "Rollout Alpha" }] },
+            Tasks: { type: "relation", relation: [{ id: mockRowTask1 }, { id: mockRowTask2 }] },
+          },
+        },
+      ],
+      [mockDbTask]: [
+        {
+          object: "page",
+          id: mockRowTask1,
+          parent: { type: "database_id", database_id: mockDbTask },
+          properties: {
+            Title: { type: "title", title: [{ plain_text: "Task Done" }] },
+            Status: { type: "status", status: { id: "o_done", name: "Done" } },
+            Email: { type: "email", email: "eng1@example.test" },
+            Project: { type: "relation", relation: [{ id: mockRowProj }] },
+            Location: { type: "place", place: { name: "Building A" } },
+            Attachments: {
+              type: "files",
+              files: [{ name: "hybrid-asset.png", type: "file", file: { url: "https://invalid.example.test/expired/hybrid-asset.png" } }],
+            },
+          },
+        },
+        {
+          object: "page",
+          id: mockRowTask2,
+          parent: { type: "database_id", database_id: mockDbTask },
+          properties: {
+            Title: { type: "title", title: [{ plain_text: "Task Open" }] },
+            Status: { type: "status", status: { id: "o_todo", name: "Not Started" } },
+            Email: { type: "email", email: "eng2@example.test" },
+            Project: { type: "relation", relation: [{ id: mockRowProj }] },
+            DependsOn: { type: "relation", relation: [{ id: mockRowTask1 }] },
+          },
+        },
+      ],
+    };
+
+    const mockBlocksByParent = {
+      [mockPgRoot]: [
+        { id: "mb_toc", type: "table_of_contents", has_children: false, table_of_contents: {} },
+        { id: "mb_h4", type: "heading_4", has_children: false, heading_4: { rich_text: [{ plain_text: "Architecture" }] } },
+        { id: "mb_tbl", type: "table", has_children: true, table: { has_column_header: true } },
+        { id: "mb_tog", type: "toggle", has_children: true, toggle: { rich_text: [{ plain_text: "API Toggle" }] } },
+        { id: "mb_tr", type: "transcription", has_children: false, transcription: { rich_text: [{ plain_text: "Spoken summary note." }] } },
+        { id: "mb_img", type: "image", has_children: false, image: { type: "file", file: { url: "https://invalid.example.test/expired/hybrid-asset.png" }, caption: [{ plain_text: "Hybrid Shot" }] } },
+        { id: mockDbProj, type: "child_database", has_children: false, child_database: { title: "Mock Initiatives" } },
+      ],
+      mb_tbl: [
+        { id: "mb_tr1", type: "table_row", has_children: false, table_row: { cells: [[{ plain_text: "Col1" }], [{ plain_text: "Col2" }]] } },
+        { id: "mb_tr2", type: "table_row", has_children: false, table_row: { cells: [[{ plain_text: "V1" }], [{ plain_text: "V2" }]] } },
+      ],
+      mb_tog: [
+        { id: "mb_tp1", type: "paragraph", has_children: false, paragraph: { rich_text: [{ plain_text: "Inside API toggle" }] } },
+      ],
+    };
+
+    const mockServer = http.createServer((req, res) => {
+      const u = new URL(req.url, "http://127.0.0.1");
+      res.setHeader("Content-Type", "application/json");
+      if (req.method === "POST" && u.pathname === "/v1/search") {
+        res.end(JSON.stringify({ results: [...Object.values(mockDatabases), ...mockPages], has_more: false }));
+        return;
+      }
+      const qMatch = u.pathname.match(/^\/v1\/databases\/([^/]+)\/query$/);
+      if (req.method === "POST" && qMatch) {
+        const dbId = decodeURIComponent(qMatch[1]);
+        res.end(JSON.stringify({ results: mockRowsByDb[dbId] ?? [], has_more: false }));
+        return;
+      }
+      const bMatch = u.pathname.match(/^\/v1\/blocks\/([^/]+)\/children$/);
+      if (req.method === "GET" && bMatch) {
+        const pid = decodeURIComponent(bMatch[1]);
+        res.end(JSON.stringify({ results: mockBlocksByParent[pid] ?? [], has_more: false }));
+        return;
+      }
+      res.statusCode = 404;
+      res.end(JSON.stringify({ error: "not_found" }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, "127.0.0.1", resolve));
+    const mockPort = mockServer.address().port;
+    const mockTokFile = path.join(m13Tmp, "mock-notion.tok");
+    fs.writeFileSync(mockTokFile, "secret_mock_token_e2e\n", { mode: 0o600 });
+    const apiStatePath = path.join(m13Tmp, "api-state.json");
+
+    try {
+      const runApi1 = await runAsync(
+        "node",
+        [
+          "scripts/notion-migrate.mjs",
+          "--api-base-url",
+          `http://127.0.0.1:${mockPort}`,
+          "--api-token-file",
+          mockTokFile,
+          "--zip",
+          outerZipPath,
+          "--vellum-url",
+          BASE,
+          "--vellum-token",
+          migToken,
+          "--collection-slug",
+          "live-m13-api",
+          "--collection-name",
+          "Live M13 API",
+          "--state",
+          apiStatePath,
+        ]
+      );
+      assert.equal(runApi1.status, 0, `API+Hybrid migrate failed: ${runApi1.stderr}\n${runApi1.stdout}`);
+      const apiSum1 = JSON.parse(runApi1.stdout);
+      assert.equal(apiSum1.pages_created, 2);
+      assert.equal(apiSum1.nested_pages, 1);
+      assert.equal(apiSum1.databases_created, 2);
+      assert.equal(apiSum1.rows_created, 3);
+      assert.equal(apiSum1.covers_attached, 1);
+      assert.ok(apiSum1.attachments_from_zip >= 3, "Hybrid ZIP satisfied cover, inline image & DB files locally");
+
+      // Idempotent second run
+      const runApi2 = await runAsync(
+        "node",
+        [
+          "scripts/notion-migrate.mjs",
+          "--api-base-url",
+          `http://127.0.0.1:${mockPort}`,
+          "--api-token-file",
+          mockTokFile,
+          "--zip",
+          outerZipPath,
+          "--vellum-url",
+          BASE,
+          "--vellum-token",
+          migToken,
+          "--collection-slug",
+          "live-m13-api",
+          "--collection-name",
+          "Live M13 API",
+          "--state",
+          apiStatePath,
+        ]
+      );
+      assert.equal(runApi2.status, 0, runApi2.stderr);
+      const apiSum2 = JSON.parse(runApi2.stdout);
+      assert.equal(apiSum2.pages_created, 0);
+      assert.equal(apiSum2.databases_created, 0);
+      assert.equal(apiSum2.rows_created, 0);
+      assert.equal(apiSum2.covers_attached, 0);
+    } finally {
+      mockServer.close();
+    }
+
+    // Verify migrated collection hierarchy, cover, blocks, rollup (0.5), formula ("50%"), unique_id ("MIG-1")
+    const apiColCheck = await apiJson("/api/collections/live-m13-api");
+    assert.equal(apiColCheck.res.status, 200, apiColCheck.text);
+    const apiPages = apiColCheck.json.pages ?? [];
+    const apiRoot = apiPages.find((p) => p.title === "Mock Root");
+    const apiChild = apiPages.find((p) => p.title === "Mock Child");
+    assert.ok(apiRoot && apiChild, "Migrated Mock Root and Child pages present");
+    assert.equal(apiChild.parent_page_id, apiRoot.id, "Nested child parent_page_id matches Mock Root");
+    assert.ok(apiRoot.cover_attachment_id, "Mock Root cover_attachment_id set via PATCH /api/pages/:id");
+
+    const rootShow = await apiJson(`/api/pages/${apiRoot.id}`);
+    assert.equal(rootShow.res.status, 200);
+    const rBlks = rootShow.json.blocks ?? [];
+    assert.ok(rBlks.some((b) => b.kind === "table_of_contents"), "TOC block preserved");
+    assert.ok(rBlks.some((b) => b.kind?.heading?.level === 4), "H4 block preserved");
+    assert.ok(rBlks.some((b) => b.kind?.table_block?.has_header === true), "TableBlock preserved");
+    assert.ok(rBlks.some((b) => b.kind?.toggle?.summary === "API Toggle"), "Toggle preserved");
+    assert.ok(rBlks.some((b) => b.kind?.callout?.icon === "transcript"), "Transcription Callout preserved");
+    assert.ok(rBlks.some((b) => b.kind?.image?.attachment_id), "Hybrid ZIP Image attachment preserved");
+    assert.ok(rBlks.some((b) => b.kind?.database_view_embed?.database_id), "child_database embed preserved");
+
+    const allDbs = await apiJson("/api/databases");
+    const projDb = (allDbs.json.databases ?? []).find((d) => d.collection_id === apiColCheck.json.collection.id && d.title === "Mock Initiatives");
+    const taskDb = (allDbs.json.databases ?? []).find((d) => d.collection_id === apiColCheck.json.collection.id && d.title === "Mock Tasks");
+    assert.ok(projDb && taskDb, "Both relational databases migrated");
+
+    const projQ = await apiJson(`/api/databases/${projDb.id}/query`, {
+      method: "POST",
+      body: JSON.stringify({ view_id: null, filters: [], filter_match_all: true, sorts: [], from_date: null, to_date: null }),
+    });
+    assert.equal(projQ.res.status, 200, projQ.text);
+    const projRollups = projQ.json.rows?.[0]?.rollups ?? {};
+    assert.equal(projRollups.completion?.number_val, "0.5");
+    assert.equal(projRollups.progresslabel?.text_val, "50%");
+
+    const taskQ = await apiJson(`/api/databases/${taskDb.id}/query`, {
+      method: "POST",
+      body: JSON.stringify({ view_id: null, filters: [], filter_match_all: true, sorts: [], from_date: null, to_date: null }),
+    });
+    assert.equal(taskQ.res.status, 200, taskQ.text);
+    assert.equal(taskQ.json.rows?.length, 2);
+    assert.ok((taskQ.json.rows ?? []).some((er) => er.row.cells.ticket?.text_val === "MIG-1"));
+    assert.ok((taskQ.json.rows ?? []).some((er) => (er.row.cells.attachments?.files_val?.attachment_ids ?? []).length === 1));
+    assert.ok((taskQ.json.rows ?? []).some((er) => (er.row.cells.dependson?.relation_val?.row_ids ?? []).length === 1));
+    console.log("✓ Live v3 M1.3 Resumable API-First + Hybrid ZIP Notion Migration Engine verified");
+  } finally {
+    fs.rmSync(m13Tmp, { recursive: true, force: true });
+  }
+}
 EOF
 
 echo "All Live Vellum E2E checks against mo serve + Dex + VersityGW S3 passed."

@@ -2,6 +2,7 @@
 module Routes.Workspace
 expose CreateCollectionInput(..),
 CreatePageInput(..),
+UpdatePageInput(..),
 PatchBlocksInput(..),
 VerifyPageInput(..),
 CreateCommentInput(..),
@@ -18,6 +19,7 @@ create_collection,
 show_page,
 page_backlinks,
 create_page,
+update_page,
 patch_blocks,
 verify_page,
 search,
@@ -117,6 +119,17 @@ struct CreatePageInput
   markdown: Text
   icon: Option(Text)
   freshness_ttl_days: Option(Int)
+  reason: Option(Text)
+end
+
+## JSON payload for `PATCH /api/pages/:id`.
+struct UpdatePageInput
+  title: Option(Text)
+  parent_page_id: Option(Text)
+  clear_parent: Option(Bool)
+  icon: Option(Text)
+  cover_attachment_id: Option(Text)
+  clear_cover: Option(Bool)
   reason: Option(Text)
 end
 
@@ -331,6 +344,25 @@ fn reconcile_markdown_blocks(
   body = strip_optional_frontmatter(raw_markdown)
   parsed = Blocks.parse_markdown_blocks(page_id, body, prov, "tmp_#{id_prefix}")
   return [] if parsed.empty?
+  if existing_blocks.empty?
+    var out = []
+    for (idx, p) in parsed.enumerate
+      seq = idx + 1
+      out = out.append(
+        Block(
+          id: "blk_#{id_prefix}_#{zero_pad4_int(seq)}",
+          page_id: page_id,
+          parent_block_id: None,
+          rank: "i#{zero_pad4_int(seq)}",
+          kind: p.kind,
+          markdown: p.markdown,
+          provenance: prov,
+          version: 1
+        )
+      )
+    end
+    return out
+  end
 
   sorted_old = Blocks.sort_blocks(existing_blocks)
   var old_by_id = {}
@@ -1685,6 +1717,210 @@ fn create_page(
         "anchored_markdown": Json.String(Blocks.to_anchored_markdown(blocks))
       })
     ).with_sse_publish_json("collection:#{page.collection_id}", "page.created", page_ev)
+  )
+end
+
+fn validate_page_parent_tx(tx: WriteTx, page_id: Text, col_id: Text, parent_id: Text) : Result(
+  Unit,
+  AppError
+)
+  clean_pid = parent_id.trim
+  if clean_pid.empty?
+    return Error(BadInput(reason: "parent_page_id must not be empty"))
+  end
+  if clean_pid == page_id
+    return Error(BadInput(reason: "page '#{page_id}' cannot be its own parent"))
+  end
+  var cur_opt = Some(clean_pid)
+  var hops = 0
+  while hops < 64
+    cid = case cur_opt
+      Some(x): x
+      None: return Ok(Unit)
+    end
+    if cid == page_id
+      return Error(BadInput(reason: "parent_page_id '#{clean_pid}' would create a cycle"))
+    end
+    par = case try Table.tx_get(tx, Db.pages_table(), cid).map_error(Db.map_table_error)
+      Some(p) if p.archived_at == None: p
+      Some(_) | None:
+        if hops == 0
+          return Error(Missing(entity: "parent_page", id: clean_pid))
+        else
+          return Ok(Unit)
+        end
+    end
+    if hops == 0 and par.collection_id != col_id
+      return Error(BadInput(reason: "parent_page_id must belong to same collection"))
+    end
+    cur_opt = par.parent_page_id
+    hops += 1
+  end
+  Error(BadInput(reason: "page nesting exceeds maximum depth (64)"))
+end
+
+## `PATCH /api/pages/:id` — Updates page title, icon, parent hierarchy (acyclic), or cover attachment.
+fn update_page(
+  req: Api.Request,
+  id: Text,
+  auth: AuthContext,
+  input: UpdatePageInput,
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  case input.title
+    Some(t) if t.trim.empty?: return Error(BadInput(reason: "page title must not be empty"))
+    Some(_) | None: Unit
+  end
+
+  now = clock.now
+  idx_job = Jobs.prepare(rng, clock, "vellum.page.indexed", Json.Object({"page_id": Json.String(id)}))
+  meta = Ledger.WriteMeta(
+    principal: auth.principal.handle,
+    action: "page.update",
+    reason: input.reason or "update page '#{id}'",
+    at: now
+  )
+  audit_payload = Json.Object({"page_id": Json.String(id)})
+
+  upd_json = try Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    meta,
+    "updated page #{id}",
+    audit_payload,
+    Db.map_ledger_error,
+    fn(tx)
+      t1 = try tx_authorize_if_agent(tx, auth, "write_direct", now)
+      old_page = case try Table.tx_get(t1, Db.pages_table(), id).map_error(Db.map_table_error)
+        Some(p) if p.archived_at == None: p
+        Some(_) | None: return Error(Missing(entity: "page", id: id))
+      end
+      try Policy.require_collection_access(auth, "write_direct", old_page.collection_id)
+      col = case try Table.tx_get(t1, Db.collections_table(), old_page.collection_id).map_error(
+        Db.map_table_error
+      )
+        Some(c): c
+        None: return Error(Missing(entity: "collection", id: old_page.collection_id))
+      end
+      if not Policy.can_write_page_direct?(auth, col)
+        return Error(
+          Forbidden(
+            reason: "collection '#{col.slug}' write policy prohibits direct writes by this principal"
+          )
+        )
+      end
+
+      next_parent = if input.clear_parent == Some(true)
+        None
+      else
+        case input.parent_page_id
+          Some(pid):
+            try validate_page_parent_tx(t1, old_page.id, old_page.collection_id, pid)
+            Some(pid.trim)
+          None: old_page.parent_page_id
+        end
+      end
+
+      next_cover = if input.clear_cover == Some(true)
+        None
+      else
+        case input.cover_attachment_id
+          Some(raw_aid):
+            aid = raw_aid.trim
+            if aid.empty?
+              None
+            else
+              att = case try Table.tx_get(t1, Db.attachments_table(), aid).map_error(
+                Db.map_table_error
+              )
+                Some(a): a
+                None: return Error(Missing(entity: "attachment", id: aid))
+              end
+              att_pg = case try Table.tx_get(t1, Db.pages_table(), att.page_id).map_error(
+                Db.map_table_error
+              )
+                Some(p) if p.archived_at == None: p
+                Some(_) | None: return Error(Missing(entity: "page", id: att.page_id))
+              end
+              if att_pg.collection_id != old_page.collection_id
+                return Error(
+                  BadInput(reason: "cover_attachment_id must belong to the same collection")
+                )
+              end
+              if att.status != "ready"
+                return Error(BadInput(reason: "cover_attachment_id must be committed ('ready')"))
+              end
+              Some(aid)
+            end
+          None: old_page.cover_attachment_id
+        end
+      end
+
+      next_title = case input.title
+        Some(t): t.trim
+        None: old_page.title
+      end
+      next_icon = case input.icon
+        Some(ic):
+          trimmed = ic.trim
+          if trimmed.empty?: None else: Some(trimmed)
+        None: old_page.icon
+      end
+
+      updated_page = Page(
+        id: old_page.id,
+        collection_id: old_page.collection_id,
+        parent_page_id: next_parent,
+        title: next_title,
+        icon: next_icon,
+        cover_attachment_id: next_cover,
+        kind: old_page.kind,
+        sort_order: old_page.sort_order,
+        database_id: old_page.database_id,
+        freshness_ttl_days: old_page.freshness_ttl_days,
+        verified_at: old_page.verified_at,
+        verified_by: old_page.verified_by,
+        created_by: old_page.created_by,
+        created_at: old_page.created_at,
+        updated_at: now,
+        archived_at: old_page.archived_at,
+        version: old_page.version + 1
+      )
+      existing_rows = try Table.tx_lookup(t1, Db.blocks_table(), Db.blocks_by_page(), old_page.id)
+        .map_error(Db.map_table_error)
+      existing_blocks = Blocks.sort_blocks(existing_rows.map(fn(x) x.1 end))
+      t2 = try Db.tx_save_page_and_blocks(t1, updated_page, existing_blocks)
+      (t3, _jid) = try Jobs.tx_put(t2, idx_job).map_error(Db.map_table_error)
+      Ok((
+        t3,
+        Json.Object({
+          "page": updated_page.to_json,
+          "collection_id": Json.String(updated_page.collection_id),
+          "version": Json.int(updated_page.version),
+          "title": Json.String(updated_page.title)
+        })
+      ))
+    end
+  )
+
+  p_col_id = upd_json.text_at("collection_id") or ""
+  p_ver = upd_json.int_at("version") or 1
+  p_title = upd_json.text_at("title") or ""
+  upd_ev = Json.Object({
+    "page_id": Json.String(id),
+    "collection_id": Json.String(p_col_id),
+    "version": Json.int(p_ver),
+    "title": Json.String(p_title),
+    "actor": Json.String(auth.principal.handle)
+  })
+  Ok(
+    json_ok(200, Json.Object({"page": upd_json.get("page") or Json.Null}))
+      .with_sse_publish_json("page:#{id}", "page.updated", upd_ev)
+      .with_sse_publish_json("collection:#{p_col_id}", "page.updated", upd_ev)
   )
 end
 
