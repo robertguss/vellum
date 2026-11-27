@@ -104,7 +104,9 @@ ensure_ai_col_feed_locked,
 sync_ai_col_feed_locked,
 rlm_view_catalog,
 detect_page_citation_drifts,
-detect_duplicate_contradictions
+detect_duplicate_contradictions,
+compute_page_backlinks,
+reconstruct_page_from_replay_proposal
 use Domain.Blocks
 use Domain.Blueprints{BlueprintDef, PageBlueprintMeta}
 use Domain.FeedBridge
@@ -151,12 +153,14 @@ use Domain.Types{
   Collection,
   CollectionWritePolicy,
   Comment,
+  ExplicitBacklink,
   Page,
   PageKind,
   Principal,
   PrincipalKind,
   Provenance,
   SearchResultItem,
+  SemanticBacklink,
   Workspace,
   WorkspaceRole,
   to_text
@@ -165,6 +169,7 @@ use Json
 use Modb{Store, WriteTx}
 use Modb.Claims
 use Modb.Errors
+use Modb.Export
 use Modb.Feeds
 use Modb.Fts
 use Modb.Grants
@@ -1674,6 +1679,27 @@ fn clean_view_removed_props(v: DbViewDef, removed_set: Set(Text)) : Result(
       end
       ncpids = cpids.filter(fn(pid) not removed_set.has?(pid) end)
       CalendarView(date_prop_id: dp_id, card_prop_ids: ncpids)
+    GalleryView(cover_prop_id: cp_opt, card_prop_ids: cpids, card_size: sz):
+      next_cp = case cp_opt
+        Some(cp) if removed_set.has?(cp): None
+        Some(cp): Some(cp)
+        None: None
+      end
+      ncpids = cpids.filter(fn(pid) not removed_set.has?(pid) end)
+      GalleryView(cover_prop_id: next_cp, card_prop_ids: ncpids, card_size: sz)
+    TimelineView(start_date_prop_id: sp_id, end_date_prop_id: ep_opt, card_prop_ids: cpids):
+      if removed_set.has?(sp_id)
+        return Error(
+          BadInput(reason: "cannot remove start date property '#{sp_id}' used by view '#{v.name}'")
+        )
+      end
+      next_ep = case ep_opt
+        Some(ep) if removed_set.has?(ep): None
+        Some(ep): Some(ep)
+        None: None
+      end
+      ncpids = cpids.filter(fn(pid) not removed_set.has?(pid) end)
+      TimelineView(start_date_prop_id: sp_id, end_date_prop_id: next_ep, card_prop_ids: ncpids)
   end
   next_filters = v.filters.filter(fn(f) not removed_set.has?(f.prop_id) end)
   next_sorts = v.sorts.filter(fn(s) not removed_set.has?(s.prop_id) end)
@@ -2931,6 +2957,282 @@ fn detect_duplicate_contradictions(
       if p.possible_contradiction: 0 else: 1
     end)
   )
+end
+
+fn block_backlink_kind(ob: Block, target_page_id: Text, target_block_ids: Set(Text)) : Option(Text)
+  matched_link = case ob.kind
+    PageLink(target_page_id: tid): tid == target_page_id
+    Paragraph | Heading(level: _) | BulletListItem | OrderedListItem(start: _) | TaskItem(
+      checked: _
+    ) | Quote | Callout(tone: _, icon: _) | CodeBlock(language: _) | Divider | Image(
+      attachment_id: _,
+      caption: _
+    ) | FileEmbed(attachment_id: _, filename: _) | DatabaseViewEmbed(
+      database_id: _,
+      view_id: _
+    ) | AiBrief(prompt: _, source_scope: _, refreshed_at: _): false
+  end
+  if matched_link or ob.markdown.contains?("[[#{target_page_id}]]") or ob.markdown.contains?(
+    "/p/#{target_page_id}"
+  )
+    return Some("page_link")
+  end
+  for c in ob.provenance.citations
+    if c.source_ref == "/p/#{target_page_id}" or c.source_ref == target_page_id
+      return Some("citation")
+    end
+    case parse_block_citation_ref(c.source_ref)
+      Some((pg_opt, bid)) if target_block_ids.has?(bid) or pg_opt == Some(target_page_id):
+        return Some("citation")
+      Some(_) | None: Unit
+    end
+  end
+  None
+end
+
+fn load_summary_snippet(store: Store, pg: Page, blks: List(Block)) : Result(Text, AppError)
+  case try Table.get(store, summaries_table(), page_summary_key(pg.id)).map_error(map_table_error)
+    Some(sum):
+      sem = (sum.semantic_summary or "").trim
+      st = sum.structural_summary.trim
+      if not sem.empty?: Ok(sem) else if not st.empty?: Ok(st) else: Ok(pg.title)
+    None:
+      plain = Blocks.blocks_plain_text(blks).trim
+      if plain.empty?
+        Ok(pg.title)
+      else if plain.byte_count > 160
+        Ok("#{plain.bytes.slice(0, 160).decode_utf8 or plain}...")
+      else
+        Ok(plain)
+      end
+  end
+end
+
+## Computes grant-filtered explicit (`PageLink`/`Citation`) and semantic (`Modb.Vec`) backlinks for `page`.
+fn compute_page_backlinks(
+  store: Store,
+  auth: AuthContext,
+  page: Page,
+  blks: List(Block),
+  limit: Int
+) : Result((List(ExplicitBacklink), List(SemanticBacklink)), AppError)
+  lim = if limit < 1: 1 else if limit > 20: 20 else: limit
+  var target_bids = Set.empty
+  for b in blks
+    target_bids = target_bids.add(b.id)
+  end
+
+  # 1. Explicit backlinks across grant-permitted active Documents
+  page_rows = try Table.scan(store, pages_table(), None, None, 400).map_error(map_table_error)
+  var explicit = []
+  var seen_exp = Set.empty
+  for (_pid, other) in page_rows
+    if other.id != page.id and other.archived_at == None and other.kind == Document and Policy
+      .collection_permitted?(auth, other.collection_id)
+      other_blks = try load_page_blocks(store, other.id)
+      for ob in other_blks
+        case block_backlink_kind(ob, page.id, target_bids)
+          Some(bkind):
+            ek = "#{other.id}:#{ob.id}"
+            if not seen_exp.has?(ek)
+              seen_exp = seen_exp.add(ek)
+              raw_ex = ob.markdown.trim
+              excerpt = if raw_ex.byte_count > 140
+                "#{raw_ex.bytes.slice(0, 140).decode_utf8 or raw_ex}..."
+              else
+                raw_ex
+              end
+              explicit = explicit.append(
+                ExplicitBacklink(
+                  source_page_id: other.id,
+                  source_title: other.title,
+                  source_collection_id: other.collection_id,
+                  block_id: ob.id,
+                  kind: bkind,
+                  excerpt: excerpt
+                )
+              )
+            end
+          None: Unit
+        end
+      end
+    end
+  end
+
+  # 2. Semantic backlinks via Modb.Vec (blend neural index with synchronous sketch index)
+  allow_doc = make_allow_doc(auth)
+  neural_dims_opt = try Table.get(store, page_neural_dims_table(), page.id).map_error(
+    map_table_error
+  )
+  var neural_hits = []
+  case neural_dims_opt
+    Some(ndims) if ndims > 0:
+      nidx = neural_vec_index(ndims)
+      case try Vec.get_vector(store, nidx, page.id).map_error(map_vec_error)
+        Some(nvec):
+          nopts = Vec.VecSearchOptions(
+            limit: lim + 6,
+            required_scope: None,
+            min_score: Some(0.15.to_float)
+          )
+          neural_hits = try Vec.search_filtered(store, nidx, nvec, nopts, allow_doc).map_error(
+            map_vec_error
+          )
+        None: Unit
+      end
+    Some(_) | None: Unit
+  end
+
+  emb_txt = page_embedding_text(page, blks, None)
+  sketch_hits = if emb_txt.byte_count >= 6
+    qvec = Vec.text_sketch_embedding(emb_txt, sketch_vec_dims)
+    sopts = Vec.VecSearchOptions(
+      limit: lim + 6,
+      required_scope: None,
+      min_score: Some(0.15.to_float)
+    )
+    try Vec.search_filtered(store, sketch_vec_index(), qvec, sopts, allow_doc).map_error(
+      map_vec_error
+    )
+  else
+    []
+  end
+
+  # Interleave top neural + sketch hits so both async neural topics and synchronous new pages surface
+  var tagged_hits = []
+  n_len = neural_hits.size
+  s_len = sketch_hits.size
+  max_len = if n_len > s_len: n_len else: s_len
+  for idx in 0..max_len
+    if idx < n_len
+      tagged_hits = tagged_hits.append((neural_hits.get(idx) or stop "n_hit", "neural"))
+    end
+    if idx < s_len
+      tagged_hits = tagged_hits.append((sketch_hits.get(idx) or stop "s_hit", "sketch"))
+    end
+  end
+
+  var semantic = []
+  var seen_sem = Set.empty
+  for (vh, backend_tag) in tagged_hits
+    continue if vh.doc_id == page.id or seen_sem.has?(vh.doc_id) or semantic.size >= lim
+    case try Table.get(store, pages_table(), vh.doc_id).map_error(map_table_error)
+      Some(hit_pg) if hit_pg.archived_at == None and hit_pg.kind == Document and Policy
+        .collection_permitted?(auth, hit_pg.collection_id):
+        seen_sem = seen_sem.add(hit_pg.id)
+        hit_blks = try load_page_blocks(store, hit_pg.id)
+        snip = try load_summary_snippet(store, hit_pg, hit_blks)
+        semantic = semantic.append(
+          SemanticBacklink(
+            page_id: hit_pg.id,
+            collection_id: hit_pg.collection_id,
+            title: hit_pg.title,
+            similarity: vh.score,
+            summary: snip,
+            vector_backend: backend_tag
+          )
+        )
+      Some(_) | None: Unit
+    end
+  end
+  Ok((explicit.take(lim), semantic))
+end
+
+## Reconstructs a page and its sorted blocks at a point in time from a `Modb.Replay.ReplayProposal`.
+fn reconstruct_page_from_replay_proposal(
+  store: Store,
+  page_id: Text,
+  prop: Replay.ReplayProposal
+) : Result((Option(Page), List(Block)), AppError)
+  p_bucket = pages_table().bucket
+  b_bucket = blocks_table().bucket
+
+  case prop.proposed_delta
+    Some(deltas):
+      var page_opt = try Table.get(store, pages_table(), page_id).map_error(map_table_error)
+      live_blks = try load_page_blocks(store, page_id)
+      var blk_map = {}
+      for lb in live_blks
+        blk_map = blk_map.set(lb.id, lb)
+      end
+      for bd in deltas
+        if bd.bucket == p_bucket
+          for op in bd.ops
+            kbytes = try Bytes.from_hex(op.key_hex).or_fail(
+              ServerFailed(reason: "invalid replay page key_hex")
+            )
+            kstr = kbytes.decode_utf8 or ""
+            if kstr == page_id
+              page_opt = case op.value_hex
+                Some(vh):
+                  vb = try Bytes.from_hex(vh).or_fail(
+                    ServerFailed(reason: "invalid replay page value_hex")
+                  )
+                  Some(
+                    try Json.decode[Page](vb).map_error(fn(e)
+                      ServerFailed(reason: "invalid replay page record: #{e.to_text}")
+                    end)
+                  )
+                None: None
+              end
+            end
+          end
+        else if bd.bucket == b_bucket
+          for op in bd.ops
+            kbytes = try Bytes.from_hex(op.key_hex).or_fail(
+              ServerFailed(reason: "invalid replay block key_hex")
+            )
+            bid = kbytes.decode_utf8 or ""
+            case op.value_hex
+              Some(vh):
+                vb = try Bytes.from_hex(vh).or_fail(
+                  ServerFailed(reason: "invalid replay block value_hex")
+                )
+                blk = try Json.decode[Block](vb).map_error(fn(e)
+                  ServerFailed(reason: "invalid replay block record: #{e.to_text}")
+                end)
+                if blk.page_id == page_id
+                  blk_map = blk_map.set(blk.id, blk)
+                else
+                  blk_map = blk_map.remove(bid)
+                end
+              None:
+                blk_map = blk_map.remove(bid)
+            end
+          end
+        end
+      end
+      Ok((page_opt, Blocks.sort_blocks(blk_map.values)))
+    None:
+      decoded_buckets = try Export.decode_snapshot_buckets(prop.proposed_state).map_error(fn(e)
+        ServerFailed(reason: "failed decoding replay snapshot: #{e.to_text}")
+      end)
+      var page_opt = None
+      var blk_list = []
+      for (bname, rows) in decoded_buckets
+        if bname == p_bucket
+          for (k, v) in rows
+            if (k.decode_utf8 or "") == page_id
+              page_opt = Some(
+                try Json.decode[Page](v).map_error(fn(e)
+                  ServerFailed(reason: "invalid replay snapshot page: #{e.to_text}")
+                end)
+              )
+            end
+          end
+        else if bname == b_bucket
+          for (_k, v) in rows
+            blk = try Json.decode[Block](v).map_error(fn(e)
+              ServerFailed(reason: "invalid replay snapshot block: #{e.to_text}")
+            end)
+            if blk.page_id == page_id
+              blk_list = blk_list.append(blk)
+            end
+          end
+        end
+      end
+      Ok((page_opt, Blocks.sort_blocks(blk_list)))
+  end
 end
 
 ## Builds the sandboxed `Modb.Views.ViewCatalog` for Tier 1 RLM Deep Research across `collection_ids`,

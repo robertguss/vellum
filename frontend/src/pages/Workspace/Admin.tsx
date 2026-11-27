@@ -22,6 +22,8 @@ import type {
   Collection,
   DatabaseDef,
   GardenReport,
+  ReplayProposalSummary,
+  ReplayStatusResponse,
   WebhookSubPublic,
 } from "../../lib/types";
 
@@ -71,17 +73,15 @@ export default function AdminConsole({
   const [impResult, setImpResult] = useState<string | null>(null);
 
   // Selective Undo (Modb.Replay)
-  const [replayFilterKind, setReplayFilterKind] = useState<"exclude_principal" | "exclude_grant">(
-    "exclude_principal"
-  );
+  const [replayFilterKind, setReplayFilterKind] = useState<
+    "exclude_principal" | "exclude_grant" | "exclude_world" | "stop_before_seq"
+  >("exclude_principal");
   const [replayTarget, setReplayTarget] = useState("@docs-gardener");
+  const [replayStopSeq, setReplayStopSeq] = useState(1);
   const [replayDesc, setReplayDesc] = useState("Rollback specific agent edits");
-  const [replaySim, setReplaySim] = useState<{
-    proposal_id: string;
-    summary: unknown;
-    bucket_diffs: unknown;
-    status: unknown;
-  } | null>(null);
+  const [replayStatus, setReplayStatus] = useState<ReplayStatusResponse | null>(null);
+  const [replayBusy, setReplayBusy] = useState(false);
+  const [replaySim, setReplaySim] = useState<ReplayProposalSummary | null>(null);
 
   // Webhooks
   const [webhooks, setWebhooks] = useState<WebhookSubPublic[]>(initialWebhooks);
@@ -92,6 +92,45 @@ export default function AdminConsole({
   useEffect(() => {
     void loadClaims();
   }, []);
+
+  useEffect(() => {
+    if (tab === "replay") {
+      void loadReplayStatus();
+    }
+  }, [tab]);
+
+  async function loadReplayStatus() {
+    try {
+      const st = await apiFetch<ReplayStatusResponse>("/api/admin/replay/status");
+      setReplayStatus(st);
+      if (st.call_count > 0) {
+        setReplayStopSeq(st.call_count);
+      }
+      if (!replaySim && st.proposals.length > 0) {
+        setReplaySim(st.proposals[0]);
+      }
+    } catch {
+      // ignore initial replay status fetch failure
+    }
+  }
+
+  async function handlePinBaseline() {
+    setReplayBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await apiFetch("/api/admin/replay/baseline", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      setNotice("Pinned Modb.Replay CoW baseline snapshot.");
+      await loadReplayStatus();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not pin replay baseline");
+    } finally {
+      setReplayBusy(false);
+    }
+  }
 
   async function loadClaims() {
     try {
@@ -243,60 +282,85 @@ export default function AdminConsole({
 
   async function handleSimulateReplay(e: React.FormEvent) {
     e.preventDefault();
+    setReplayBusy(true);
     setError(null);
     setNotice(null);
     try {
-      await apiFetch("/api/admin/replay/baseline", {
-        method: "POST",
-        body: JSON.stringify({}),
-      });
       const sim = await apiFetch<{
         proposal_id: string;
-        summary: unknown;
-        bucket_diffs: unknown;
+        description: string;
+        filter: unknown;
+        base_call_seq: number;
+        summary: ReplayProposalSummary["summary"];
+        outcomes: unknown[];
+        bucket_diffs: ReplayProposalSummary["bucket_diffs"];
         status: unknown;
       }>("/api/admin/replay/simulate", {
         method: "POST",
         body: JSON.stringify({
           filter_kind: replayFilterKind,
-          target: replayTarget.trim(),
-          seq: null,
-          description: replayDesc.trim() || "selective undo",
+          target: replayFilterKind === "stop_before_seq" ? null : replayTarget.trim(),
+          seq: replayFilterKind === "stop_before_seq" ? replayStopSeq : null,
+          description: replayDesc.trim() || `Selective simulation (${replayFilterKind})`,
         }),
       });
-      setReplaySim(sim);
+      setReplaySim({
+        id: sim.proposal_id,
+        description: sim.description,
+        filter: sim.filter,
+        base_call_seq: sim.base_call_seq,
+        created_by: "you",
+        created_at: new Date().toISOString(),
+        status: sim.status,
+        summary: sim.summary,
+        outcomes: sim.outcomes ?? [],
+        bucket_diffs: sim.bucket_diffs ?? [],
+      });
+      await loadReplayStatus();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Replay simulation failed");
+    } finally {
+      setReplayBusy(false);
     }
   }
 
-  async function handleAcceptReplay() {
-    if (!replaySim) return;
+  async function handleAcceptReplay(propId?: string) {
+    const targetId = propId ?? replaySim?.id;
+    if (!targetId) return;
+    setReplayBusy(true);
     setError(null);
     try {
-      await apiFetch(`/api/admin/replay/${replaySim.proposal_id}/accept`, {
+      await apiFetch(`/api/admin/replay/${targetId}/accept`, {
         method: "POST",
         body: JSON.stringify({}),
       });
-      setNotice(`Applied selective rollback ${replaySim.proposal_id}`);
-      setReplaySim(null);
+      setNotice(`Applied selective rollback ${targetId}`);
+      if (replaySim?.id === targetId) setReplaySim(null);
+      await loadReplayStatus();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not accept rollback");
+    } finally {
+      setReplayBusy(false);
     }
   }
 
-  async function handleDiscardReplay() {
-    if (!replaySim) return;
+  async function handleDiscardReplay(propId?: string) {
+    const targetId = propId ?? replaySim?.id;
+    if (!targetId) return;
+    setReplayBusy(true);
     setError(null);
     try {
-      await apiFetch(`/api/admin/replay/${replaySim.proposal_id}/discard`, {
+      await apiFetch(`/api/admin/replay/${targetId}/discard`, {
         method: "POST",
         body: JSON.stringify({}),
       });
-      setNotice(`Discarded simulation ${replaySim.proposal_id}`);
-      setReplaySim(null);
+      setNotice(`Discarded simulation ${targetId}`);
+      if (replaySim?.id === targetId) setReplaySim(null);
+      await loadReplayStatus();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not discard simulation");
+    } finally {
+      setReplayBusy(false);
     }
   }
 
@@ -830,96 +894,336 @@ export default function AdminConsole({
           </form>
         )}
 
-        {/* TAB 4: SELECTIVE UNDO */}
+        {/* TAB 4: SELECTIVE UNDO / VISUAL MODB.REPLAY */}
         {tab === "replay" && (
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            <form
-              onSubmit={handleSimulateReplay}
-              className="rounded-2xl border border-stone-200 bg-white p-5 space-y-3 text-xs"
-            >
-              <div className="flex items-center gap-2 text-sm font-semibold text-stone-900">
-                <History className="h-4 w-4 text-amber-700" />
-                Simulate Selective Rollback (Modb.Replay)
+          <div className="space-y-6">
+            {/* CoW Baseline Banner */}
+            <div className="rounded-2xl border border-stone-200 bg-white p-5 flex flex-wrap items-center justify-between gap-4">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2 text-sm font-semibold text-stone-900">
+                  <History className="h-4 w-4 text-amber-700" />
+                  Modb.Replay Time-Travel &amp; Selective Undo
+                </div>
+                {replayStatus?.baseline ? (
+                  <p className="text-xs text-stone-600">
+                    CoW baseline pinned at{" "}
+                    <span className="font-mono text-stone-900">txid #{replayStatus.baseline.txid}</span>{" "}
+                    (schema v{replayStatus.baseline.schema_version}, {replayStatus.baseline.pinned_at}) ·{" "}
+                    <strong>{replayStatus.call_count}</strong> replayable calls recorded.
+                  </p>
+                ) : (
+                  <p className="text-xs text-stone-500">
+                    No CoW replay baseline pinned yet. Pin before recording replay calls to enable offline counterfactual simulation and point-in-time scrubbing.
+                  </p>
+                )}
               </div>
-              <div>
-                <label className="font-medium text-stone-700">Filter Mode</label>
-                <select
-                  value={replayFilterKind}
-                  onChange={(e) =>
-                    setReplayFilterKind(e.target.value as "exclude_principal" | "exclude_grant")
-                  }
-                  className="mt-1 w-full rounded-lg border border-stone-200 px-3 py-2 bg-white"
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={replayBusy}
+                  onClick={() => void loadReplayStatus()}
+                  className="rounded-lg border border-stone-200 px-3 py-1.5 text-xs font-medium text-stone-700 hover:bg-stone-50"
                 >
-                  <option value="exclude_principal">Exclude Principal Handle</option>
-                  <option value="exclude_grant">Exclude Grant Subtree</option>
-                </select>
+                  Refresh
+                </button>
+                {!replayStatus?.baseline && (
+                  <button
+                    type="button"
+                    disabled={replayBusy || (replayStatus?.call_count ?? 0) > 0}
+                    onClick={() => void handlePinBaseline()}
+                    className="rounded-lg bg-stone-900 px-3.5 py-1.5 text-xs font-medium text-white hover:bg-stone-800 disabled:opacity-50"
+                  >
+                    Pin CoW Baseline
+                  </button>
+                )}
               </div>
-              <div>
-                <label className="font-medium text-stone-700">Target Principal / Grant ID</label>
-                <input
-                  value={replayTarget}
-                  onChange={(e) => setReplayTarget(e.target.value)}
-                  className="mt-1 w-full rounded-lg border border-stone-200 px-3 py-2 font-mono"
-                />
-              </div>
-              <div>
-                <label className="font-medium text-stone-700">Description</label>
-                <input
-                  value={replayDesc}
-                  onChange={(e) => setReplayDesc(e.target.value)}
-                  className="mt-1 w-full rounded-lg border border-stone-200 px-3 py-2"
-                />
-              </div>
-              <button
-                type="submit"
-                className="rounded-lg bg-amber-700 px-4 py-2 font-medium text-white hover:bg-amber-800"
-              >
-                Pin Baseline &amp; Simulate
-              </button>
+            </div>
 
-              {replaySim && (
-                <div className="space-y-3 pt-2 border-t border-stone-100">
-                  <div className="font-mono text-stone-800">
-                    Simulation: <strong>{replaySim.proposal_id}</strong>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              {/* Left: Simulation Builder & Visual Diff Preview */}
+              <div className="space-y-4">
+                <form
+                  onSubmit={handleSimulateReplay}
+                  className="rounded-2xl border border-stone-200 bg-white p-5 space-y-3 text-xs"
+                >
+                  <div className="text-sm font-semibold text-stone-900">
+                    Counterfactual Replay Simulation
                   </div>
-                  <pre className="rounded-lg bg-stone-950 text-stone-100 p-3 overflow-x-auto max-h-48">
-                    {JSON.stringify(replaySim.bucket_diffs, null, 2)}
-                  </pre>
-                  <div className="flex gap-2">
-                    <button
-                      type="button"
-                      onClick={() => void handleAcceptReplay()}
-                      className="rounded-lg bg-emerald-700 px-3 py-1.5 font-medium text-white"
+                  <div>
+                    <label className="font-medium text-stone-700">Filter Mode</label>
+                    <select
+                      value={replayFilterKind}
+                      onChange={(e) =>
+                        setReplayFilterKind(
+                          e.target.value as
+                            | "exclude_principal"
+                            | "exclude_grant"
+                            | "exclude_world"
+                            | "stop_before_seq"
+                        )
+                      }
+                      className="mt-1 w-full rounded-lg border border-stone-200 px-3 py-2 bg-white"
                     >
-                      Apply Selective Undo
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void handleDiscardReplay()}
-                      className="rounded-lg border border-stone-200 px-3 py-1.5 text-stone-700"
-                    >
-                      Discard
-                    </button>
+                      <option value="exclude_principal">Exclude Principal Handle</option>
+                      <option value="exclude_grant">Exclude Grant Subtree</option>
+                      <option value="exclude_world">Exclude Single World / Proposal</option>
+                      <option value="stop_before_seq">Rewind Before Sequence #</option>
+                    </select>
                   </div>
-                </div>
-              )}
-            </form>
 
-            <div className="rounded-2xl border border-stone-200 bg-white p-5 space-y-2 max-h-96 overflow-y-auto">
-              <div className="text-sm font-semibold text-stone-900">
-                Recent Ledger Transactions ({audit_feed.length})
-              </div>
-              {audit_feed.map((ev) => (
-                <div key={ev.seq} className="border-b border-stone-100 py-2 text-xs">
-                  <div className="flex justify-between font-mono text-stone-500">
-                    <span>
-                      #{ev.seq} · {ev.actor_name}
-                    </span>
-                    <span>{ev.action}</span>
+                  {replayFilterKind === "stop_before_seq" ? (
+                    <div className="space-y-1.5">
+                      <div className="flex items-center justify-between font-medium text-stone-700">
+                        <span>Stop Before Replay Call #</span>
+                        <span className="font-mono text-amber-800">seq &lt; {replayStopSeq}</span>
+                      </div>
+                      <input
+                        type="range"
+                        min={1}
+                        max={Math.max(1, (replayStatus?.call_count ?? 1) + 1)}
+                        value={replayStopSeq}
+                        onChange={(e) => setReplayStopSeq(Number(e.target.value))}
+                        className="w-full accent-amber-700"
+                      />
+                    </div>
+                  ) : (
+                    <div>
+                      <label className="font-medium text-stone-700">
+                        {replayFilterKind === "exclude_world"
+                          ? "Target World ID"
+                          : replayFilterKind === "exclude_grant"
+                            ? "Target Grant ID"
+                            : "Target Principal Handle / ID"}
+                      </label>
+                      <input
+                        value={replayTarget}
+                        onChange={(e) => setReplayTarget(e.target.value)}
+                        className="mt-1 w-full rounded-lg border border-stone-200 px-3 py-2 font-mono"
+                      />
+                    </div>
+                  )}
+
+                  <div>
+                    <label className="font-medium text-stone-700">Simulation Reason</label>
+                    <input
+                      value={replayDesc}
+                      onChange={(e) => setReplayDesc(e.target.value)}
+                      className="mt-1 w-full rounded-lg border border-stone-200 px-3 py-2"
+                    />
                   </div>
-                  <div className="text-stone-800 mt-0.5">{ev.reason}</div>
+                  <button
+                    type="submit"
+                    disabled={replayBusy}
+                    className="rounded-lg bg-amber-700 px-4 py-2 font-medium text-white hover:bg-amber-800 disabled:opacity-50"
+                  >
+                    {replayBusy ? "Simulating..." : "Simulate Counterfactual History"}
+                  </button>
+                </form>
+
+                {replaySim && (
+                  <div className="rounded-2xl border border-amber-200 bg-white p-5 space-y-4 text-xs">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <div className="font-mono font-semibold text-stone-900">
+                          {replaySim.id}
+                        </div>
+                        <div className="text-stone-500">{replaySim.description}</div>
+                      </div>
+                      <span className="rounded-full bg-amber-50 border border-amber-200 px-2.5 py-0.5 font-mono text-[11px] text-amber-900">
+                        {typeof replaySim.status === "string"
+                          ? replaySim.status
+                          : Object.keys((replaySim.status as Record<string, unknown>) ?? {})[0] ?? "pending"}
+                      </span>
+                    </div>
+
+                    {/* Structured Summary Metrics */}
+                    <div className="grid grid-cols-3 gap-2">
+                      <div className="rounded-lg bg-stone-50 p-2">
+                        <div className="text-[10px] text-stone-500">Excluded Calls</div>
+                        <div className="font-mono text-sm font-semibold text-amber-800">
+                          {replaySim.summary.excluded} / {replaySim.summary.total_calls}
+                        </div>
+                      </div>
+                      <div className="rounded-lg bg-stone-50 p-2">
+                        <div className="text-[10px] text-stone-500">Now Refused / Blocked</div>
+                        <div className="font-mono text-sm font-semibold text-red-700">
+                          {replaySim.summary.now_refused + replaySim.summary.now_invariant_blocked}
+                        </div>
+                      </div>
+                      <div className="rounded-lg bg-stone-50 p-2">
+                        <div className="text-[10px] text-stone-500">Unchanged / Changed</div>
+                        <div className="font-mono text-sm font-semibold text-emerald-700">
+                          {replaySim.summary.unchanged} / {replaySim.summary.reply_changed}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Bucket Diff Summary */}
+                    <div className="space-y-1.5">
+                      <div className="font-semibold text-stone-700">
+                        Affected MoDB Buckets ({replaySim.bucket_diffs.length})
+                      </div>
+                      {replaySim.bucket_diffs.length === 0 ? (
+                        <p className="text-stone-400">Zero storage differences vs Live.</p>
+                      ) : (
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                          {replaySim.bucket_diffs.map((bd) => (
+                            <div
+                              key={bd.bucket}
+                              className="flex items-center justify-between rounded-lg border border-stone-100 bg-stone-50 px-2.5 py-1.5 font-mono text-[11px]"
+                            >
+                              <span className="text-stone-800">{bd.bucket}</span>
+                              <span>
+                                <span className="text-emerald-700">+{bd.added}</span>{" "}
+                                <span className="text-amber-700">~{bd.modified}</span>{" "}
+                                <span className="text-red-700">-{bd.removed}</span>
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Call-by-Call Outcomes */}
+                    {replaySim.outcomes.length > 0 && (
+                      <div className="space-y-1.5">
+                        <div className="font-semibold text-stone-700">
+                          Replayed Call Outcomes ({replaySim.outcomes.length})
+                        </div>
+                        <div className="max-h-40 overflow-y-auto space-y-1">
+                          {replaySim.outcomes.map((raw, i) => {
+                            const obj = (raw as Record<string, Record<string, unknown>>) ?? {};
+                            const kind = Object.keys(obj)[0] ?? "outcome";
+                            const inner = obj[kind] ?? {};
+                            const tone =
+                              kind === "excluded"
+                                ? "bg-amber-50 text-amber-900 border-amber-200"
+                                : kind === "now_refused" || kind === "now_invariant_blocked"
+                                  ? "bg-red-50 text-red-900 border-red-200"
+                                  : "bg-stone-50 text-stone-700 border-stone-200";
+                            return (
+                              <div
+                                key={i}
+                                className={`flex items-center justify-between rounded border px-2 py-1 font-mono text-[11px] ${tone}`}
+                              >
+                                <span>
+                                  #{String(inner.seq ?? i + 1)} · {String(inner.principal ?? "")} ·{" "}
+                                  {String(inner.action ?? "")}
+                                </span>
+                                <span className="font-semibold uppercase">{kind}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {replaySim.status === "pending" && (
+                      <div className="flex gap-2 pt-1">
+                        <button
+                          type="button"
+                          disabled={replayBusy}
+                          onClick={() => void handleAcceptReplay(replaySim.id)}
+                          className="rounded-lg bg-emerald-700 px-3 py-1.5 font-medium text-white hover:bg-emerald-800 disabled:opacity-50"
+                        >
+                          Apply Selective Undo
+                        </button>
+                        <button
+                          type="button"
+                          disabled={replayBusy}
+                          onClick={() => void handleDiscardReplay(replaySim.id)}
+                          className="rounded-lg border border-stone-200 px-3 py-1.5 text-stone-700 hover:bg-stone-50 disabled:opacity-50"
+                        >
+                          Discard
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Right: Recorded Replay Calls & Recent Ledger */}
+              <div className="space-y-4">
+                <div className="rounded-2xl border border-stone-200 bg-white p-5 space-y-2.5 max-h-96 overflow-y-auto text-xs">
+                  <div className="text-sm font-semibold text-stone-900">
+                    Recorded Modb.Replay Call Log ({replayStatus?.calls.length ?? 0})
+                  </div>
+                  {(replayStatus?.calls.length ?? 0) === 0 ? (
+                    <p className="text-stone-400">
+                      No Modb.World proposals accepted under replay logging yet.
+                    </p>
+                  ) : (
+                    (replayStatus?.calls ?? []).map((c) => (
+                      <div
+                        key={c.seq}
+                        className="rounded-lg border border-stone-100 bg-stone-50 p-2.5 space-y-1.5"
+                      >
+                        <div className="flex items-center justify-between font-mono text-[11px] text-stone-600">
+                          <span>
+                            #{c.seq} · {c.principal} · {c.action}
+                          </span>
+                          <span>{c.page_id ?? c.database_id ?? c.world_id ?? ""}</span>
+                        </div>
+                        <div className="text-stone-800">{c.reason}</div>
+                        <div className="flex flex-wrap gap-1.5 pt-0.5">
+                          {c.world_id && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setReplayFilterKind("exclude_world");
+                                setReplayTarget(c.world_id ?? "");
+                                setReplayDesc(`Undo World ${c.world_id} (${c.principal})`);
+                              }}
+                              className="rounded border border-stone-200 bg-white px-2 py-0.5 text-[10px] text-stone-700 hover:bg-stone-100"
+                            >
+                              Exclude World
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setReplayFilterKind("exclude_principal");
+                              setReplayTarget(c.principal);
+                              setReplayDesc(`Exclude actor ${c.principal}`);
+                            }}
+                            className="rounded border border-stone-200 bg-white px-2 py-0.5 text-[10px] text-stone-700 hover:bg-stone-100"
+                          >
+                            Exclude Actor
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setReplayFilterKind("stop_before_seq");
+                              setReplayStopSeq(c.seq);
+                              setReplayDesc(`Rewind before call #${c.seq}`);
+                            }}
+                            className="rounded border border-stone-200 bg-white px-2 py-0.5 text-[10px] text-stone-700 hover:bg-stone-100"
+                          >
+                            Rewind Before #{c.seq}
+                          </button>
+                        </div>
+                      </div>
+                    ))
+                  )}
                 </div>
-              ))}
+
+                <div className="rounded-2xl border border-stone-200 bg-white p-5 space-y-2 max-h-72 overflow-y-auto">
+                  <div className="text-sm font-semibold text-stone-900">
+                    Recent Ledger Transactions ({audit_feed.length})
+                  </div>
+                  {audit_feed.map((ev) => (
+                    <div key={ev.seq} className="border-b border-stone-100 py-2 text-xs">
+                      <div className="flex justify-between font-mono text-stone-500">
+                        <span>
+                          #{ev.seq} · {ev.actor_name}
+                        </span>
+                        <span>{ev.action}</span>
+                      </div>
+                      <div className="text-stone-800 mt-0.5">{ev.reason}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
           </div>
         )}

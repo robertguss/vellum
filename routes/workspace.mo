@@ -16,6 +16,7 @@ home,
 show_collection,
 create_collection,
 show_page,
+page_backlinks,
 create_page,
 patch_blocks,
 verify_page,
@@ -1345,10 +1346,27 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
       audit_entries = try Ledger.audit_tail_store(store, 200).map_error(Db.map_ledger_error)
       page_audit = filter_audit_for_page(audit_entries, page.id, 25)
       citation_drifts = try Db.detect_page_citation_drifts(store, Some(a), page, blks)
+      (explicit_backlinks, semantic_backlinks) = try Db.compute_page_backlinks(
+        store,
+        a,
+        page,
+        blks,
+        6
+      )
 
       Ok((
         (c_list, d_list, col, page, blks, cmt_rows.map(fn(x) x.1 end), att_rows.map(fn(x) x.1 end)),
-        (bps, page_bp_opt, page_meta_opt, page_props, scenarios, page_audit, citation_drifts),
+        (
+          bps,
+          page_bp_opt,
+          page_meta_opt,
+          page_props,
+          scenarios,
+          page_audit,
+          citation_drifts,
+          explicit_backlinks,
+          semantic_backlinks
+        ),
         (principals_json, rel_targets_json, metrics_json)
       ))
     end
@@ -1363,7 +1381,9 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
       page_proposals,
       open_scenarios,
       page_audit,
-      citation_drifts
+      citation_drifts,
+      explicit_backlinks,
+      semantic_backlinks
     ),
     (principals_json, rel_targets_json, resolved_metrics_json)
   ) = page_bundle
@@ -1390,7 +1410,9 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
           "resolved_metrics": resolved_metrics_json,
           "open_scenarios": open_scenarios.to_json,
           "page_audit": page_audit.to_json,
-          "citation_drifts": citation_drifts.to_json
+          "citation_drifts": citation_drifts.to_json,
+          "explicit_backlinks": explicit_backlinks.to_json,
+          "semantic_backlinks": semantic_backlinks.to_json
         })
       )
     )
@@ -1421,9 +1443,53 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
       "resolved_metrics": resolved_metrics_json,
       "open_scenarios": open_scenarios.to_json,
       "page_audit": page_audit.to_json,
-      "citation_drifts": citation_drifts.to_json
+      "citation_drifts": citation_drifts.to_json,
+      "explicit_backlinks": explicit_backlinks.to_json,
+      "semantic_backlinks": semantic_backlinks.to_json
     }
   )
+end
+
+## `GET /api/pages/:id/backlinks` — Returns grant-filtered explicit (`PageLink`/`Citation`) and
+## semantic (`Modb.Vec`) backlinks pointing to page `id`.
+fn page_backlinks(req: Api.Request, id: Text, auth: AuthContext, rf: ReadFiles) : Result(
+  Api.Response,
+  AppError
+)
+  if not Policy.action_permitted?(auth, "read")
+    return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'read'"))
+  end
+  if not rf.exists?(Db.ledger_db_path)
+    return Error(Missing(entity: "page", id: id))
+  end
+  lim = case req.query_param("limit")
+    Some(s): s.trim.to_int or 8
+    None: 8
+  end
+  payload = try Ledger.read_locked(
+    rf,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      page = case try Table.get(store, Db.pages_table(), id).map_error(Db.map_table_error)
+        Some(p) if p.archived_at == None: p
+        Some(_) | None: return Error(Missing(entity: "page", id: id))
+      end
+      try Policy.require_collection_access(auth, "read", page.collection_id)
+      blks = try Db.load_page_blocks(store, page.id)
+      (exp, sem) = try Db.compute_page_backlinks(store, auth, page, blks, lim)
+      Ok(
+        Json.Object({
+          "page_id": Json.String(page.id),
+          "explicit_backlinks": exp.to_json,
+          "semantic_backlinks": sem.to_json
+        })
+      )
+    end
+  )
+  Ok(json_ok(200, payload))
 end
 
 ## `POST /api/pages` — Creates a page with canonical blocks and BM25 FTS indexing.

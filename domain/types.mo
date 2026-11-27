@@ -19,6 +19,8 @@ BlockOp(..),
 Comment(..),
 Attachment(..),
 SearchResultItem(..),
+ExplicitBacklink(..),
+SemanticBacklink(..),
 AuditFeedItem(..),
 AppError(..),
 to_text
@@ -245,6 +247,26 @@ struct SearchResultItem
   fts_rank: Option(Int)
   vec_rank: Option(Int)
   vec_score: Option(Float)
+end
+
+## Explicit incoming reference (`PageLink` or block/page `Citation`) pointing to a target page.
+struct ExplicitBacklink
+  source_page_id: Text
+  source_title: Text
+  source_collection_id: Text
+  block_id: Text
+  kind: Text
+  excerpt: Text
+end
+
+## Semantically similar page surfaced via `Modb.Vec` cosine search (grant-filtered).
+struct SemanticBacklink
+  page_id: Text
+  collection_id: Text
+  title: Text
+  similarity: Float
+  summary: Text
+  vector_backend: Text
 end
 
 ## UI-ready summary of a `Modb.Ledger.AuditEntry` (`actor_name` avoids Mo's `actor` keyword).

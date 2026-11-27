@@ -41,6 +41,7 @@ matches_filters?,
 sort_enriched_rows,
 group_rows_for_board,
 filter_calendar_range,
+filter_timeline_range,
 row_plain_text
 use Crypto
 use Date
@@ -184,11 +185,13 @@ struct DbRow
   version: Int
 end
 
-## View presentation configuration for Table, Kanban Board, or Calendar views.
+## View presentation configuration for Table, Kanban Board, Calendar, Gallery, or Timeline views.
 enum DbViewKind
   TableView(visible_prop_ids: List(Text), column_widths: Map(Text, Int))
   BoardView(group_by_prop_id: Text, card_prop_ids: List(Text), hide_empty_groups: Bool)
   CalendarView(date_prop_id: Text, card_prop_ids: List(Text))
+  GalleryView(cover_prop_id: Option(Text), card_prop_ids: List(Text), card_size: Text)
+  TimelineView(start_date_prop_id: Text, end_date_prop_id: Option(Text), card_prop_ids: List(Text))
 end
 
 ## Saved view filter predicate operators.
@@ -1327,6 +1330,71 @@ fn filter_calendar_range(
   out
 end
 
+fn timeline_row_span(
+  r: EnrichedRow,
+  start_prop_id: Text,
+  end_prop_id_opt: Option(Text)
+) : Option((Date.Date, Date.Date))
+  case effective_cell(r, start_prop_id)
+    DateVal(start: st, end_date: inline_end):
+      explicit_end = case end_prop_id_opt
+        Some(ep_id):
+          case effective_cell(r, ep_id)
+            DateVal(start: est, end_date: eed_opt): Some(eed_opt or est)
+            Empty | TextVal(_) | NumberVal(_) | SelectVal(option_id: _) | MultiSelectVal(
+              option_ids: _
+            ) | BoolVal(_) | PrincipalVal(_) | UrlVal(_) | RelationVal(row_ids: _): None
+          end
+        None: None
+      end
+      eff_end = case explicit_end
+        Some(d): d
+        None: inline_end or st
+      end
+      final_end = if eff_end < st: st else: eff_end
+      Some((st, final_end))
+    Empty | TextVal(_) | NumberVal(_) | SelectVal(option_id: _) | MultiSelectVal(option_ids: _) | BoolVal(
+      _
+    ) | PrincipalVal(_) | UrlVal(_) | RelationVal(row_ids: _): None
+  end
+end
+
+## Filters rows overlapping optional `[from_date, to_date]` across `[start_date_prop_id, end_date_prop_id]`
+## and sorts scheduled items chronologically ascending (unscheduled rows retained at the end when unfiltered).
+fn filter_timeline_range(
+  rows: List(EnrichedRow),
+  start_prop_id: Text,
+  end_prop_id_opt: Option(Text),
+  from_date: Option(Date.Date),
+  to_date: Option(Date.Date)
+) : List(EnrichedRow)
+  has_bound = from_date != None or to_date != None
+  var scheduled = []
+  var unscheduled = []
+  for r in rows
+    case timeline_row_span(r, start_prop_id, end_prop_id_opt)
+      Some((st, eff_end)):
+        after_from = case from_date
+          Some(f): eff_end >= f
+          None: true
+        end
+        before_to = case to_date
+          Some(t): st <= t
+          None: true
+        end
+        if after_from and before_to
+          scheduled = scheduled.append((st.to_iso, r))
+        end
+      None:
+        if not has_bound
+          unscheduled = unscheduled.append(r)
+        end
+    end
+  end
+  ordered = scheduled.sort_by(fn(pair) pair.0 end).map(fn(pair) pair.1 end)
+  ordered.concat(unscheduled)
+end
+
 ## Extracts searchable plain text from a `DbRow`'s cells for `Modb.Fts` indexing.
 fn row_plain_text(def: DatabaseDef, row: DbRow) : Text
   var parts = []
@@ -1676,4 +1744,71 @@ test "AiDerived column schema validation, typed output parsing, input hash drift
   b_groups = group_rows_for_board(def, [EnrichedRow(row: r1, rollups: {})], "risk", false)
   assert b_groups.size == 3
   assert (b_groups.get(0) or stop "bg0").rows.size == 1
+
+  # GalleryView / TimelineView JSON round-trip + filter_timeline_range chronological order & overlap
+  g_kind = GalleryView(cover_prop_id: Some("cover"), card_prop_ids: ["risk"], card_size: "md")
+  assert Json.decode[DbViewKind](Json.encode(g_kind).bytes) == Ok(g_kind)
+  t_kind = TimelineView(
+    start_date_prop_id: "start_at",
+    end_date_prop_id: Some("end_at"),
+    card_prop_ids: ["risk"]
+  )
+  assert Json.decode[DbViewKind](Json.encode(t_kind).bytes) == Ok(t_kind)
+
+  tl_early = DbRow(
+    id: "tl_1",
+    database_id: "db_ai",
+    page_id: "pg_tl1",
+    cells: {
+      "title": TextVal("Phase A"),
+      "start_at": DateVal(start: Date.parse_iso("2026-12-01") or stop "d1", end_date: None),
+      "end_at": DateVal(start: Date.parse_iso("2026-12-10") or stop "d2", end_date: None)
+    },
+    created_by: "usr_1",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+  tl_late = DbRow(
+    id: "tl_2",
+    database_id: "db_ai",
+    page_id: "pg_tl2",
+    cells: {
+      "title": TextVal("Phase B"),
+      "start_at": DateVal(start: Date.parse_iso("2026-12-15") or stop "d3", end_date: None),
+      "end_at": DateVal(start: Date.parse_iso("2026-12-22") or stop "d4", end_date: None)
+    },
+    created_by: "usr_1",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+  tl_unsched = DbRow(
+    id: "tl_3",
+    database_id: "db_ai",
+    page_id: "pg_tl3",
+    cells: {"title": TextVal("Backlog")},
+    created_by: "usr_1",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+  tl_in = [
+    EnrichedRow(row: tl_late, rollups: {}),
+    EnrichedRow(row: tl_unsched, rollups: {}),
+    EnrichedRow(row: tl_early, rollups: {})
+  ]
+  tl_all = filter_timeline_range(tl_in, "start_at", Some("end_at"), None, None)
+  assert tl_all.map(fn(e) e.row.id end) == ["tl_1", "tl_2", "tl_3"]
+  tl_win = filter_timeline_range(
+    tl_in,
+    "start_at",
+    Some("end_at"),
+    Date.parse_iso("2026-12-08"),
+    Date.parse_iso("2026-12-12")
+  )
+  assert tl_win.map(fn(e) e.row.id end) == ["tl_1"]
 end

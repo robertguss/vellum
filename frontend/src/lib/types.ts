@@ -356,7 +356,15 @@ export interface EnrichedRow {
 export type DbViewKind =
   | { table_view: { visible_prop_ids: string[]; column_widths: Record<string, number> } }
   | { board_view: { group_by_prop_id: string; card_prop_ids: string[]; hide_empty_groups: boolean } }
-  | { calendar_view: { date_prop_id: string; card_prop_ids: string[] } };
+  | { calendar_view: { date_prop_id: string; card_prop_ids: string[] } }
+  | { gallery_view: { cover_prop_id: string | null; card_prop_ids: string[]; card_size: string } }
+  | {
+      timeline_view: {
+        start_date_prop_id: string;
+        end_date_prop_id: string | null;
+        card_prop_ids: string[];
+      };
+    };
 
 export type FilterOp =
   | "eq"
@@ -780,4 +788,115 @@ export interface CompiledPackResult {
   omitted_count: number;
   skipped_stale_count: number;
   compiled_at: string;
+}
+
+export interface ExplicitBacklink {
+  source_page_id: string;
+  source_title: string;
+  source_collection_id: string;
+  block_id: string;
+  kind: "page_link" | "citation" | string;
+  excerpt: string;
+}
+
+export interface SemanticBacklink {
+  page_id: string;
+  collection_id: string;
+  title: string;
+  similarity: number;
+  summary: string;
+  vector_backend: "neural" | "sketch" | string;
+}
+
+export interface ReplayBaseline {
+  pin_id: string;
+  schema_version: number;
+  txid: number;
+  pinned_at: string;
+}
+
+export interface ReplayCallRecord {
+  seq: number;
+  audit_seq: number | null;
+  principal: string;
+  grant_id: string | null;
+  world_id: string | null;
+  action: string;
+  reason: string;
+  at: string;
+  page_id: string | null;
+  database_id: string | null;
+  outcome: unknown;
+}
+
+export interface ReplaySummary {
+  total_calls: number;
+  excluded: number;
+  unchanged: number;
+  reply_changed: number;
+  now_refused: number;
+  now_invariant_blocked: number;
+  still_refused: number;
+  now_accepted: number;
+  migrations_run: number[];
+}
+
+export interface ReplayBucketDiff {
+  bucket: string;
+  added: number;
+  removed: number;
+  modified: number;
+}
+
+export interface ReplayProposalSummary {
+  id: string;
+  description: string;
+  filter: unknown;
+  base_call_seq: number;
+  created_by: string;
+  created_at: string;
+  status: unknown;
+  summary: ReplaySummary;
+  outcomes: unknown[];
+  bucket_diffs: ReplayBucketDiff[];
+}
+
+export interface ReplayStatusResponse {
+  baseline: ReplayBaseline | null;
+  call_count: number;
+  calls: ReplayCallRecord[];
+  proposals: ReplayProposalSummary[];
+}
+
+export interface PageTimeTravelStop {
+  seq: number;
+  stop_before_seq: number;
+  label: string;
+  principal: string;
+  action: string;
+  reason: string;
+  world_id: string | null;
+  grant_id: string | null;
+  at: string;
+}
+
+export interface PageHistoryResponse {
+  page_id: string;
+  current_version: number;
+  baseline: ReplayBaseline | null;
+  can_scrub: boolean;
+  total_replay_calls: number;
+  stops: PageTimeTravelStop[];
+}
+
+export interface PageTimeTravelResponse {
+  page_id: string;
+  stop_before_seq: number;
+  existed_at_point: boolean;
+  historical_page: Page | null;
+  historical_blocks: Block[];
+  historical_markdown: string;
+  ops_to_live_count: number;
+  summary: ReplaySummary;
+  outcomes: unknown[];
 }
