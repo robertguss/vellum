@@ -35,6 +35,8 @@ validate_row_cells,
 extract_row_title,
 cell_index_tokens,
 compute_rollup,
+compute_rollup_with_target,
+is_computed_property?,
 effective_cell,
 matches_filter?,
 matches_filters?,
@@ -42,13 +44,18 @@ sort_enriched_rows,
 group_rows_for_board,
 filter_calendar_range,
 filter_timeline_range,
-row_plain_text
+row_plain_text,
+decode_cell_map_json,
+decode_property_defs_json,
+decode_filter_rules_json,
+decode_sort_rules_json,
+check_unique_id_immutable
 use Crypto
 use Date
 use Domain.Types{Citation}
 use Json
 
-## Visual badge color for `Select` and `MultiSelect` property options.
+## Visual badge color for `Select`, `Status`, and `MultiSelect` property options.
 enum SelectOptionColor
   Gray
   Blue
@@ -58,7 +65,7 @@ enum SelectOptionColor
   Purple
 end
 
-## Allowed discrete choice within a `Select` or `MultiSelect` column.
+## Allowed discrete choice within a `Select`, `Status`, or `MultiSelect` column.
 struct SelectOption
   id: Text
   label: Text
@@ -72,6 +79,7 @@ enum RollupAgg
   SumValues
   MinValue
   MaxValue
+  PercentPerGroup
 end
 
 ## Output type enforced when compiling an `AiDerived` property via `validate_cell`.
@@ -123,9 +131,18 @@ enum PropertyKind
   DateProp(include_time: Bool)
   Select(options: List(SelectOption))
   MultiSelect(options: List(SelectOption))
+  Status(options: List(SelectOption), done_option_ids: List(Text))
   Checkbox
   Person
+  Email
+  FileList
   Url
+  UniqueId(prefix: Text)
+  Formula(expression: Text, format: Text)
+  CreatedTime
+  CreatedBy
+  LastEditedTime
+  LastEditedBy
   Relation(target_db_id: Text, inverse_prop_id: Option(Text))
   Rollup(relation_prop_id: Text, target_prop_id: Text, agg: RollupAgg)
   AiDerived(
@@ -168,6 +185,7 @@ enum CellValue
   MultiSelectVal(option_ids: List(Text))
   BoolVal(Bool)
   PrincipalVal(List(Text))
+  FilesVal(attachment_ids: List(Text))
   UrlVal(Text)
   RelationVal(row_ids: List(Text))
 end
@@ -281,12 +299,50 @@ fn prop_is_ai_derived?(kind: PropertyKind) : Bool
     ): true
     Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
       options: _
-    ) | Checkbox | Person | Url | Relation(target_db_id: _, inverse_prop_id: _) | Rollup(
-      relation_prop_id: _,
-      target_prop_id: _,
-      agg: _
+    ) | Status(options: _, done_option_ids: _) | Checkbox | Person | Email | FileList | Url | UniqueId(
+      prefix: _
+    ) | Formula(expression: _, format: _) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
+      target_db_id: _,
+      inverse_prop_id: _
+    ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): false
+  end
+end
+
+## Whether a property's value is computed dynamically at query time (`Rollup`, `Formula`, or audit metadata).
+fn is_computed_property?(kind: PropertyKind) : Bool
+  case kind
+    Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | Formula(
+      expression: _,
+      format: _
+    ) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy: true
+    Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
+      options: _
+    ) | Status(options: _, done_option_ids: _) | Checkbox | Person | Email | FileList | Url | UniqueId(
+      prefix: _
+    ) | Relation(target_db_id: _, inverse_prop_id: _) | AiDerived(
+      prompt: _,
+      source_prop_ids: _,
+      include_row_body: _,
+      output_kind: _,
+      mode: _,
+      daily_call_cap: _
     ): false
   end
+end
+
+fn is_done_status_label?(label: Text) : Bool
+  low = label.trim.ascii_lowercase
+  low == "done" or low == "complete" or low == "completed" or low == "shipped" or low == "closed"
+end
+
+fn valid_email?(raw: Text) : Bool
+  t = raw.trim
+  return false if t.empty? or t.contains?(" ") or t.contains?("\t") or t.contains?("\n") or t.contains?("\r")
+  parts = t.split("@")
+  return false if parts.size != 2
+  local = parts.get(0) or ""
+  dom = parts.get(1) or ""
+  not local.empty? and dom.contains?(".") and not dom.starts_with?(".") and not dom.ends_with?(".")
 end
 
 ## Whether `def` declares at least one `AiDerived` column.
@@ -322,11 +378,12 @@ fn compute_ai_input_hash(def: DatabaseDef, prop: PropertyDef, row: DbRow, body_p
     ): (sids, inc)
     Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
       options: _
-    ) | Checkbox | Person | Url | Relation(target_db_id: _, inverse_prop_id: _) | Rollup(
-      relation_prop_id: _,
-      target_prop_id: _,
-      agg: _
-    ): ([], false)
+    ) | Status(options: _, done_option_ids: _) | Checkbox | Person | Email | FileList | Url | UniqueId(
+      prefix: _
+    ) | Formula(expression: _, format: _) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
+      target_db_id: _,
+      inverse_prop_id: _
+    ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): ([], false)
   end
 
   var target_ids = []
@@ -530,7 +587,7 @@ fn validate_options(opts: List(SelectOption)) : Option(Text)
   None
 end
 
-## Validates a `DatabaseDef` schema (non-empty title, unique props, >= 1 `Title`, valid rollups).
+## Validates a `DatabaseDef` schema (non-empty title, unique props, >= 1 `Title`, valid rollups, status, unique_id, formula).
 fn validate_database_def(def: DatabaseDef) : Option(Text)
   return Some("database title must not be empty") if def.title.trim.empty?
   return Some("database version must be >= 1") if def.version < 1
@@ -557,6 +614,32 @@ fn validate_database_def(def: DatabaseDef) : Option(Text)
         case validate_options(opts)
           Some(msg): return Some(msg)
           None: Unit
+        end
+      Status(options: opts, done_option_ids: done_ids):
+        case validate_options(opts)
+          Some(msg): return Some(msg)
+          None: Unit
+        end
+        for did in done_ids
+          if not has_option_id?(opts, did)
+            return Some("Status property '#{pid}' done_option_ids references unknown option '#{did}'")
+          end
+        end
+      UniqueId(prefix: pfx):
+        trimmed_pfx = pfx.trim
+        if trimmed_pfx.byte_count > 24 or pfx.contains?("\n") or pfx.contains?("\r") or
+          trimmed_pfx.contains?(" ")
+          return Some(
+            "UniqueId property '#{pid}' prefix must be <= 24 chars without spaces or newlines"
+          )
+        end
+      Formula(expression: expr, format: fmt):
+        if expr.trim.empty?
+          return Some("Formula property '#{pid}' requires a non-empty expression")
+        end
+        if fmt != "" and fmt != "plain" and fmt != "number" and fmt != "currency" and fmt != "percent" and
+          fmt != "text" and fmt != "date" and fmt != "bool"
+          return Some("invalid Formula format '#{fmt}' on property '#{pid}'")
         end
       Relation(target_db_id: tdb, inverse_prop_id: _):
         if tdb.trim.empty?
@@ -588,7 +671,7 @@ fn validate_database_def(def: DatabaseDef) : Option(Text)
             end
           AiText | AiDate | AiBool: Unit
         end
-      RichText | DateProp(include_time: _) | Checkbox | Person | Url | Rollup(
+      RichText | DateProp(include_time: _) | Checkbox | Person | Email | FileList | Url | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Rollup(
         relation_prop_id: _,
         target_prop_id: _,
         agg: _
@@ -613,7 +696,13 @@ fn validate_database_def(def: DatabaseDef) : Option(Text)
               Relation(target_db_id: _, inverse_prop_id: _): Unit
               Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
                 options: _
-              ) | Checkbox | Person | Url | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
+              ) | Status(options: _, done_option_ids: _) | Checkbox | Person | Email | FileList | Url | UniqueId(
+                prefix: _
+              ) | Formula(expression: _, format: _) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Rollup(
+                relation_prop_id: _,
+                target_prop_id: _,
+                agg: _
+              ) | AiDerived(
                 prompt: _,
                 source_prop_ids: _,
                 include_row_body: _,
@@ -643,7 +732,12 @@ fn validate_database_def(def: DatabaseDef) : Option(Text)
         end
       Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
         options: _
-      ) | Checkbox | Person | Url | Relation(target_db_id: _, inverse_prop_id: _): Unit
+      ) | Status(options: _, done_option_ids: _) | Checkbox | Person | Email | FileList | Url | UniqueId(
+        prefix: _
+      ) | Formula(expression: _, format: _) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
+        target_db_id: _,
+        inverse_prop_id: _
+      ): Unit
     end
   end
   None
@@ -656,6 +750,7 @@ fn cell_empty?(val: CellValue) : Bool
     SelectVal(option_id: oid): oid.trim.empty?
     MultiSelectVal(option_ids: oids): oids.empty?
     PrincipalVal(pids): pids.empty?
+    FilesVal(attachment_ids: aids): aids.empty?
     RelationVal(row_ids: rids): rids.empty?
     NumberVal(_) | DateVal(start: _, end_date: _) | BoolVal(_): false
   end
@@ -668,10 +763,14 @@ end
 ## Validates one `CellValue` against its column `PropertyDef` schema.
 fn validate_cell(prop: PropertyDef, val: CellValue) : Option(Text)
   case val
-    Empty: return if prop.required: Some("required property '#{prop.id}' cannot be Empty") else: None
+    Empty: return if prop.required and not is_computed_property?(prop.kind): Some(
+      "required property '#{prop.id}' cannot be Empty"
+    ) else: None
     TextVal(_) | NumberVal(_) | DateVal(start: _, end_date: _) | SelectVal(option_id: _) | MultiSelectVal(
       option_ids: _
-    ) | BoolVal(_) | PrincipalVal(_) | UrlVal(_) | RelationVal(row_ids: _): Unit
+    ) | BoolVal(_) | PrincipalVal(_) | FilesVal(attachment_ids: _) | UrlVal(_) | RelationVal(
+      row_ids: _
+    ): Unit
   end
 
   case (prop.kind, val)
@@ -688,11 +787,14 @@ fn validate_cell(prop: PropertyDef, val: CellValue) : Option(Text)
         Some(ed) if ed < st: Some("date property '#{prop.id}' end_date cannot precede start")
         Some(_) | None: None
       end
-    (Select(options: opts), SelectVal(option_id: oid)):
+    (Select(options: opts), SelectVal(option_id: oid)) | (
+      Status(options: opts, done_option_ids: _),
+      SelectVal(option_id: oid)
+    ):
       if has_option_id?(opts, oid)
         None
       else
-        Some("invalid select option '#{oid}' for property '#{prop.id}'")
+        Some("invalid option '#{oid}' for property '#{prop.id}'")
       end
     (MultiSelect(options: opts), MultiSelectVal(option_ids: oids)):
       for oid in oids
@@ -708,6 +810,18 @@ fn validate_cell(prop: PropertyDef, val: CellValue) : Option(Text)
       else
         None
       end
+    (Email, TextVal(e)):
+      if valid_email?(e)
+        None
+      else
+        Some("Email property '#{prop.id}' must be a valid email address")
+      end
+    (FileList, FilesVal(attachment_ids: aids)):
+      if aids.any?(fn(x) x.trim.empty? end)
+        Some("FileList property '#{prop.id}' contains blank attachment ID")
+      else
+        None
+      end
     (Url, UrlVal(u)):
       trimmed = u.trim
       if trimmed.starts_with?("https://") or trimmed.starts_with?("http://")
@@ -715,14 +829,23 @@ fn validate_cell(prop: PropertyDef, val: CellValue) : Option(Text)
       else
         Some("Url property '#{prop.id}' must start with http:// or https://")
       end
+    (UniqueId(prefix: _), TextVal(s)):
+      if s.trim.empty?
+        Some("UniqueId property '#{prop.id}' must not be blank")
+      else
+        None
+      end
     (Relation(target_db_id: _, inverse_prop_id: _), RelationVal(row_ids: rids)):
       if rids.any?(fn(x) x.trim.empty? end)
         Some("Relation property '#{prop.id}' contains blank row ID")
       else
         None
       end
-    (Rollup(relation_prop_id: _, target_prop_id: _, agg: _), _): Some(
-      "Rollup property '#{prop.id}' is computed dynamically and cannot be written directly"
+    (Rollup(relation_prop_id: _, target_prop_id: _, agg: _), _) | (
+      Formula(expression: _, format: _),
+      _
+    ) | (CreatedTime, _) | (CreatedBy, _) | (LastEditedTime, _) | (LastEditedBy, _): Some(
+      "computed property '#{prop.id}' cannot be written directly"
     )
     (
       AiDerived(
@@ -770,7 +893,7 @@ fn validate_row_cells(def: DatabaseDef, row: DbRow) : Option(Text)
   end
 
   for p in def.properties
-    if p.required
+    if p.required and not is_computed_property?(p.kind)
       cval = row.cells.get(p.id) or Empty
       if cell_empty?(cval)
         return Some("required property '#{p.id}' is missing")
@@ -791,11 +914,12 @@ fn extract_row_title(def: DatabaseDef, cells: Map(Text, CellValue)) : Text
         end
       RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
         options: _
-      ) | Checkbox | Person | Url | Relation(target_db_id: _, inverse_prop_id: _) | Rollup(
-        relation_prop_id: _,
-        target_prop_id: _,
-        agg: _
-      ) | AiDerived(
+      ) | Status(options: _, done_option_ids: _) | Checkbox | Person | Email | FileList | Url | UniqueId(
+        prefix: _
+      ) | Formula(expression: _, format: _) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
+        target_db_id: _,
+        inverse_prop_id: _
+      ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
         prompt: _,
         source_prop_ids: _,
         include_row_body: _,
@@ -819,6 +943,7 @@ fn cell_index_tokens(prop_id: Text, val: CellValue) : List((Text, Text))
     MultiSelectVal(option_ids: oids): oids.map(fn(oid) (prop_id, oid) end)
     BoolVal(b): [(prop_id, if b: "true" else: "false")]
     PrincipalVal(pids): pids.map(fn(pid) (prop_id, pid) end)
+    FilesVal(attachment_ids: aids): aids.map(fn(aid) (prop_id, aid) end)
     RelationVal(row_ids: rids): rids.map(fn(rid) (prop_id, rid) end)
   end
 end
@@ -827,11 +952,87 @@ fn non_empty_cells(cells: List(CellValue)) : List(CellValue)
   cells.filter(fn(c) not cell_empty?(c) end)
 end
 
-## Computes a `Rollup` cell using exact `Decimal` arithmetic (`SumValues`, `MinValue`, `MaxValue`, etc.).
-fn compute_rollup(agg: RollupAgg, target_cells: List(CellValue)) : CellValue
+fn rollup_cell_done?(c: CellValue, target_prop: Option(PropertyDef)) : Bool
+  case c
+    BoolVal(b): b
+    SelectVal(option_id: oid):
+      case target_prop
+        Some(tp):
+          case tp.kind
+            Status(options: opts, done_option_ids: dids):
+              if not dids.empty?
+                dids.contains?(oid)
+              else
+                var matched_label = oid
+                for o in opts
+                  if o.id == oid
+                    matched_label = o.label
+                  end
+                end
+                is_done_status_label?(matched_label)
+              end
+            Select(options: opts) | AiDerived(
+              prompt: _,
+              source_prop_ids: _,
+              include_row_body: _,
+              output_kind: AiSelect(options: opts),
+              mode: _,
+              daily_call_cap: _
+            ):
+              var matched_label = oid
+              for o in opts
+                if o.id == oid
+                  matched_label = o.label
+                end
+              end
+              is_done_status_label?(matched_label)
+            Title | RichText | Number(format: _) | DateProp(include_time: _) | MultiSelect(
+              options: _
+            ) | Checkbox | Person | Email | FileList | Url | UniqueId(prefix: _) | Formula(
+              expression: _,
+              format: _
+            ) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
+              target_db_id: _,
+              inverse_prop_id: _
+            ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
+              prompt: _,
+              source_prop_ids: _,
+              include_row_body: _,
+              output_kind: _,
+              mode: _,
+              daily_call_cap: _
+            ): is_done_status_label?(oid)
+          end
+        None: is_done_status_label?(oid)
+      end
+    Empty | TextVal(_) | NumberVal(_) | DateVal(start: _, end_date: _) | MultiSelectVal(
+      option_ids: _
+    ) | PrincipalVal(_) | FilesVal(attachment_ids: _) | UrlVal(_) | RelationVal(row_ids: _): false
+  end
+end
+
+## Computes a `Rollup` cell using exact `Decimal` arithmetic (`SumValues`, `PercentPerGroup`, `MinValue`, `MaxValue`, etc.).
+fn compute_rollup_with_target(
+  agg: RollupAgg,
+  target_cells: List(CellValue),
+  target_prop: Option(PropertyDef)
+) : CellValue
   case agg
     CountAll: NumberVal(target_cells.size.to_decimal)
     CountValues: NumberVal(non_empty_cells(target_cells).size.to_decimal)
+    PercentPerGroup:
+      if target_cells.empty?
+        NumberVal(zero_decimal())
+      else
+        var done_cnt = 0
+        for c in target_cells
+          if rollup_cell_done?(c, target_prop)
+            done_cnt += 1
+          end
+        end
+        ratio = (done_cnt.to_decimal / target_cells.size.to_decimal).round(4)
+        NumberVal(ratio)
+      end
     SumValues:
       var acc = zero_decimal()
       var count = 0
@@ -842,7 +1043,9 @@ fn compute_rollup(agg: RollupAgg, target_cells: List(CellValue)) : CellValue
             count += 1
           Empty | TextVal(_) | DateVal(start: _, end_date: _) | SelectVal(option_id: _) | MultiSelectVal(
             option_ids: _
-          ) | BoolVal(_) | PrincipalVal(_) | UrlVal(_) | RelationVal(row_ids: _): Unit
+          ) | BoolVal(_) | PrincipalVal(_) | FilesVal(attachment_ids: _) | UrlVal(_) | RelationVal(
+            row_ids: _
+          ): Unit
         end
       end
       if count == 0: NumberVal(zero_decimal()) else: NumberVal(acc)
@@ -861,7 +1064,7 @@ fn compute_rollup(agg: RollupAgg, target_cells: List(CellValue)) : CellValue
           end
           Empty | TextVal(_) | SelectVal(option_id: _) | MultiSelectVal(option_ids: _) | BoolVal(_) | PrincipalVal(
             _
-          ) | UrlVal(_) | RelationVal(row_ids: _): Unit
+          ) | FilesVal(attachment_ids: _) | UrlVal(_) | RelationVal(row_ids: _): Unit
         end
       end
       case best_num
@@ -887,7 +1090,7 @@ fn compute_rollup(agg: RollupAgg, target_cells: List(CellValue)) : CellValue
           end
           Empty | TextVal(_) | SelectVal(option_id: _) | MultiSelectVal(option_ids: _) | BoolVal(_) | PrincipalVal(
             _
-          ) | UrlVal(_) | RelationVal(row_ids: _): Unit
+          ) | FilesVal(attachment_ids: _) | UrlVal(_) | RelationVal(row_ids: _): Unit
         end
       end
       case best_num
@@ -899,6 +1102,11 @@ fn compute_rollup(agg: RollupAgg, target_cells: List(CellValue)) : CellValue
           end
       end
   end
+end
+
+## Computes a `Rollup` cell using exact `Decimal` arithmetic (`SumValues`, `MinValue`, `MaxValue`, etc.).
+fn compute_rollup(agg: RollupAgg, target_cells: List(CellValue)) : CellValue
+  compute_rollup_with_target(agg, target_cells, None)
 end
 
 ## Reads a property's effective cell from either stored row cells or computed rollups.
@@ -979,7 +1187,9 @@ fn cell_equals_json?(cell: CellValue, target: Json) : Bool
           (b and low == "true") or (not b and low == "false")
         Json.Null | Json.Number(_) | Json.Array(_) | Json.Object(_): false
       end
-    MultiSelectVal(option_ids: xs) | PrincipalVal(xs) | RelationVal(row_ids: xs):
+    MultiSelectVal(option_ids: xs) | PrincipalVal(xs) | FilesVal(attachment_ids: xs) | RelationVal(
+      row_ids: xs
+    ):
       case target
         Json.String(t): xs.contains?(t)
         Json.Array(_): xs == json_to_text_list(target)
@@ -1017,7 +1227,9 @@ fn cell_compare_json(cell: CellValue, target: Json) : Option(Int)
         0
       end
     end)
-    Empty | MultiSelectVal(option_ids: _) | BoolVal(_) | PrincipalVal(_) | RelationVal(row_ids: _): None
+    Empty | MultiSelectVal(option_ids: _) | BoolVal(_) | PrincipalVal(_) | FilesVal(
+      attachment_ids: _
+    ) | RelationVal(row_ids: _): None
   end
 end
 
@@ -1035,9 +1247,9 @@ fn cell_contains_text?(cell: CellValue, needle_raw: Text) : Bool
       end
     )
     BoolVal(b): (if b: "true" else: "false").contains?(needle)
-    MultiSelectVal(option_ids: xs) | PrincipalVal(xs) | RelationVal(row_ids: xs): xs.any?(
-      fn(x) x.ascii_lowercase.contains?(needle) end
-    )
+    MultiSelectVal(option_ids: xs) | PrincipalVal(xs) | FilesVal(attachment_ids: xs) | RelationVal(
+      row_ids: xs
+    ): xs.any?(fn(x) x.ascii_lowercase.contains?(needle) end)
   end
 end
 
@@ -1054,9 +1266,9 @@ fn cell_in_set?(cell: CellValue, allowed: List(Text)) : Bool
       end
     end)
     BoolVal(b): allowed.contains?(if b: "true" else: "false")
-    MultiSelectVal(option_ids: xs) | PrincipalVal(xs) | RelationVal(row_ids: xs): xs.any?(
-      fn(x) allowed.contains?(x) end
-    )
+    MultiSelectVal(option_ids: xs) | PrincipalVal(xs) | FilesVal(attachment_ids: xs) | RelationVal(
+      row_ids: xs
+    ): xs.any?(fn(x) allowed.contains?(x) end)
   end
 end
 
@@ -1114,7 +1326,9 @@ fn cell_sort_text(cell: CellValue) : Text
     NumberVal(d): d.to_text
     DateVal(start: dt, end_date: _): dt.to_iso
     BoolVal(b): if b: "1" else: "0"
-    MultiSelectVal(option_ids: xs) | PrincipalVal(xs) | RelationVal(row_ids: xs): xs.join(",")
+    MultiSelectVal(option_ids: xs) | PrincipalVal(xs) | FilesVal(attachment_ids: xs) | RelationVal(
+      row_ids: xs
+    ): xs.join(",")
   end
 end
 
@@ -1227,7 +1441,7 @@ fn sort_enriched_rows(rows: List(EnrichedRow), sorts: List(DbSortRule)) : List(E
   merge_sorted_rows(left, right, sorts)
 end
 
-## Groups filtered/sorted rows into Kanban columns defined by a `Select` or `Checkbox` property.
+## Groups filtered/sorted rows into Kanban columns defined by a `Select`, `Status`, or `Checkbox` property.
 fn group_rows_for_board(
   def: DatabaseDef,
   rows: List(EnrichedRow),
@@ -1245,7 +1459,7 @@ fn group_rows_for_board(
   case prop_opt
     Some(p):
       case p.kind
-        Select(options: opts):
+        Select(options: opts) | Status(options: opts, done_option_ids: _):
           for o in opts
             ordered_buckets = ordered_buckets.append((o.id, o.label))
           end
@@ -1266,7 +1480,9 @@ fn group_rows_for_board(
             AiBool: ordered_buckets = [("true", "Checked"), ("false", "Unchecked")]
             AiText | AiNumber(format: _) | AiDate: Unit
           end
-        Title | RichText | Number(format: _) | DateProp(include_time: _) | MultiSelect(options: _) | Person | Url | Relation(
+        Title | RichText | Number(format: _) | DateProp(include_time: _) | MultiSelect(options: _) | Person | Email | FileList | Url | UniqueId(
+          prefix: _
+        ) | Formula(expression: _, format: _) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
           target_db_id: _,
           inverse_prop_id: _
         ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): Unit
@@ -1283,7 +1499,7 @@ fn group_rows_for_board(
       TextVal(s) if not s.trim.empty?: s.trim
       Empty | TextVal(_) | SelectVal(option_id: _) | NumberVal(_) | DateVal(start: _, end_date: _) | MultiSelectVal(
         option_ids: _
-      ) | PrincipalVal(_) | UrlVal(_) | RelationVal(row_ids: _): "__none__"
+      ) | PrincipalVal(_) | FilesVal(attachment_ids: _) | UrlVal(_) | RelationVal(row_ids: _): "__none__"
     end
     cur = grouped.get(gkey) or []
     grouped = grouped.set(gkey, cur.append(r))
@@ -1324,7 +1540,7 @@ fn filter_calendar_range(
         end
       Empty | TextVal(_) | NumberVal(_) | SelectVal(option_id: _) | MultiSelectVal(option_ids: _) | BoolVal(
         _
-      ) | PrincipalVal(_) | UrlVal(_) | RelationVal(row_ids: _): Unit
+      ) | PrincipalVal(_) | FilesVal(attachment_ids: _) | UrlVal(_) | RelationVal(row_ids: _): Unit
     end
   end
   out
@@ -1343,7 +1559,9 @@ fn timeline_row_span(
             DateVal(start: est, end_date: eed_opt): Some(eed_opt or est)
             Empty | TextVal(_) | NumberVal(_) | SelectVal(option_id: _) | MultiSelectVal(
               option_ids: _
-            ) | BoolVal(_) | PrincipalVal(_) | UrlVal(_) | RelationVal(row_ids: _): None
+            ) | BoolVal(_) | PrincipalVal(_) | FilesVal(attachment_ids: _) | UrlVal(_) | RelationVal(
+              row_ids: _
+            ): None
           end
         None: None
       end
@@ -1355,7 +1573,7 @@ fn timeline_row_span(
       Some((st, final_end))
     Empty | TextVal(_) | NumberVal(_) | SelectVal(option_id: _) | MultiSelectVal(option_ids: _) | BoolVal(
       _
-    ) | PrincipalVal(_) | UrlVal(_) | RelationVal(row_ids: _): None
+    ) | PrincipalVal(_) | FilesVal(attachment_ids: _) | UrlVal(_) | RelationVal(row_ids: _): None
   end
 end
 
@@ -1406,7 +1624,7 @@ fn row_plain_text(def: DatabaseDef, row: DbRow) : Text
         end
       Some(SelectVal(option_id: oid)):
         case p.kind
-          Select(options: opts) | AiDerived(
+          Select(options: opts) | Status(options: opts, done_option_ids: _) | AiDerived(
             prompt: _,
             source_prop_ids: _,
             include_row_body: _,
@@ -1419,7 +1637,9 @@ fn row_plain_text(def: DatabaseDef, row: DbRow) : Text
                 parts = parts.append(o.label)
               end
             end
-          Title | RichText | Number(format: _) | DateProp(include_time: _) | MultiSelect(options: _) | Checkbox | Person | Url | Relation(
+          Title | RichText | Number(format: _) | DateProp(include_time: _) | MultiSelect(options: _) | Checkbox | Person | Email | FileList | Url | UniqueId(
+            prefix: _
+          ) | Formula(expression: _, format: _) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
             target_db_id: _,
             inverse_prop_id: _
           ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
@@ -1439,7 +1659,13 @@ fn row_plain_text(def: DatabaseDef, row: DbRow) : Text
                 parts = parts.append(o.label)
               end
             end
-          Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | Checkbox | Person | Url | Relation(
+          Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | Status(
+            options: _,
+            done_option_ids: _
+          ) | Checkbox | Person | Email | FileList | Url | UniqueId(prefix: _) | Formula(
+            expression: _,
+            format: _
+          ) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
             target_db_id: _,
             inverse_prop_id: _
           ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
@@ -1453,362 +1679,50 @@ fn row_plain_text(def: DatabaseDef, row: DbRow) : Text
         end
       Some(NumberVal(d)): parts = parts.append(d.to_text)
       Some(DateVal(start: st, end_date: _)): parts = parts.append(st.to_iso)
+      Some(FilesVal(attachment_ids: aids)):
+        if not aids.empty?
+          parts = parts.append(aids.join(" "))
+        end
       Some(Empty) | Some(BoolVal(_)) | Some(PrincipalVal(_)) | Some(RelationVal(row_ids: _)) | None: Unit
     end
   end
   parts.join("\n")
 end
 
-test "DatabaseModel validation, exact Decimal rollups, multi-view filters, sorts, Kanban grouping, and Calendar overlap"
-  todo_opt = SelectOption(id: "todo", label: "Todo", color: Gray)
-  done_opt = SelectOption(id: "done", label: "Done", color: Green)
-  def = DatabaseDef(
-    id: "db_tasks",
-    collection_id: "col_general",
-    page_id: "pg_db_tasks",
-    title: "Tasks",
-    description: "Sprint tasks",
-    properties: [
-      PropertyDef(id: "title", name: "Title", kind: Title, required: true, sort_order: "a"),
-      PropertyDef(
-        id: "status",
-        name: "Status",
-        kind: Select(options: [todo_opt, done_opt]),
-        required: true,
-        sort_order: "b"
-      ),
-      PropertyDef(
-        id: "points",
-        name: "Points",
-        kind: Number(format: "plain"),
-        required: false,
-        sort_order: "c"
-      ),
-      PropertyDef(
-        id: "due",
-        name: "Due",
-        kind: DateProp(include_time: false),
-        required: false,
-        sort_order: "d"
-      ),
-      PropertyDef(
-        id: "project",
-        name: "Project",
-        kind: Relation(target_db_id: "db_proj", inverse_prop_id: None),
-        required: false,
-        sort_order: "e"
-      ),
-      PropertyDef(
-        id: "proj_pts",
-        name: "Total Pts",
-        kind: Rollup(relation_prop_id: "project", target_prop_id: "points", agg: SumValues),
-        required: false,
-        sort_order: "f"
-      )
-    ],
-    version: 1
-  )
-  assert validate_database_def(def) == None
-
-  ## Exact Decimal arithmetic (0.1 + 0.2 == 0.3, never float drift)
-  d1 = "0.1".to_decimal or stop "d1"
-  d2 = "0.2".to_decimal or stop "d2"
-  d3 = "0.3".to_decimal or stop "d3"
-  sum_cell = compute_rollup(SumValues, [NumberVal(d1), NumberVal(d2), Empty])
-  assert sum_cell == NumberVal(d3)
-  assert compute_rollup(CountAll, [NumberVal(d1), Empty]) == NumberVal(2.to_decimal)
-  assert compute_rollup(CountValues, [NumberVal(d1), Empty]) == NumberVal(1.to_decimal)
-
-  t0 = Time.parse("2026-11-26T12:00:00Z") or stop "t0"
-  dt1 = Date.parse_iso("2026-11-10") or stop "dt1"
-  dt2 = Date.parse_iso("2026-11-25") or stop "dt2"
-  r1 = DbRow(
-    id: "row_1",
-    database_id: "db_tasks",
-    page_id: "pg_r1",
-    cells: {
-      "title": TextVal("Fix Auth"),
-      "status": SelectVal(option_id: "todo"),
-      "points": NumberVal(d1),
-      "due": DateVal(start: dt1, end_date: None)
-    },
-    created_by: "usr_1",
-    created_at: t0,
-    updated_at: t0,
-    archived_at: None,
-    version: 1
-  )
-  r2 = DbRow(
-    id: "row_2",
-    database_id: "db_tasks",
-    page_id: "pg_r2",
-    cells: {
-      "title": TextVal("Ship Ledger"),
-      "status": SelectVal(option_id: "done"),
-      "points": NumberVal(d2),
-      "due": DateVal(start: dt2, end_date: None)
-    },
-    created_by: "usr_1",
-    created_at: t0,
-    updated_at: t0,
-    archived_at: None,
-    version: 1
-  )
-  assert validate_row_cells(def, r1) == None
-
-  bad_opt = DbRow(
-    id: "row_bad",
-    database_id: "db_tasks",
-    page_id: "pg_bad",
-    cells: {"title": TextVal("Bad"), "status": SelectVal(option_id: "bogus")},
-    created_by: "usr_1",
-    created_at: t0,
-    updated_at: t0,
-    archived_at: None,
-    version: 1
-  )
-  assert validate_row_cells(def, bad_opt) != None
-
-  er1 = EnrichedRow(row: r1, rollups: {"proj_pts": sum_cell})
-  er2 = EnrichedRow(row: r2, rollups: {"proj_pts": NumberVal(zero_decimal())})
-
-  assert matches_filters?(
-    er1,
-    [DbFilterRule(prop_id: "status", op: Eq, value: Json.String("todo"))],
-    true
-  )
-  assert not matches_filters?(
-    er1,
-    [DbFilterRule(prop_id: "status", op: Neq, value: Json.String("todo"))],
-    true
-  )
-  assert matches_filters?(
-    er2,
-    [DbFilterRule(prop_id: "points", op: Gt, value: Json.String("0.15"))],
-    true
-  )
-  assert matches_filters?(
-    er1,
-    [DbFilterRule(prop_id: "title", op: Contains, value: Json.String("auth"))],
-    true
-  )
-  assert matches_filters?(
-    er2,
-    [DbFilterRule(prop_id: "status", op: InSet, value: Json.Array([Json.String("done")]))],
-    true
-  )
-
-  sorted_desc = sort_enriched_rows([er1, er2], [DbSortRule(prop_id: "points", desc: true)])
-  assert sorted_desc.map(fn(e) e.row.id end) == ["row_2", "row_1"]
-
-  groups = group_rows_for_board(def, [er1, er2], "status", false)
-  assert groups.size == 3
-  assert (groups.get(0) or stop "g0").group_key == "todo"
-  assert (groups.get(0) or stop "g0b").rows.size == 1
-
-  cal = filter_calendar_range(
-    [er1, er2],
-    "due",
-    Date.parse_iso("2026-11-20"),
-    Date.parse_iso("2026-11-30")
-  )
-  assert cal.map(fn(e) e.row.id end) == ["row_2"]
+## Decodes a JSON object into `Map(Text, CellValue)` once to avoid duplicate monomorphic decoders.
+fn decode_cell_map_json(raw: Bytes) : Result(Map(Text, CellValue), Text)
+  Json.decode_strict[Map(Text, CellValue)](raw).map_error(fn(e) e.to_text end)
 end
 
-test "AiDerived column schema validation, typed output parsing, input hash drift, and AiSelect board grouping"
-  low_opt = SelectOption(id: "low", label: "Low Risk", color: Green)
-  high_opt = SelectOption(id: "high", label: "High Risk", color: Red)
-  ai_prop = PropertyDef(
-    id: "risk",
-    name: "Risk Tier",
-    kind: AiDerived(
-      prompt: "Classify operational risk",
-      source_prop_ids: ["title"],
-      include_row_body: false,
-      output_kind: AiSelect(options: [low_opt, high_opt]),
-      mode: AutoApply,
-      daily_call_cap: 10
-    ),
-    required: false,
-    sort_order: "b"
-  )
-  ai_score_prop = PropertyDef(
-    id: "score",
-    name: "Risk Score",
-    kind: AiDerived(
-      prompt: "Compute score",
-      source_prop_ids: [],
-      include_row_body: true,
-      output_kind: AiNumber(format: "plain"),
-      mode: StageProposal,
-      daily_call_cap: 5
-    ),
-    required: false,
-    sort_order: "c"
-  )
-  def = DatabaseDef(
-    id: "db_ai",
-    collection_id: "col_general",
-    page_id: "pg_db_ai",
-    title: "AI Ops",
-    description: "AI derived test DB",
-    properties: [
-      PropertyDef(id: "title", name: "Item", kind: Title, required: true, sort_order: "a"),
-      ai_prop,
-      ai_score_prop
-    ],
-    version: 1
-  )
-  assert validate_database_def(def) == None
-  assert has_ai_derived_columns?(def)
+## Decodes a JSON array into `List(PropertyDef)` once to avoid duplicate monomorphic decoders.
+fn decode_property_defs_json(raw: Bytes) : Result(List(PropertyDef), Text)
+  Json.decode_strict[List(PropertyDef)](raw).map_error(fn(e) e.to_text end)
+end
 
-  # Self-referencing source property rejected
-  bad_self = PropertyDef(
-    id: "bad",
-    name: "Bad",
-    kind: AiDerived(
-      prompt: "Self",
-      source_prop_ids: ["bad"],
-      include_row_body: false,
-      output_kind: AiText,
-      mode: AutoApply,
-      daily_call_cap: 5
-    ),
-    required: false,
-    sort_order: "d"
-  )
-  assert validate_database_def(
-    DatabaseDef(
-      id: "db_bad",
-      collection_id: "col_general",
-      page_id: "pg_bad",
-      title: "Bad",
-      description: "",
-      properties: [
-        PropertyDef(id: "title", name: "Item", kind: Title, required: true, sort_order: "a"),
-        bad_self
-      ],
-      version: 1
-    )
-  ) !=
-    None
+## Decodes a JSON array into `List(DbFilterRule)` once to avoid duplicate monomorphic decoders.
+fn decode_filter_rules_json(raw: Bytes) : Result(List(DbFilterRule), Text)
+  Json.decode_strict[List(DbFilterRule)](raw).map_error(fn(e) e.to_text end)
+end
 
-  # Fenced JSON select parsing + label matching + bogus option rejection
-  parsed_sel = parse_ai_cell_output(
-    AiSelect(options: [low_opt, high_opt]),
-    "```json\n{\"value\": \"High Risk\", \"rationale\": \"Elevated outage cost\"}\n```"
-  )
-  assert parsed_sel == Ok((SelectVal(option_id: "high"), Some("Elevated outage cost")))
-  assert parse_ai_cell_output(AiSelect(options: [low_opt, high_opt]), "bogus_option") is Error(_)
-  assert parse_ai_cell_output(AiNumber(format: "currency"), "$1,250.50") ==
-    Ok((NumberVal("1250.50".to_decimal or stop "dec"), None))
-  assert parse_ai_cell_output(AiNumber(format: "plain"), "not-a-number") is Error(_)
-  assert parse_ai_cell_output(AiDate, "2026-12-15") ==
-    Ok((DateVal(start: Date.parse_iso("2026-12-15") or stop "dt", end_date: None), None))
-  assert parse_ai_cell_output(AiBool, "{\"value\": true}") == Ok((BoolVal(true), None))
+## Decodes a JSON array into `List(DbSortRule)` once to avoid duplicate monomorphic decoders.
+fn decode_sort_rules_json(raw: Bytes) : Result(List(DbSortRule), Text)
+  Json.decode_strict[List(DbSortRule)](raw).map_error(fn(e) e.to_text end)
+end
 
-  # validate_cell rejects wrong cell variant for AiSelect / AiNumber
-  assert validate_cell(ai_prop, SelectVal(option_id: "high")) == None
-  assert validate_cell(ai_prop, SelectVal(option_id: "bogus")) != None
-  assert validate_cell(ai_prop, TextVal("wrong")) != None
-
-  # compute_ai_input_hash detects source cell drift
-  t0 = Time.parse("2026-12-01T00:00:00Z") or stop "t0"
-  r1 = DbRow(
-    id: "r1",
-    database_id: "db_ai",
-    page_id: "pg_r1",
-    cells: {"title": TextVal("Normal Check"), "risk": SelectVal(option_id: "low")},
-    created_by: "usr_1",
-    created_at: t0,
-    updated_at: t0,
-    archived_at: None,
-    version: 1
-  )
-  r1_edited = DbRow(
-    id: "r1",
-    database_id: "db_ai",
-    page_id: "pg_r1",
-    cells: {"title": TextVal("Urgent Failover"), "risk": SelectVal(option_id: "low")},
-    created_by: "usr_1",
-    created_at: t0,
-    updated_at: t0,
-    archived_at: None,
-    version: 2
-  )
-  h1 = compute_ai_input_hash(def, ai_prop, r1, "body")
-  h2 = compute_ai_input_hash(def, ai_prop, r1_edited, "body")
-  assert h1 != h2
-
-  # AiSelect board grouping works identically to Select
-  b_groups = group_rows_for_board(def, [EnrichedRow(row: r1, rollups: {})], "risk", false)
-  assert b_groups.size == 3
-  assert (b_groups.get(0) or stop "bg0").rows.size == 1
-
-  # GalleryView / TimelineView JSON round-trip + filter_timeline_range chronological order & overlap
-  g_kind = GalleryView(cover_prop_id: Some("cover"), card_prop_ids: ["risk"], card_size: "md")
-  assert Json.decode[DbViewKind](Json.encode(g_kind).bytes) == Ok(g_kind)
-  t_kind = TimelineView(
-    start_date_prop_id: "start_at",
-    end_date_prop_id: Some("end_at"),
-    card_prop_ids: ["risk"]
-  )
-  assert Json.decode[DbViewKind](Json.encode(t_kind).bytes) == Ok(t_kind)
-
-  tl_early = DbRow(
-    id: "tl_1",
-    database_id: "db_ai",
-    page_id: "pg_tl1",
-    cells: {
-      "title": TextVal("Phase A"),
-      "start_at": DateVal(start: Date.parse_iso("2026-12-01") or stop "d1", end_date: None),
-      "end_at": DateVal(start: Date.parse_iso("2026-12-10") or stop "d2", end_date: None)
-    },
-    created_by: "usr_1",
-    created_at: t0,
-    updated_at: t0,
-    archived_at: None,
-    version: 1
-  )
-  tl_late = DbRow(
-    id: "tl_2",
-    database_id: "db_ai",
-    page_id: "pg_tl2",
-    cells: {
-      "title": TextVal("Phase B"),
-      "start_at": DateVal(start: Date.parse_iso("2026-12-15") or stop "d3", end_date: None),
-      "end_at": DateVal(start: Date.parse_iso("2026-12-22") or stop "d4", end_date: None)
-    },
-    created_by: "usr_1",
-    created_at: t0,
-    updated_at: t0,
-    archived_at: None,
-    version: 1
-  )
-  tl_unsched = DbRow(
-    id: "tl_3",
-    database_id: "db_ai",
-    page_id: "pg_tl3",
-    cells: {"title": TextVal("Backlog")},
-    created_by: "usr_1",
-    created_at: t0,
-    updated_at: t0,
-    archived_at: None,
-    version: 1
-  )
-  tl_in = [
-    EnrichedRow(row: tl_late, rollups: {}),
-    EnrichedRow(row: tl_unsched, rollups: {}),
-    EnrichedRow(row: tl_early, rollups: {})
-  ]
-  tl_all = filter_timeline_range(tl_in, "start_at", Some("end_at"), None, None)
-  assert tl_all.map(fn(e) e.row.id end) == ["tl_1", "tl_2", "tl_3"]
-  tl_win = filter_timeline_range(
-    tl_in,
-    "start_at",
-    Some("end_at"),
-    Date.parse_iso("2026-12-08"),
-    Date.parse_iso("2026-12-12")
-  )
-  assert tl_win.map(fn(e) e.row.id end) == ["tl_1"]
+## Rejects any attempt to overwrite an auto-assigned `UniqueId` property value after row creation.
+fn check_unique_id_immutable(
+  def: DatabaseDef,
+  old_cells: Map(Text, CellValue),
+  updates: Map(Text, CellValue)
+) : Result(Unit, Text)
+  for p in def.properties
+    if p.kind is UniqueId(prefix: _)
+      case (old_cells.get(p.id), updates.get(p.id))
+        (Some(ov), Some(nv)) if ov != nv:
+          return Error("UniqueId property '#{p.id}' cannot be modified after creation")
+        (_, _): Unit
+      end
+    end
+  end
+  Ok(Unit)
 end

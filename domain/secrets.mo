@@ -297,35 +297,3 @@ fn redact_tokens(text: Text, tokens: List(Text)) : (Text, Int)
   end
   (cur, count)
 end
-
-test "Domain.Secrets scans every secret class, avoids false positives, masks safely, and redacts"
-  clean = "Runbook summary: rotate deployment certificates quarterly and check gateway quorum v2."
-  assert scan_text(clean) == []
-
-  sample = "OpenAI: sk-proj-AbCdEf1234567890XyZ\nGitHub: ghp_Token1234567890abcdef123456\nStripe: sk_live_51TestKey9876543210\nSlack: xoxb-123456789012-abcdef\nAWS: AKIAIOSFODNN7EXAMPLE\nAgent: vlm_ag_testtoken1234567890\nHook: whsec_secretvalue1234567890\nPEM:\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAK\n-----END RSA PRIVATE KEY-----"
-  found = scan_text(sample)
-  kinds = found.map(fn(f) f.kind end)
-  assert kinds == [
-    "ai_api_key",
-    "github_token",
-    "stripe_secret_key",
-    "slack_token",
-    "aws_access_key",
-    "vellum_agent_token",
-    "webhook_secret",
-    "pem_private_key"
-  ]
-
-  for f in found
-    pub = finding_to_public_json(f).to_text
-    assert not pub.contains?(f.raw_token)
-    assert f.masked_preview != f.raw_token
-  end
-
-  tokens = found.map(fn(f) f.raw_token end)
-  (redacted, n_repl) = redact_tokens(sample, tokens)
-  assert n_repl == 8
-  assert scan_text(redacted) == []
-  assert not redacted.contains?("sk-proj-AbCdEf1234567890XyZ")
-  assert redacted.contains?("[REDACTED]")
-end

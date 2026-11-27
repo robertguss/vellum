@@ -83,7 +83,7 @@ function encodeInputToCell(prop: PropertyDef, raw: string): CellValue {
   if (typeof prop.kind === "object" && "date_prop" in prop.kind) {
     return { date_val: { start: trimmed, end_date: null } };
   }
-  if (typeof prop.kind === "object" && "select" in prop.kind) {
+  if (typeof prop.kind === "object" && ("select" in prop.kind || "status" in prop.kind)) {
     return { select_val: { option_id: trimmed } };
   }
   return { text_val: trimmed };
@@ -266,7 +266,7 @@ export default function DatabaseView({
       activeDb.properties.filter(
         (p) =>
           p.kind === "checkbox" ||
-          (typeof p.kind === "object" && "select" in p.kind) ||
+          (typeof p.kind === "object" && ("select" in p.kind || "status" in p.kind)) ||
           (typeof p.kind === "object" &&
             "ai_derived" in p.kind &&
             (p.kind.ai_derived.output_kind === "ai_bool" ||
@@ -356,7 +356,9 @@ export default function DatabaseView({
 
   const firstSelectProp = useMemo(
     () =>
-      activeDb.properties.find((p) => typeof p.kind === "object" && "select" in p.kind) ?? null,
+      activeDb.properties.find(
+        (p) => typeof p.kind === "object" && ("select" in p.kind || "status" in p.kind)
+      ) ?? null,
     [activeDb.properties]
   );
 
@@ -872,12 +874,14 @@ export default function DatabaseView({
     const selectOpts =
       typeof boardGroupProp.kind === "object" && "select" in boardGroupProp.kind
         ? boardGroupProp.kind.select.options
-        : typeof boardGroupProp.kind === "object" &&
-            "ai_derived" in boardGroupProp.kind &&
-            typeof boardGroupProp.kind.ai_derived.output_kind === "object" &&
-            "ai_select" in boardGroupProp.kind.ai_derived.output_kind
-          ? boardGroupProp.kind.ai_derived.output_kind.ai_select.options
-          : null;
+        : typeof boardGroupProp.kind === "object" && "status" in boardGroupProp.kind
+          ? boardGroupProp.kind.status.options
+          : typeof boardGroupProp.kind === "object" &&
+              "ai_derived" in boardGroupProp.kind &&
+              typeof boardGroupProp.kind.ai_derived.output_kind === "object" &&
+              "ai_select" in boardGroupProp.kind.ai_derived.output_kind
+            ? boardGroupProp.kind.ai_derived.output_kind.ai_select.options
+            : null;
     const isBoolGroup =
       boardGroupProp.kind === "checkbox" ||
       (typeof boardGroupProp.kind === "object" &&

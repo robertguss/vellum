@@ -77,6 +77,9 @@ function formatPropertyKind(kind: PropertyKind | null): string {
   if ("date_prop" in kind) return "date";
   if ("select" in kind) return `select(${kind.select.options.length} opts)`;
   if ("multi_select" in kind) return `multi_select(${kind.multi_select.options.length} opts)`;
+  if ("status" in kind) return `status(${kind.status.options.length} opts)`;
+  if ("unique_id" in kind) return `unique_id(${kind.unique_id.prefix || "#"})`;
+  if ("formula" in kind) return `formula(${kind.formula.format || "auto"})`;
   if ("relation" in kind) return `relation(${kind.relation.target_db_id})`;
   if ("rollup" in kind) return `rollup(${kind.rollup.agg})`;
   if ("ai_derived" in kind) {

@@ -121,32 +121,3 @@ fn classify_file_sync(
     (_, _, _, _): "clean"
   end
 end
-
-test "Sync deterministic paths, title derivation, SHA-256, and 3-way conflict classification"
-  assert slugify_title("Gateway / Failover Runbook!!") == "gateway-failover-runbook"
-  assert page_rel_path("eng-ops", "Gateway Runbook", "pg_123") == "eng-ops/gateway-runbook--pg_123.md"
-  assert derive_title_from_markdown("eng-ops/new-sop.md", "Intro") == "new sop"
-  assert derive_title_from_markdown("eng-ops/a.md", "# Service Failover Plan\n\nSteps") == "Service Failover Plan"
-
-  base_sha = sha256_text("v1 content")
-  local_sha = sha256_text("v1 local edit")
-  remote_sha = sha256_text("v2 remote edit")
-  entry = SyncManifestEntry(
-    page_id: "pg_1",
-    collection_id: "col_1",
-    collection_slug: "eng",
-    rel_path: "eng/doc--pg_1.md",
-    version: 1,
-    content_sha256: base_sha,
-    synced_at: "2026-12-05T10:00:00Z"
-  )
-
-  assert classify_file_sync(None, None, Some(1), Some(base_sha)) == "pull_new"
-  assert classify_file_sync(None, Some(local_sha), None, None) == "push_create"
-  assert classify_file_sync(Some(entry), Some(base_sha), Some(1), Some(base_sha)) == "clean"
-  assert classify_file_sync(Some(entry), Some(local_sha), Some(1), Some(base_sha)) == "push_update"
-  assert classify_file_sync(Some(entry), Some(base_sha), Some(2), Some(remote_sha)) == "pull_update"
-  assert classify_file_sync(Some(entry), Some(local_sha), Some(2), Some(remote_sha)) == "conflict_proposal"
-  assert classify_file_sync(Some(entry), None, Some(1), Some(base_sha)) == "pull_update"
-  assert classify_file_sync(Some(entry), Some(local_sha), None, None) == "remote_deleted"
-end

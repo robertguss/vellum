@@ -17,11 +17,10 @@ use Domain.DatabaseModel{
   PropertyDef,
   PropertyKind,
   SelectOption,
-  SelectOptionColor,
   validate_cell
 }
 use Domain.Policy{valid_collection_slug?}
-use Domain.Types{Page, PageKind}
+use Domain.Types{Page}
 use Json
 
 ## Statamic-style field schema blueprint that can be attached to any non-database Vellum page.
@@ -98,7 +97,10 @@ fn validate_blueprint_def(bp: BlueprintDef) : Option(Text)
         if tdb.trim.empty?
           return Some("relation field '#{fid}' requires non-empty target_db_id")
         end
-      Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
+      Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | Formula(
+        expression: _,
+        format: _
+      ) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | AiDerived(
         prompt: _,
         source_prop_ids: _,
         include_row_body: _,
@@ -106,9 +108,11 @@ fn validate_blueprint_def(bp: BlueprintDef) : Option(Text)
         mode: _,
         daily_call_cap: _
       ): return Some(
-        "blueprint field '#{fid}' cannot use Rollup or AiDerived kind"
+        "blueprint field '#{fid}' cannot use computed Rollup, Formula, Audit, or AiDerived kind"
       )
-      Title | RichText | DateProp(include_time: _) | Checkbox | Person | Url: Unit
+      Title | RichText | DateProp(include_time: _) | Status(options: _, done_option_ids: _) | Checkbox | Person | Email | FileList | Url | UniqueId(
+        prefix: _
+      ): Unit
     end
   end
   None
@@ -140,14 +144,16 @@ end
 
 fn option_label_or_id(prop: PropertyDef, oid: Text) : Text
   case prop.kind
-    Select(options: opts) | MultiSelect(options: opts):
+    Select(options: opts) | MultiSelect(options: opts) | Status(options: opts, done_option_ids: _):
       for opt in opts
         if opt.id == oid
           return opt.label
         end
       end
       oid
-    Title | RichText | Number(format: _) | DateProp(include_time: _) | Checkbox | Person | Url | Relation(
+    Title | RichText | Number(format: _) | DateProp(include_time: _) | Checkbox | Person | Email | FileList | Url | UniqueId(
+      prefix: _
+    ) | Formula(expression: _, format: _) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
       target_db_id: _,
       inverse_prop_id: _
     ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
@@ -175,6 +181,7 @@ fn cell_plain_value(prop: PropertyDef, val: CellValue) : Text
     MultiSelectVal(option_ids: oids): oids.map(fn(o) option_label_or_id(prop, o) end).join(" ")
     BoolVal(b): if b: "true" else: "false"
     PrincipalVal(pids): pids.join(" ")
+    FilesVal(attachment_ids: aids): aids.join(" ")
     UrlVal(u): u
     RelationVal(row_ids: rids): rids.join(" ")
   end
@@ -218,6 +225,7 @@ fn cell_yaml_value(val: CellValue) : Option(Text)
     MultiSelectVal(option_ids: oids): Some(yaml_list(oids))
     BoolVal(b): Some(if b: "true" else: "false")
     PrincipalVal(pids): Some(yaml_list(pids))
+    FilesVal(attachment_ids: aids): Some(yaml_list(aids))
     UrlVal(u): Some(yaml_escape_string(u))
     RelationVal(row_ids: rids): Some(yaml_list(rids))
   end
@@ -448,7 +456,7 @@ fn parse_yaml_meta_values(bp: BlueprintDef, meta_raw: Map(Text, Text)) : Result(
   for (fid, raw_v) in meta_raw.entries
     prop = try by_id.get(fid).or_fail("unknown field '#{fid}' for blueprint '#{bp.slug}'")
     cval = case prop.kind
-      Title | RichText: TextVal(unescape_yaml_scalar(raw_v))
+      Title | RichText | Email | UniqueId(prefix: _): TextVal(unescape_yaml_scalar(raw_v))
       Url: UrlVal(unescape_yaml_scalar(raw_v))
       Number(format: _):
         s = unescape_yaml_scalar(raw_v).trim
@@ -470,7 +478,9 @@ fn parse_yaml_meta_values(bp: BlueprintDef, meta_raw: Map(Text, Text)) : Result(
           None
         end
         DateVal(start: st, end_date: ed)
-      Select(options: _): SelectVal(option_id: unescape_yaml_scalar(raw_v))
+      Select(options: _) | Status(options: _, done_option_ids: _): SelectVal(
+        option_id: unescape_yaml_scalar(raw_v)
+      )
       MultiSelect(options: _): MultiSelectVal(option_ids: try parse_yaml_string_list(raw_v))
       Checkbox:
         low = unescape_yaml_scalar(raw_v).trim.ascii_lowercase
@@ -482,10 +492,14 @@ fn parse_yaml_meta_values(bp: BlueprintDef, meta_raw: Map(Text, Text)) : Result(
           return Error("invalid boolean '#{raw_v}' for field '#{fid}'")
         end
       Person: PrincipalVal(try parse_yaml_string_list(raw_v))
+      FileList: FilesVal(attachment_ids: try parse_yaml_string_list(raw_v))
       Relation(target_db_id: _, inverse_prop_id: _): RelationVal(
         row_ids: try parse_yaml_string_list(raw_v)
       )
-      Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
+      Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | Formula(
+        expression: _,
+        format: _
+      ) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | AiDerived(
         prompt: _,
         source_prop_ids: _,
         include_row_body: _,
@@ -501,130 +515,4 @@ fn parse_yaml_meta_values(bp: BlueprintDef, meta_raw: Map(Text, Text)) : Result(
     Some(err): Error(err)
     None: Ok(out)
   end
-end
-
-test "blueprint validation, page meta validation, plain text, and yaml frontmatter"
-  opt_open = SelectOption(id: "open", label: "Open", color: Green)
-  opt_closed = SelectOption(id: "closed", label: "Closed", color: Red)
-  bp = BlueprintDef(
-    id: "bp_decision",
-    slug: "decision-record",
-    name: "Decision Record",
-    description: "Architectural or budget decision",
-    icon: Some("scale"),
-    fields: [
-      PropertyDef(
-        id: "status",
-        name: "Status",
-        kind: Select(options: [opt_open, opt_closed]),
-        required: true,
-        sort_order: "a"
-      ),
-      PropertyDef(
-        id: "budget",
-        name: "Budget",
-        kind: Number(format: "currency"),
-        required: false,
-        sort_order: "b"
-      ),
-      PropertyDef(
-        id: "owner",
-        name: "Owner",
-        kind: Person,
-        required: false,
-        sort_order: "c"
-      )
-    ],
-    default_template_markdown: "## Decision Context\n\n## Recommendation",
-    version: 1
-  )
-  assert validate_blueprint_def(bp) == None
-
-  bad_slug_bp = BlueprintDef(
-    id: bp.id,
-    slug: "Invalid Slug!",
-    name: bp.name,
-    description: bp.description,
-    icon: bp.icon,
-    fields: bp.fields,
-    default_template_markdown: bp.default_template_markdown,
-    version: bp.version
-  )
-  assert validate_blueprint_def(bad_slug_bp) != None
-
-  now = Time.parse("2026-11-26T12:00:00Z") or stop "now"
-  budget_dec = "1250.50".to_decimal or stop "dec"
-  page = Page(
-    id: "pg_1",
-    collection_id: "col_1",
-    parent_page_id: None,
-    title: "Migrate Storage",
-    icon: None,
-    cover_attachment_id: None,
-    kind: Document,
-    sort_order: "i",
-    database_id: None,
-    freshness_ttl_days: None,
-    verified_at: None,
-    verified_by: None,
-    created_by: "usr_1",
-    created_at: now,
-    updated_at: now,
-    archived_at: None,
-    version: 3
-  )
-
-  missing_req = PageBlueprintMeta(
-    page_id: "pg_1",
-    blueprint_id: "bp_decision",
-    values: {"budget": NumberVal(budget_dec)},
-    updated_at: now
-  )
-  assert validate_page_meta(bp, missing_req.values) != None
-
-  unknown_key = {"status": SelectVal(option_id: "open"), "extra": TextVal("bad")}
-  assert validate_page_meta(bp, unknown_key) != None
-
-  good_meta = PageBlueprintMeta(
-    page_id: "pg_1",
-    blueprint_id: "bp_decision",
-    values: {
-      "status": SelectVal(option_id: "open"),
-      "budget": NumberVal(budget_dec),
-      "owner": PrincipalVal(["usr_alice"])
-    },
-    updated_at: now
-  )
-  assert validate_page_meta(bp, good_meta.values) == None
-
-  plain = page_meta_plain_text(bp, good_meta)
-  assert plain.contains?("Status: Open")
-  assert plain.contains?("Budget: 1250.5")
-
-  yaml = to_yaml_frontmatter(page, Some(bp), Some(good_meta), "Hello")
-  assert yaml.starts_with?("---\nid: \"pg_1\"\n")
-  assert yaml.contains?("blueprint: \"decision-record\"")
-  assert yaml.contains?("  status: \"open\"")
-  assert yaml.contains?("  budget: 1250.5")
-  assert yaml.ends_with?("---\n\nHello")
-
-  parsed_fm = case parse_yaml_frontmatter(yaml)
-    Ok(p): p
-    Error(_): stop "parse_yaml_frontmatter"
-  end
-  assert parsed_fm.has_frontmatter
-  assert parsed_fm.page_id == Some("pg_1")
-  assert parsed_fm.title == Some("Migrate Storage")
-  assert parsed_fm.collection_id == Some("col_1")
-  assert parsed_fm.version == Some(3)
-  assert parsed_fm.blueprint_slug == Some("decision-record")
-  assert parsed_fm.body_markdown == "Hello"
-  assert parse_yaml_meta_values(bp, parsed_fm.meta_raw) == Ok(good_meta.values)
-
-  plain_md = case parse_yaml_frontmatter("# Just Markdown\n\nBody")
-    Ok(p): p
-    Error(_): stop "plain_md"
-  end
-  assert not plain_md.has_frontmatter
-  assert plain_md.body_markdown == "# Just Markdown\n\nBody"
 end

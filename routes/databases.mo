@@ -26,6 +26,7 @@ use Arvo.Modb.Jobs
 use Date
 use Db
 use Domain.Blocks
+use Domain.Formulas
 use Domain.DatabaseModel{
   AiCellMeta,
   AiOutputKind,
@@ -154,6 +155,34 @@ fn find_prop(def: DatabaseDef, prop_id: Text) : Option(PropertyDef)
   None
 end
 
+fn validate_formula_props(def: DatabaseDef) : Option(Text)
+  for p in def.properties
+    case p.kind
+      Formula(expression: expr, format: _):
+        case Formulas.validate_formula(expr)
+          Some(msg): return Some("invalid Formula expression on property '#{p.id}': #{msg}")
+          None: Unit
+        end
+      Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
+        options: _
+      ) | Status(options: _, done_option_ids: _) | Checkbox | Person | Email | FileList | Url | UniqueId(
+        prefix: _
+      ) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
+        target_db_id: _,
+        inverse_prop_id: _
+      ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
+        prompt: _,
+        source_prop_ids: _,
+        include_row_body: _,
+        output_kind: _,
+        mode: _,
+        daily_call_cap: _
+      ): Unit
+    end
+  end
+  None
+end
+
 fn validate_view_def(def: DatabaseDef, v: DbViewDef) : Option(Text)
   return Some("view name must not be empty") if v.name.trim.empty?
   case v.kind
@@ -169,7 +198,7 @@ fn validate_view_def(def: DatabaseDef, v: DbViewDef) : Option(Text)
         None: return Some("BoardView group_by_prop_id '#{gb_id}' not found")
       end
       case gb_prop.kind
-        Select(options: _) | Checkbox: Unit
+        Select(options: _) | Status(options: _, done_option_ids: _) | Checkbox: Unit
         AiDerived(
           prompt: _,
           source_prop_ids: _,
@@ -185,7 +214,9 @@ fn validate_view_def(def: DatabaseDef, v: DbViewDef) : Option(Text)
           mode: _,
           daily_call_cap: _
         ): Unit
-        Title | RichText | Number(format: _) | DateProp(include_time: _) | MultiSelect(options: _) | Person | Url | Relation(
+        Title | RichText | Number(format: _) | DateProp(include_time: _) | MultiSelect(options: _) | Person | Email | FileList | Url | UniqueId(
+          prefix: _
+        ) | Formula(expression: _, format: _) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
           target_db_id: _,
           inverse_prop_id: _
         ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
@@ -196,7 +227,7 @@ fn validate_view_def(def: DatabaseDef, v: DbViewDef) : Option(Text)
           mode: _,
           daily_call_cap: _
         ): return Some(
-          "BoardView group_by_prop_id '#{gb_id}' must be Select, Checkbox, or AI Select/Bool"
+          "BoardView group_by_prop_id '#{gb_id}' must be Select, Status, Checkbox, or AI Select/Bool"
         )
       end
       for pid in cpids
@@ -218,7 +249,13 @@ fn validate_view_def(def: DatabaseDef, v: DbViewDef) : Option(Text)
           mode: _,
           daily_call_cap: _
         ): Unit
-        Title | RichText | Number(format: _) | Select(options: _) | MultiSelect(options: _) | Checkbox | Person | Url | Relation(
+        Title | RichText | Number(format: _) | Select(options: _) | MultiSelect(options: _) | Status(
+          options: _,
+          done_option_ids: _
+        ) | Checkbox | Person | Email | FileList | Url | UniqueId(prefix: _) | Formula(
+          expression: _,
+          format: _
+        ) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
           target_db_id: _,
           inverse_prop_id: _
         ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
@@ -245,21 +282,22 @@ fn validate_view_def(def: DatabaseDef, v: DbViewDef) : Option(Text)
             None: return Some("GalleryView cover_prop_id '#{cp}' not found")
           end
           case cprop.kind
-            Url | RichText | Title: Unit
+            Url | RichText | Title | FileList: Unit
             Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
               options: _
-            ) | Checkbox | Person | Relation(target_db_id: _, inverse_prop_id: _) | Rollup(
-              relation_prop_id: _,
-              target_prop_id: _,
-              agg: _
-            ) | AiDerived(
+            ) | Status(options: _, done_option_ids: _) | Checkbox | Person | Email | UniqueId(
+              prefix: _
+            ) | Formula(expression: _, format: _) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
+              target_db_id: _,
+              inverse_prop_id: _
+            ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
               prompt: _,
               source_prop_ids: _,
               include_row_body: _,
               output_kind: _,
               mode: _,
               daily_call_cap: _
-            ): return Some("GalleryView cover_prop_id '#{cp}' must be Url, RichText, or Title")
+            ): return Some("GalleryView cover_prop_id '#{cp}' must be Url, RichText, FileList, or Title")
           end
         Some(_) | None: Unit
       end
@@ -285,7 +323,13 @@ fn validate_view_def(def: DatabaseDef, v: DbViewDef) : Option(Text)
           mode: _,
           daily_call_cap: _
         ): Unit
-        Title | RichText | Number(format: _) | Select(options: _) | MultiSelect(options: _) | Checkbox | Person | Url | Relation(
+        Title | RichText | Number(format: _) | Select(options: _) | MultiSelect(options: _) | Status(
+          options: _,
+          done_option_ids: _
+        ) | Checkbox | Person | Email | FileList | Url | UniqueId(prefix: _) | Formula(
+          expression: _,
+          format: _
+        ) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
           target_db_id: _,
           inverse_prop_id: _
         ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
@@ -316,7 +360,9 @@ fn validate_view_def(def: DatabaseDef, v: DbViewDef) : Option(Text)
             ): Unit
             Title | RichText | Number(format: _) | Select(options: _) | MultiSelect(
               options: _
-            ) | Checkbox | Person | Url | Relation(
+            ) | Status(options: _, done_option_ids: _) | Checkbox | Person | Email | FileList | Url | UniqueId(
+              prefix: _
+            ) | Formula(expression: _, format: _) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
               target_db_id: _,
               inverse_prop_id: _
             ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
@@ -374,7 +420,7 @@ fn list_databases(auth: AuthContext, rf: ReadFiles) : Result(Api.Response, AppEr
     return Ok(json_ok(200, Json.Object({"databases": Json.Array([])})))
   end
 
-  dbs = try Ledger.read_locked(
+  payload = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -389,10 +435,10 @@ fn list_databases(auth: AuthContext, rf: ReadFiles) : Result(Api.Response, AppEr
           visible = visible.append(def)
         end
       end
-      Ok(visible)
+      Ok(Json.Object({"databases": visible.to_json}))
     end
   )
-  Ok(json_ok(200, Json.Object({"databases": dbs.to_json})))
+  Ok(json_ok(200, payload))
 end
 
 ## `POST /api/databases` — Creates a `DatabaseDef`, host `Page`, and default Table `DbViewDef`.
@@ -422,6 +468,10 @@ fn create_database(
     version: 1
   )
   case DatabaseModel.validate_database_def(def)
+    Some(msg): return Error(BadInput(reason: msg))
+    None: Unit
+  end
+  case validate_formula_props(def)
     Some(msg): return Error(BadInput(reason: msg))
     None: Unit
   end
@@ -467,7 +517,7 @@ fn create_database(
     "collection_id": Json.String(def.collection_id)
   })
 
-  (saved_def, saved_page, saved_view) = try Ledger.transact_locked(
+  try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -491,24 +541,153 @@ fn create_database(
         Db.map_table_error
       )
       t5 = try Db.tx_refresh_db_summary(t4, def, now)
-      Ok((t5, (def, host_page, default_view)))
+      Ok((t5, Unit))
     end
   )
 
-  if DatabaseModel.has_ai_derived_columns?(saved_def)
-    try Db.ensure_ai_col_feed_locked(files, saved_def.id, now)
+  if DatabaseModel.has_ai_derived_columns?(def)
+    try Db.ensure_ai_col_feed_locked(files, def.id, now)
   end
 
   Ok(
     json_ok(
       201,
       Json.Object({
-        "database": saved_def.to_json,
-        "page": saved_page.to_json,
-        "default_view": saved_view.to_json
+        "database": def.to_json,
+        "page": host_page.to_json,
+        "default_view": default_view.to_json
       })
     )
   )
+end
+
+fn build_show_rel_targets(
+  store: Store,
+  def: DatabaseDef,
+  db_by_id: Map(Text, DatabaseDef)
+) : Result(Json, AppError)
+  var rel_targets_map = {}
+  var seen_targets = Set.empty
+  for prop in def.properties
+    if prop.kind is Relation(target_db_id: tdb_id, inverse_prop_id: _)
+      if not seen_targets.has?(tdb_id)
+        seen_targets = seen_targets.add(tdb_id)
+        case db_by_id.get(tdb_id)
+          Some(target_def):
+            t_rows = try load_active_db_rows(store, target_def.id)
+            var opt_list = []
+            for tr in t_rows
+              opt_list = opt_list.append(
+                Json.Object({
+                  "row_id": Json.String(tr.id),
+                  "page_id": Json.String(tr.page_id),
+                  "title": Json.String(DatabaseModel.extract_row_title(target_def, tr.cells))
+                })
+              )
+            end
+            rel_targets_map = rel_targets_map.set(tdb_id, Json.Array(opt_list))
+          None: Unit
+        end
+      end
+    end
+  end
+  Ok(Json.Object(rel_targets_map))
+end
+
+fn build_show_ai_meta(
+  store: Store,
+  def: DatabaseDef,
+  active_rows: List(DbRow),
+  today_iso: Text
+) : Result((Json, Json), AppError)
+  var prop_by_id = {}
+  var usage_map = {}
+  for p in def.properties
+    prop_by_id = prop_by_id.set(p.id, p)
+    if p.kind is AiDerived(
+      prompt: _,
+      source_prop_ids: _,
+      include_row_body: _,
+      output_kind: _,
+      mode: _,
+      daily_call_cap: cap
+    )
+      uk = DatabaseModel.ai_col_usage_key(def.id, p.id, today_iso)
+      used = case try Table.get(store, Db.ai_col_usage_table(), uk).map_error(Db.map_table_error)
+        Some(u): u.calls_used
+        None: 0
+      end
+      rem = if cap > used: cap - used else: 0
+      usage_map = usage_map.set(
+        p.id,
+        Json.Object({
+          "calls_used": Json.int(used),
+          "daily_call_cap": Json.int(cap),
+          "remaining_calls": Json.int(rem),
+          "day_iso": Json.String(today_iso)
+        })
+      )
+    end
+  end
+
+  var row_by_id = {}
+  for r in active_rows
+    row_by_id = row_by_id.set(r.id, r)
+  end
+  meta_pairs = try Table.lookup(
+    store,
+    Db.ai_cell_meta_table(),
+    Db.ai_cell_meta_by_database(),
+    def.id
+  ).map_error(Db.map_table_error)
+  var cell_meta_map = {}
+  for (_mk, m) in meta_pairs
+    row_opt = row_by_id.get(m.row_id)
+    prop_opt = prop_by_id.get(m.prop_id)
+    live_stale = if m.stale
+      true
+    else
+      case (prop_opt, row_opt)
+        (Some(prop), Some(row)):
+          if prop.kind is AiDerived(
+            prompt: pr,
+            source_prop_ids: _,
+            include_row_body: body?,
+            output_kind: out_k,
+            mode: _,
+            daily_call_cap: _
+          )
+            pr_h = compute_ai_prompt_hash(pr, out_k)
+            b_plain = if body?
+              Blocks.blocks_plain_text(try Db.load_page_blocks(store, row.page_id))
+            else
+              ""
+            end
+            in_h = compute_ai_input_hash(def, prop, row, b_plain)
+            pr_h != m.prompt_hash or in_h != m.input_hash
+          else
+            false
+          end
+        (_, _): true
+      end
+    end
+    eff_m = AiCellMeta(
+      id: m.id,
+      database_id: m.database_id,
+      row_id: m.row_id,
+      prop_id: m.prop_id,
+      model: m.model,
+      prompt_hash: m.prompt_hash,
+      input_hash: m.input_hash,
+      stale: live_stale,
+      rationale: m.rationale,
+      citations: m.citations,
+      proposal_id: m.proposal_id,
+      computed_at: m.computed_at
+    )
+    cell_meta_map = cell_meta_map.set("#{m.row_id}:#{m.prop_id}", eff_m.to_json)
+  end
+  Ok((Json.Object(usage_map), Json.Object(cell_meta_map)))
 end
 
 ## `GET /d/:id` and `GET /api/databases/:id` — Returns database schema, saved views, and enriched rows (`ReadFiles`-only).
@@ -534,18 +713,7 @@ fn show_database(
   now = clock.now
   today_iso = now.to_text.bytes.slice(0, 10).decode_utf8 or "1970-01-01"
   read_act = db_read_action(a)
-  (
-    cols,
-    dbs,
-    def,
-    views,
-    enriched,
-    principals_json,
-    relation_targets_json,
-    scenarios_json,
-    ai_meta_json,
-    ai_usage_json
-  ) = try Ledger
+  show_payload = try Ledger
     .read_locked(
       rf,
       Db.ledger_db_path,
@@ -602,44 +770,7 @@ fn show_database(
           end
         end
 
-        var rel_targets_map = {}
-        var seen_targets = Set.empty
-        for prop in def.properties
-          case prop.kind
-            Relation(target_db_id: tdb_id, inverse_prop_id: _):
-              if not seen_targets.has?(tdb_id)
-                seen_targets = seen_targets.add(tdb_id)
-                case db_by_id.get(tdb_id)
-                  Some(target_def):
-                    t_rows = try load_active_db_rows(store, target_def.id)
-                    var opt_list = []
-                    for tr in t_rows
-                      opt_list = opt_list.append(
-                        Json.Object({
-                          "row_id": Json.String(tr.id),
-                          "page_id": Json.String(tr.page_id),
-                          "title": Json.String(
-                            DatabaseModel.extract_row_title(target_def, tr.cells)
-                          )
-                        })
-                      )
-                    end
-                    rel_targets_map = rel_targets_map.set(tdb_id, Json.Array(opt_list))
-                  None: Unit
-                end
-              end
-            Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
-              options: _
-            ) | Checkbox | Person | Url | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
-              prompt: _,
-              source_prop_ids: _,
-              include_row_body: _,
-              output_kind: _,
-              mode: _,
-              daily_call_cap: _
-            ): Unit
-          end
-        end
+        rel_targets_json = try build_show_rel_targets(store, def, db_by_id)
 
         scen_pairs = try Table.lookup(
           store,
@@ -654,121 +785,22 @@ fn show_database(
           end
         end
 
-        var prop_by_id = {}
-        var usage_map = {}
-        for p in def.properties
-          prop_by_id = prop_by_id.set(p.id, p)
-          case p.kind
-            AiDerived(
-              prompt: _,
-              source_prop_ids: _,
-              include_row_body: _,
-              output_kind: _,
-              mode: _,
-              daily_call_cap: cap
-            ):
-              uk = DatabaseModel.ai_col_usage_key(def.id, p.id, today_iso)
-              used = case try Table.get(store, Db.ai_col_usage_table(), uk).map_error(
-                Db.map_table_error
-              )
-                Some(u): u.calls_used
-                None: 0
-              end
-              rem = if cap > used: cap - used else: 0
-              usage_map = usage_map.set(
-                p.id,
-                Json.Object({
-                  "calls_used": Json.int(used),
-                  "daily_call_cap": Json.int(cap),
-                  "remaining_calls": Json.int(rem),
-                  "day_iso": Json.String(today_iso)
-                })
-              )
-            Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
-              options: _
-            ) | Checkbox | Person | Url | Relation(target_db_id: _, inverse_prop_id: _) | Rollup(
-              relation_prop_id: _,
-              target_prop_id: _,
-              agg: _
-            ): Unit
-          end
-        end
+        (usage_json, cell_meta_json) = try build_show_ai_meta(store, def, active_rows, today_iso)
 
-        var row_by_id = {}
-        for r in active_rows
-          row_by_id = row_by_id.set(r.id, r)
-        end
-        meta_pairs = try Table.lookup(
-          store,
-          Db.ai_cell_meta_table(),
-          Db.ai_cell_meta_by_database(),
-          def.id
-        ).map_error(Db.map_table_error)
-        var cell_meta_map = {}
-        for (_mk, m) in meta_pairs
-          row_opt = row_by_id.get(m.row_id)
-          prop_opt = prop_by_id.get(m.prop_id)
-          live_stale = if m.stale
-            true
-          else
-            case (prop_opt, row_opt)
-              (Some(prop), Some(row)):
-                case prop.kind
-                  AiDerived(
-                    prompt: pr,
-                    source_prop_ids: _,
-                    include_row_body: body?,
-                    output_kind: out_k,
-                    mode: _,
-                    daily_call_cap: _
-                  ):
-                    pr_h = compute_ai_prompt_hash(pr, out_k)
-                    b_plain = if body?
-                      Blocks.blocks_plain_text(try Db.load_page_blocks(store, row.page_id))
-                    else
-                      ""
-                    end
-                    in_h = compute_ai_input_hash(def, prop, row, b_plain)
-                    pr_h != m.prompt_hash or in_h != m.input_hash
-                  Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(
-                    options: _
-                  ) | MultiSelect(options: _) | Checkbox | Person | Url | Relation(
-                    target_db_id: _,
-                    inverse_prop_id: _
-                  ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): false
-                end
-              (_, _): true
-            end
-          end
-          eff_m = AiCellMeta(
-            id: m.id,
-            database_id: m.database_id,
-            row_id: m.row_id,
-            prop_id: m.prop_id,
-            model: m.model,
-            prompt_hash: m.prompt_hash,
-            input_hash: m.input_hash,
-            stale: live_stale,
-            rationale: m.rationale,
-            citations: m.citations,
-            proposal_id: m.proposal_id,
-            computed_at: m.computed_at
-          )
-          cell_meta_map = cell_meta_map.set("#{m.row_id}:#{m.prop_id}", eff_m.to_json)
-        end
-
-        Ok((
-          cols,
-          dbs,
-          def,
-          sorted_views,
-          DatabaseModel.sort_enriched_rows(enr, []),
-          Json.Array(principals_list),
-          Json.Object(rel_targets_map),
-          open_scenarios.to_json,
-          Json.Object(cell_meta_map),
-          Json.Object(usage_map)
-        ))
+        Ok(
+          Json.Object({
+            "collections": cols.to_json,
+            "databases": dbs.to_json,
+            "database": def.to_json,
+            "views": sorted_views.to_json,
+            "rows": DatabaseModel.sort_enriched_rows(enr, []).to_json,
+            "principals": Json.Array(principals_list),
+            "relation_targets": rel_targets_json,
+            "scenarios": open_scenarios.to_json,
+            "ai_cell_meta": cell_meta_json,
+            "ai_usage": usage_json
+          })
+        )
       end
     )
 
@@ -777,14 +809,14 @@ fn show_database(
       json_ok(
         200,
         Json.Object({
-          "database": def.to_json,
-          "views": views.to_json,
-          "rows": enriched.to_json,
-          "principals": principals_json,
-          "relation_targets": relation_targets_json,
-          "scenarios": scenarios_json,
-          "ai_cell_meta": ai_meta_json,
-          "ai_usage": ai_usage_json
+          "database": show_payload.get("database") or Json.Null,
+          "views": show_payload.get("views") or Json.Null,
+          "rows": show_payload.get("rows") or Json.Null,
+          "principals": show_payload.get("principals") or Json.Null,
+          "relation_targets": show_payload.get("relation_targets") or Json.Null,
+          "scenarios": show_payload.get("scenarios") or Json.Null,
+          "ai_cell_meta": show_payload.get("ai_cell_meta") or Json.Null,
+          "ai_usage": show_payload.get("ai_usage") or Json.Null
         })
       )
     )
@@ -800,16 +832,16 @@ fn show_database(
     icfg,
     "Workspace/Database",
     {
-      "collections": cols.to_json,
-      "databases": dbs.to_json,
-      "database": def.to_json,
-      "views": views.to_json,
-      "rows": enriched.to_json,
-      "principals": principals_json,
-      "relation_targets": relation_targets_json,
-      "scenarios": scenarios_json,
-      "ai_cell_meta": ai_meta_json,
-      "ai_usage": ai_usage_json
+      "collections": show_payload.get("collections") or Json.Null,
+      "databases": show_payload.get("databases") or Json.Null,
+      "database": show_payload.get("database") or Json.Null,
+      "views": show_payload.get("views") or Json.Null,
+      "rows": show_payload.get("rows") or Json.Null,
+      "principals": show_payload.get("principals") or Json.Null,
+      "relation_targets": show_payload.get("relation_targets") or Json.Null,
+      "scenarios": show_payload.get("scenarios") or Json.Null,
+      "ai_cell_meta": show_payload.get("ai_cell_meta") or Json.Null,
+      "ai_usage": show_payload.get("ai_usage") or Json.Null
     },
     shared
   )
@@ -835,7 +867,7 @@ fn update_database_schema(
   )
   audit_payload = Json.Object({"database_id": Json.String(id)})
 
-  updated = try Ledger.transact_locked(
+  upd_meta = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -884,22 +916,34 @@ fn update_database_schema(
         Some(msg): return Error(BadInput(reason: msg))
         None: Unit
       end
+      case validate_formula_props(next_def)
+        Some(msg): return Error(BadInput(reason: msg))
+        None: Unit
+      end
       t2 = try Db.tx_clean_removed_db_properties(t1, old_def, next_def)
       t3 = try Db.tx_refresh_db_summary(t2, next_def, now)
-      Ok((t3, next_def))
+      Ok((
+        t3,
+        Json.Object({
+          "database": next_def.to_json,
+          "version": Json.int(next_def.version),
+          "has_ai": Json.Boolean(DatabaseModel.has_ai_derived_columns?(next_def))
+        })
+      ))
     end
   )
-  if DatabaseModel.has_ai_derived_columns?(updated)
-    try Db.ensure_ai_col_feed_locked(files, updated.id, now)
+  if upd_meta.bool_at("has_ai") == Some(true)
+    try Db.ensure_ai_col_feed_locked(files, id, now)
   end
+  upd_ver = upd_meta.int_at("version") or 1
   schema_ev = Json.Object({
-    "database_id": Json.String(updated.id),
-    "version": Json.int(updated.version),
+    "database_id": Json.String(id),
+    "version": Json.int(upd_ver),
     "actor": Json.String(auth.principal.handle)
   })
   Ok(
-    json_ok(200, updated.to_json).with_sse_publish_json(
-      "database:#{updated.id}",
+    json_ok(200, upd_meta.get("database") or Json.Null).with_sse_publish_json(
+      "database:#{id}",
       "db.schema_updated",
       schema_ev
     )
@@ -943,7 +987,7 @@ fn create_view(
   )
   audit_payload = Json.Object({"database_id": Json.String(id), "view_id": Json.String(view_id)})
 
-  saved = try Ledger.transact_locked(
+  try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -963,17 +1007,17 @@ fn create_view(
         None: Unit
       end
       t2 = try Table.put(t1, Db.db_views_table(), v.id, v).map_error(Db.map_table_error)
-      Ok((t2, v))
+      Ok((t2, Unit))
     end
   )
   view_ev = Json.Object({
-    "database_id": Json.String(saved.database_id),
-    "view_id": Json.String(saved.id),
+    "database_id": Json.String(v.database_id),
+    "view_id": Json.String(v.id),
     "actor": Json.String(auth.principal.handle)
   })
   Ok(
-    json_ok(201, saved.to_json).with_sse_publish_json(
-      "database:#{saved.database_id}",
+    json_ok(201, v.to_json).with_sse_publish_json(
+      "database:#{v.database_id}",
       "db.views_updated",
       view_ev
     )
@@ -1022,8 +1066,8 @@ fn update_view(
   filters_opt = case raw_json.get("filters")
     None | Some(Json.Null): None
     Some(fjson): Some(
-      try Json.decode_strict[List(DbFilterRule)](fjson.to_text.bytes).map_error(fn(e)
-        BadInput(reason: "invalid 'filters': #{e.to_text}")
+      try DatabaseModel.decode_filter_rules_json(fjson.to_text.bytes).map_error(fn(e)
+        BadInput(reason: "invalid 'filters': #{e}")
       end)
     )
   end
@@ -1035,8 +1079,8 @@ fn update_view(
   sorts_opt = case raw_json.get("sorts")
     None | Some(Json.Null): None
     Some(sjson): Some(
-      try Json.decode_strict[List(DbSortRule)](sjson.to_text.bytes).map_error(fn(e)
-        BadInput(reason: "invalid 'sorts': #{e.to_text}")
+      try DatabaseModel.decode_sort_rules_json(sjson.to_text.bytes).map_error(fn(e)
+        BadInput(reason: "invalid 'sorts': #{e}")
       end)
     )
   end
@@ -1055,7 +1099,7 @@ fn update_view(
   )
   audit_payload = Json.Object({"database_id": Json.String(id), "view_id": Json.String(view_id)})
 
-  saved = try Ledger.transact_locked(
+  saved_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -1089,17 +1133,17 @@ fn update_view(
         None: Unit
       end
       t2 = try Table.put(t1, Db.db_views_table(), next_v.id, next_v).map_error(Db.map_table_error)
-      Ok((t2, next_v))
+      Ok((t2, next_v.to_json))
     end
   )
   view_ev = Json.Object({
-    "database_id": Json.String(saved.database_id),
-    "view_id": Json.String(saved.id),
+    "database_id": Json.String(id),
+    "view_id": Json.String(view_id),
     "actor": Json.String(auth.principal.handle)
   })
   Ok(
-    json_ok(200, saved.to_json).with_sse_publish_json(
-      "database:#{saved.database_id}",
+    json_ok(200, saved_json).with_sse_publish_json(
+      "database:#{id}",
       "db.views_updated",
       view_ev
     )
@@ -1205,7 +1249,7 @@ fn query_database(
   end
   read_act = db_read_action(auth)
 
-  res = try Ledger.read_locked(
+  res_json = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -1282,11 +1326,11 @@ fn query_database(
           rows: final_rows,
           board_groups: board_groups,
           total_count: final_rows.size
-        )
+        ).to_json
       )
     end
   )
-  Ok(json_ok(200, res.to_json))
+  Ok(json_ok(200, res_json))
 end
 
 ## `POST /api/databases/:id/rows` — Atomically creates a `DbRow`, backing `Page(DatabaseRow)`, `vlm_db_cells` indexes, and `Modb.Fts`.
@@ -1328,7 +1372,7 @@ fn create_row(
     "page_id": Json.String(page_id)
   })
 
-  (saved_row, saved_page) = try Ledger.transact_locked(
+  row_res_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -1344,11 +1388,12 @@ fn create_row(
       end
       try Policy.require_collection_access(auth, "write_db", def.collection_id)
 
+      (t_seq, assigned_cells) = try Db.tx_assign_unique_ids(t1, def, input.cells)
       row = DbRow(
         id: row_id,
         database_id: def.id,
         page_id: page_id,
-        cells: input.cells,
+        cells: assigned_cells,
         created_by: auth.principal.id,
         created_at: now,
         updated_at: now,
@@ -1360,7 +1405,7 @@ fn create_row(
         None: Unit
       end
 
-      row_title = DatabaseModel.extract_row_title(def, input.cells)
+      row_title = DatabaseModel.extract_row_title(def, assigned_cells)
       page = Page(
         id: page_id,
         collection_id: def.collection_id,
@@ -1380,22 +1425,39 @@ fn create_row(
         archived_at: None,
         version: 1
       )
-      t2 = try Db.tx_put_db_row(t1, def, row, page, blocks)
-      (t3, _jid) = try Jobs.tx_put(t2, idx_job).map_error(Db.map_table_error)
-      Ok((t3, (row, page)))
+      t2 = try Db.tx_put_db_row(t_seq, def, row, page, blocks)
+      t2b = try Table.put(t2, Db.db_row_editors_table(), row.id, auth.principal.id).map_error(
+        Db.map_table_error
+      )
+      (t3, _jid) = try Jobs.tx_put(t2b, idx_job).map_error(Db.map_table_error)
+      Ok((
+        t3,
+        Json.Object({
+          "row": row.to_json,
+          "page": page.to_json,
+          "collection_id": Json.String(def.collection_id)
+        })
+      ))
     end
   )
+  col_id = row_res_json.text_at("collection_id") or ""
   row_ev = Json.Object({
-    "database_id": Json.String(saved_row.database_id),
-    "row_id": Json.String(saved_row.id),
-    "page_id": Json.String(saved_page.id),
-    "collection_id": Json.String(saved_page.collection_id),
+    "database_id": Json.String(id),
+    "row_id": Json.String(row_id),
+    "page_id": Json.String(page_id),
+    "collection_id": Json.String(col_id),
     "actor": Json.String(auth.principal.handle)
   })
   Ok(
-    json_ok(201, Json.Object({"row": saved_row.to_json, "page": saved_page.to_json}))
-      .with_sse_publish_json("database:#{saved_row.database_id}", "db.row_created", row_ev)
-      .with_sse_publish_json("collection:#{saved_page.collection_id}", "db.row_created", row_ev)
+    json_ok(
+      201,
+      Json.Object({
+        "row": row_res_json.get("row") or Json.Null,
+        "page": row_res_json.get("page") or Json.Null
+      })
+    )
+      .with_sse_publish_json("database:#{id}", "db.row_created", row_ev)
+      .with_sse_publish_json("collection:#{col_id}", "db.row_created", row_ev)
   )
 end
 
@@ -1421,7 +1483,7 @@ fn update_row(
   )
   audit_payload = Json.Object({"database_id": Json.String(id), "row_id": Json.String(row_id)})
 
-  (next_row, next_page) = try Ledger.transact_locked(
+  row_res_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -1449,6 +1511,10 @@ fn update_row(
           )
         )
       end
+
+      try DatabaseModel.check_unique_id_immutable(def, old_row.cells, input.cells).map_error(fn(msg)
+        BadInput(reason: msg)
+      end)
 
       var merged_cells = old_row.cells
       for (k, v) in input.cells.entries
@@ -1500,6 +1566,8 @@ fn update_row(
         version: old_page.version + 1
       )
       t2 = try Db.tx_put_db_row(t1, def, bumped_row, bumped_page, existing_blocks)
+      t2b = try Table.put(t2, Db.db_row_editors_table(), bumped_row.id, auth.principal.id)
+        .map_error(Db.map_table_error)
       idx_job = Jobs.JobRecord(
         id: stub_job.id,
         queue: stub_job.queue,
@@ -1514,22 +1582,40 @@ fn update_row(
         created_at: stub_job.created_at,
         updated_at: stub_job.updated_at
       )
-      (t3, _jid) = try Jobs.tx_put(t2, idx_job).map_error(Db.map_table_error)
-      Ok((t3, (bumped_row, bumped_page)))
+      (t3, _jid) = try Jobs.tx_put(t2b, idx_job).map_error(Db.map_table_error)
+      Ok((
+        t3,
+        Json.Object({
+          "row": bumped_row.to_json,
+          "page": bumped_page.to_json,
+          "page_id": Json.String(bumped_page.id),
+          "collection_id": Json.String(def.collection_id),
+          "version": Json.int(bumped_row.version)
+        })
+      ))
     end
   )
+  col_id = row_res_json.text_at("collection_id") or ""
+  page_id = row_res_json.text_at("page_id") or ""
+  upd_ver = row_res_json.int_at("version") or 1
   row_ev = Json.Object({
-    "database_id": Json.String(next_row.database_id),
-    "row_id": Json.String(next_row.id),
-    "page_id": Json.String(next_page.id),
-    "collection_id": Json.String(next_page.collection_id),
-    "version": Json.int(next_row.version),
+    "database_id": Json.String(id),
+    "row_id": Json.String(row_id),
+    "page_id": Json.String(page_id),
+    "collection_id": Json.String(col_id),
+    "version": Json.int(upd_ver),
     "actor": Json.String(auth.principal.handle)
   })
   Ok(
-    json_ok(200, Json.Object({"row": next_row.to_json, "page": next_page.to_json}))
-      .with_sse_publish_json("database:#{next_row.database_id}", "db.row_updated", row_ev)
-      .with_sse_publish_json("collection:#{next_page.collection_id}", "db.row_updated", row_ev)
+    json_ok(
+      200,
+      Json.Object({
+        "row": row_res_json.get("row") or Json.Null,
+        "page": row_res_json.get("page") or Json.Null
+      })
+    )
+      .with_sse_publish_json("database:#{id}", "db.row_updated", row_ev)
+      .with_sse_publish_json("collection:#{col_id}", "db.row_updated", row_ev)
   )
 end
 
@@ -1552,7 +1638,7 @@ fn delete_row(
   )
   audit_payload = Json.Object({"database_id": Json.String(id), "row_id": Json.String(row_id)})
 
-  col_id = try Ledger.transact_locked(
+  del_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -1573,9 +1659,10 @@ fn delete_row(
       end
       _ignore = old_row
       t2 = try Db.tx_delete_db_row(t1, def, row_id)
-      Ok((t2, def.collection_id))
+      Ok((t2, Json.Object({"collection_id": Json.String(def.collection_id)})))
     end
   )
+  col_id = del_json.text_at("collection_id") or ""
   del_ev = Json.Object({
     "database_id": Json.String(id),
     "row_id": Json.String(row_id),

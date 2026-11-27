@@ -1,9 +1,13 @@
 import { Link } from "@inertiajs/react";
 import {
+  AtSign,
   Calendar,
   Check,
+  Clock,
   ExternalLink,
+  Hash,
   Link2,
+  Paperclip,
   Pencil,
   RefreshCw,
   Sigma,
@@ -78,6 +82,9 @@ export function formatNumberCell(raw: string, format: string): string {
   if (format === "percent") {
     return `${new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(num)}%`;
   }
+  if (format === "percent_fraction") {
+    return `${new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 }).format(num * 100)}%`;
+  }
   return new Intl.NumberFormat("en-US", { maximumFractionDigits: 4 }).format(num);
 }
 
@@ -100,6 +107,9 @@ export function getSelectOptions(prop: PropertyDef): SelectOption[] {
   if (typeof prop.kind === "object" && "select" in prop.kind) {
     return prop.kind.select.options;
   }
+  if (typeof prop.kind === "object" && "status" in prop.kind) {
+    return prop.kind.status.options;
+  }
   if (typeof prop.kind === "object" && "multi_select" in prop.kind) {
     return prop.kind.multi_select.options;
   }
@@ -117,6 +127,7 @@ export function getSelectOptions(prop: PropertyDef): SelectOption[] {
 export function resolveRollupFormat(prop: PropertyDef, databases: DatabaseDef[], currentDb: DatabaseDef): string {
   if (typeof prop.kind !== "object" || !("rollup" in prop.kind)) return "plain";
   const { relation_prop_id, target_prop_id, agg } = prop.kind.rollup;
+  if (agg === "percent_per_group") return "percent_fraction";
   if (agg === "count_all" || agg === "count_values") return "plain";
   const relProp = currentDb.properties.find((p) => p.id === relation_prop_id);
   if (!relProp || typeof relProp.kind !== "object" || !("relation" in relProp.kind)) return "plain";
@@ -141,6 +152,10 @@ export function renderCellDisplay(
     if (prop && typeof prop.kind === "object") {
       if ("number" in prop.kind) {
         fmt = prop.kind.number.format;
+      } else if ("formula" in prop.kind) {
+        fmt = prop.kind.formula.format || "plain";
+      } else if ("rollup" in prop.kind && prop.kind.rollup.agg === "percent_per_group") {
+        fmt = "percent_fraction";
       } else if (
         "ai_derived" in prop.kind &&
         typeof prop.kind.ai_derived.output_kind === "object" &&
@@ -176,6 +191,10 @@ export function renderCellDisplay(
         return pr ? pr.display_name : id;
       })
       .join(", ");
+  }
+  if ("files_val" in cell) {
+    if (cell.files_val.attachment_ids.length === 0) return "—";
+    return `${cell.files_val.attachment_ids.length} file${cell.files_val.attachment_ids.length === 1 ? "" : "s"}`;
   }
   if ("url_val" in cell) return cell.url_val || "—";
   if ("relation_val" in cell) {
@@ -313,9 +332,11 @@ export default function InlineCellEditor({
     );
   }
 
-  // 2. SELECT
-  if (typeof prop.kind === "object" && "select" in prop.kind) {
-    const opts = prop.kind.select.options;
+  // 2. SELECT / STATUS
+  if (typeof prop.kind === "object" && ("select" in prop.kind || "status" in prop.kind)) {
+    const isStatus = "status" in prop.kind;
+    const opts = isStatus ? (prop.kind as { status: { options: SelectOption[]; done_option_ids: string[] } }).status.options : (prop.kind as { select: { options: SelectOption[] } }).select.options;
+    const doneIds = isStatus ? (prop.kind as { status: { options: SelectOption[]; done_option_ids: string[] } }).status.done_option_ids : [];
     const curOptId =
       typeof cell === "object" && "select_val" in cell ? cell.select_val.option_id : "";
     const selectedOpt = curOptId ? opts.find((o) => o.id === curOptId) : undefined;
@@ -323,23 +344,28 @@ export default function InlineCellEditor({
       ? SELECT_COLOR_CLASSES[selectedOpt.color]
       : "border-stone-200 bg-white text-stone-500";
     return (
-      <select
-        value={curOptId}
-        disabled={disabled}
-        onChange={(e) =>
-          void onCommit(
-            e.target.value ? { select_val: { option_id: e.target.value } } : "empty"
-          )
-        }
-        className={`rounded-full border px-2.5 py-0.5 text-xs font-medium outline-none cursor-pointer ${pillCls}`}
-      >
-        <option value="">—</option>
-        {opts.map((o) => (
-          <option key={o.id} value={o.id}>
-            {o.label}
-          </option>
-        ))}
-      </select>
+      <div className="inline-flex items-center gap-1">
+        <select
+          value={curOptId}
+          disabled={disabled}
+          onChange={(e) =>
+            void onCommit(
+              e.target.value ? { select_val: { option_id: e.target.value } } : "empty"
+            )
+          }
+          className={`rounded-full border px-2.5 py-0.5 text-xs font-medium outline-none cursor-pointer ${pillCls}`}
+        >
+          <option value="">—</option>
+          {opts.map((o) => (
+            <option key={o.id} value={o.id}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+        {isStatus && selectedOpt && doneIds.includes(selectedOpt.id) && (
+          <Check className="h-3 w-3 text-emerald-600 shrink-0" />
+        )}
+      </div>
     );
   }
 
@@ -375,6 +401,62 @@ export default function InlineCellEditor({
       >
         <Sigma className="h-3 w-3 text-stone-400" />
         {display}
+      </span>
+    );
+  }
+
+  // 4a. FORMULA (read-only deterministic computation)
+  if (typeof prop.kind === "object" && "formula" in prop.kind) {
+    const display = renderCellDisplay(cell, prop, principals, relationTargets[prop.id]);
+    return (
+      <span
+        className="inline-flex items-center gap-1.5 rounded-md border border-indigo-200 bg-indigo-50/70 px-2 py-0.5 text-xs text-indigo-950"
+        title={prop.kind.formula.expression}
+      >
+        <span className="font-mono text-[10px] font-semibold text-indigo-600 shrink-0">fx</span>
+        <span className="max-w-[220px] truncate">{display}</span>
+      </span>
+    );
+  }
+
+  // 4c. UNIQUE_ID (immutable auto-increment key)
+  if (typeof prop.kind === "object" && "unique_id" in prop.kind) {
+    const valStr = typeof cell === "object" && "text_val" in cell ? cell.text_val : "—";
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded border border-stone-200 bg-stone-100 px-2 py-0.5 font-mono text-xs font-medium text-stone-700"
+        title="Auto-increment Unique ID"
+      >
+        <Hash className="h-3 w-3 text-stone-400" />
+        {valStr}
+      </span>
+    );
+  }
+
+  // 4d. AUDIT TIMESTAMPS (created_time / last_edited_time)
+  if (prop.kind === "created_time" || prop.kind === "last_edited_time") {
+    const ts = typeof cell === "object" && "text_val" in cell ? cell.text_val : "—";
+    const shortTs = ts.length >= 16 ? `${ts.slice(0, 10)} ${ts.slice(11, 16)}` : ts;
+    return (
+      <span
+        className="inline-flex items-center gap-1 font-mono text-[11px] text-stone-500"
+        title={ts}
+      >
+        <Clock className="h-3 w-3 text-stone-400" />
+        {shortTs}
+      </span>
+    );
+  }
+
+  // 4e. AUDIT ACTORS (created_by / last_edited_by)
+  if (prop.kind === "created_by" || prop.kind === "last_edited_by") {
+    const ids = typeof cell === "object" && "principal_val" in cell ? cell.principal_val : [];
+    const pid = ids[0];
+    const pr = pid ? principals.find((x) => x.id === pid) : undefined;
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full border border-stone-200 bg-stone-50 px-2 py-0.5 text-[11px] text-stone-600">
+        <User className="h-2.5 w-2.5 text-stone-400" />
+        {pid ? (pr ? pr.display_name : pid) : "—"}
       </span>
     );
   }
@@ -698,6 +780,193 @@ export default function InlineCellEditor({
         >
           <Pencil className="h-3 w-3" />
         </button>
+      </div>
+    );
+  }
+
+  // 7b. EMAIL
+  if (prop.kind === "email") {
+    const curEmail = typeof cell === "object" && "text_val" in cell ? cell.text_val : "";
+    if (editing) {
+      const saveEmail = () => {
+        const t = draft.trim();
+        if (!t) {
+          setEditing(false);
+          setLocalError(null);
+          if (curEmail) void onCommit("empty");
+          return;
+        }
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(t)) {
+          setLocalError("Enter a valid email address");
+          return;
+        }
+        setEditing(false);
+        setLocalError(null);
+        if (t !== curEmail) void onCommit({ text_val: t });
+      };
+      return (
+        <div ref={containerRef} className="relative min-w-[180px]">
+          <input
+            autoFocus
+            type="email"
+            placeholder="name@domain.edu"
+            value={draft}
+            onChange={(e) => {
+              setDraft(e.target.value);
+              setLocalError(null);
+            }}
+            onBlur={saveEmail}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                saveEmail();
+              } else if (e.key === "Escape") {
+                setEditing(false);
+                setLocalError(null);
+              }
+            }}
+            className={`w-full rounded border px-2 py-0.5 text-xs outline-none ${
+              localError
+                ? "border-red-400 bg-red-50 ring-2 ring-red-100"
+                : "border-blue-400 bg-white ring-2 ring-blue-100"
+            }`}
+          />
+          {localError && (
+            <div className="absolute left-0 top-full mt-1 z-20 rounded bg-red-700 px-2 py-0.5 text-[10px] text-white whitespace-nowrap shadow">
+              {localError}
+            </div>
+          )}
+        </div>
+      );
+    }
+    return (
+      <div className="group flex items-center gap-1.5">
+        {curEmail ? (
+          <a
+            href={`mailto:${curEmail}`}
+            className="inline-flex items-center gap-1 text-xs text-blue-600 hover:underline truncate max-w-[190px]"
+          >
+            <AtSign className="h-3 w-3 text-stone-400 shrink-0" />
+            {curEmail}
+          </a>
+        ) : (
+          <button
+            type="button"
+            disabled={disabled}
+            onClick={() => {
+              setDraft("");
+              setEditing(true);
+            }}
+            className="text-xs text-stone-400 hover:text-stone-700"
+          >
+            —
+          </button>
+        )}
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => {
+            setDraft(curEmail);
+            setEditing(true);
+          }}
+          className="opacity-0 group-hover:opacity-100 text-stone-400 hover:text-stone-700 transition"
+          title="Edit email"
+        >
+          <Pencil className="h-3 w-3" />
+        </button>
+      </div>
+    );
+  }
+
+  // 7c. FILE LIST
+  if (prop.kind === "file_list") {
+    const ids =
+      typeof cell === "object" && "files_val" in cell ? cell.files_val.attachment_ids : [];
+    const removeFile = (fid: string) => {
+      const next = ids.filter((x) => x !== fid);
+      void onCommit(next.length > 0 ? { files_val: { attachment_ids: next } } : "empty");
+    };
+    const addFile = () => {
+      const t = searchText.trim();
+      if (!t) return;
+      if (ids.includes(t)) {
+        setSearchText("");
+        return;
+      }
+      setSearchText("");
+      void onCommit({ files_val: { attachment_ids: [...ids, t] } });
+    };
+    return (
+      <div ref={containerRef} className="relative flex flex-wrap items-center gap-1">
+        {ids.map((fid) => (
+          <span
+            key={fid}
+            className="inline-flex items-center gap-1 rounded border border-stone-200 bg-stone-50 px-2 py-0.5 text-[11px] text-stone-700"
+          >
+            <Paperclip className="h-2.5 w-2.5 text-stone-400" />
+            {fid.startsWith("att_") ? (
+              <a
+                href={`/api/attachments/${fid}/download`}
+                target="_blank"
+                rel="noreferrer"
+                className="hover:underline font-mono text-[10px]"
+              >
+                {fid}
+              </a>
+            ) : (
+              <span className="truncate max-w-[140px]">{fid}</span>
+            )}
+            {!disabled && (
+              <button
+                type="button"
+                onClick={() => removeFile(fid)}
+                className="text-stone-400 hover:text-red-600"
+                title="Remove file"
+              >
+                <X className="h-2.5 w-2.5" />
+              </button>
+            )}
+          </span>
+        ))}
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => {
+            setSearchText("");
+            setEditing((prev) => !prev);
+          }}
+          className="inline-flex items-center gap-1 rounded border border-dashed border-stone-300 px-1.5 py-0.5 text-[11px] text-stone-500 hover:border-stone-400 hover:text-stone-800"
+          title="Add file attachment ID"
+        >
+          <Paperclip className="h-3 w-3" />
+          {ids.length === 0 ? "Add file" : "+"}
+        </button>
+        {editing && (
+          <div className="absolute left-0 top-full mt-1 z-30 w-60 rounded-xl border border-stone-200 bg-white p-2 shadow-lg space-y-2">
+            <div className="flex gap-1">
+              <input
+                autoFocus
+                value={searchText}
+                onChange={(e) => setSearchText(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    addFile();
+                  }
+                }}
+                placeholder="att_... or filename"
+                className="flex-1 rounded-md border border-stone-200 px-2 py-1 text-xs outline-none"
+              />
+              <button
+                type="button"
+                onClick={addFile}
+                className="rounded-md bg-stone-900 px-2 py-1 text-xs font-medium text-white hover:bg-stone-800"
+              >
+                Add
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     );
   }

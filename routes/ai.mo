@@ -1595,9 +1595,9 @@ fn ai_cell_value_to_plain_text(prop: PropertyDef, c: CellValue) : Text
         None: st.to_iso
       end
     BoolVal(b): if b: "true" else: "false"
-    SelectVal(option_id: oid):
+      SelectVal(option_id: oid):
       case prop.kind
-        Select(options: opts) | AiDerived(
+        Select(options: opts) | Status(options: opts, done_option_ids: _) | AiDerived(
           prompt: _,
           source_prop_ids: _,
           include_row_body: _,
@@ -1611,7 +1611,9 @@ fn ai_cell_value_to_plain_text(prop: PropertyDef, c: CellValue) : Text
             end
           end
           oid
-        Title | RichText | Number(format: _) | DateProp(include_time: _) | MultiSelect(options: _) | Checkbox | Person | Url | Relation(
+        Title | RichText | Number(format: _) | DateProp(include_time: _) | MultiSelect(options: _) | Checkbox | Person | Email | FileList | Url | UniqueId(
+          prefix: _
+        ) | Formula(expression: _, format: _) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
           target_db_id: _,
           inverse_prop_id: _
         ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
@@ -1623,7 +1625,9 @@ fn ai_cell_value_to_plain_text(prop: PropertyDef, c: CellValue) : Text
           daily_call_cap: _
         ): oid
       end
-    MultiSelectVal(option_ids: xs) | PrincipalVal(xs) | RelationVal(row_ids: xs): xs.join(", ")
+    MultiSelectVal(option_ids: xs) | PrincipalVal(xs) | FilesVal(attachment_ids: xs) | RelationVal(
+      row_ids: xs
+    ): xs.join(", ")
   end
 end
 
@@ -1652,11 +1656,12 @@ fn build_row_ai_context(
         ): false
         Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
           options: _
-        ) | Checkbox | Person | Url | Relation(target_db_id: _, inverse_prop_id: _) | Rollup(
-          relation_prop_id: _,
-          target_prop_id: _,
-          agg: _
-        ): true
+        ) | Status(options: _, done_option_ids: _) | Checkbox | Person | Email | FileList | Url | UniqueId(
+          prefix: _
+        ) | Formula(expression: _, format: _) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
+          target_db_id: _,
+          inverse_prop_id: _
+        ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): true
       end
     end).map(fn(p) p.id end)
   else
@@ -1781,11 +1786,12 @@ fn ai_columns_status(
             )
           Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
             options: _
-          ) | Checkbox | Person | Url | Relation(target_db_id: _, inverse_prop_id: _) | Rollup(
-            relation_prop_id: _,
-            target_prop_id: _,
-            agg: _
-          ): Unit
+          ) | Status(options: _, done_option_ids: _) | Checkbox | Person | Email | FileList | Url | UniqueId(
+            prefix: _
+          ) | Formula(expression: _, format: _) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
+            target_db_id: _,
+            inverse_prop_id: _
+          ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): Unit
         end
       end
 
@@ -1830,7 +1836,9 @@ fn ai_columns_status(
                   pr_h != m.prompt_hash or in_h != m.input_hash
                 Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(
                   options: _
-                ) | MultiSelect(options: _) | Checkbox | Person | Url | Relation(
+                ) | MultiSelect(options: _) | Status(options: _, done_option_ids: _) | Checkbox | Person | Email | FileList | Url | UniqueId(
+                  prefix: _
+                ) | Formula(expression: _, format: _) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
                   target_db_id: _,
                   inverse_prop_id: _
                 ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): false
@@ -1981,11 +1989,14 @@ fn run_ai_column(
           ): Ok((d, c, prp, pr_t, sids, inc_b, ok_k, cm, cap))
           Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
             options: _
-          ) | Checkbox | Person | Url | Relation(target_db_id: _, inverse_prop_id: _) | Rollup(
-            relation_prop_id: _,
-            target_prop_id: _,
-            agg: _
-          ): Error(BadInput(reason: "property '#{prop_id}' is not an AI-compiled column"))
+          ) | Status(options: _, done_option_ids: _) | Checkbox | Person | Email | FileList | Url | UniqueId(
+            prefix: _
+          ) | Formula(expression: _, format: _) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
+            target_db_id: _,
+            inverse_prop_id: _
+          ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): Error(
+            BadInput(reason: "property '#{prop_id}' is not an AI-compiled column")
+          )
         end
       end
     )

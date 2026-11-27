@@ -180,7 +180,9 @@ export default function EmbeddedDatabase({
   const boardGroupProp = useMemo(
     () =>
       database?.properties.find(
-        (p) => (typeof p.kind === "object" && "select" in p.kind) || p.kind === "checkbox"
+        (p) =>
+          (typeof p.kind === "object" && ("select" in p.kind || "status" in p.kind)) ||
+          p.kind === "checkbox"
       ) ?? null,
     [database]
   );

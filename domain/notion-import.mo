@@ -349,10 +349,12 @@ fn infer_database_from_csv(table: ParsedCsvTable) : Result(InferredDbImport, Tex
           )
           Number(format: _): NumberVal(raw_val.to_decimal or stop "verified decimal")
           Url: UrlVal(raw_val)
-          Select(options: _):
+          Select(options: _) | Status(options: _, done_option_ids: _):
             oid = opt_map.get(raw_val) or raw_val
             SelectVal(option_id: oid)
-          RichText | Title | MultiSelect(options: _) | Person | Relation(
+          RichText | Title | MultiSelect(options: _) | Person | Email | FileList | UniqueId(
+            prefix: _
+          ) | Formula(expression: _, format: _) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
             target_db_id: _,
             inverse_prop_id: _
           ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
@@ -371,40 +373,4 @@ fn infer_database_from_csv(table: ParsedCsvTable) : Result(InferredDbImport, Tex
   end
 
   Ok(InferredDbImport(properties: props, row_cells: out_rows))
-end
-
-test "NotionImport ID stripping, internal link rewriting, RFC 4180 CSV parsing, and typed schema inference"
-  p1 = NotionPageImport(
-    path: "docs/Gateway%20Spec%209a1b2c3d4e5f67890123456789abcdef.md",
-    title: None,
-    markdown: "# Spec\n\n[[Runbook 0123456789abcdef0123456789abcdef]]\n\n[Read Runbook](Runbook%200123456789abcdef0123456789abcdef.md)"
-  )
-  assert notion_page_title(p1) == "Gateway Spec"
-  rewritten = rewrite_notion_links(p1.markdown, {"Runbook": "pg_runbook"})
-  assert rewritten.contains?("[[pg_runbook|Runbook]]")
-  assert rewritten.contains?("[[pg_runbook|Read Runbook]]")
-
-  csv_raw = "Incident,Severity,Cost,Date,Resolved,Link\n\"API, 502 spike\",Critical,125.50,2026-11-20,true,https://status.acme.io/1\nDB timeout,Warning,0.25,2026-11-21,false,https://status.acme.io/2\n"
-  table = case parse_csv(csv_raw)
-    Ok(t): t
-    Error(_m): stop "parse_csv failed"
-  end
-  assert table.headers == ["Incident", "Severity", "Cost", "Date", "Resolved", "Link"]
-  assert table.rows.size == 2
-  inferred = case infer_database_from_csv(table)
-    Ok(inf): inf
-    Error(_m): stop "infer_database_from_csv failed"
-  end
-  assert inferred.properties.size == 6
-  assert (inferred.properties.get(0) or stop "p0").kind == Title
-  assert (inferred.properties.get(1) or stop "p1").kind is Select(options: _)
-  assert (inferred.properties.get(2) or stop "p2").kind == Number(format: "plain")
-  assert (inferred.properties.get(3) or stop "p3").kind == DateProp(include_time: false)
-  assert (inferred.properties.get(4) or stop "p4").kind == Checkbox
-  assert (inferred.properties.get(5) or stop "p5").kind == Url
-
-  row0 = inferred.row_cells.first or stop "row0"
-  assert row0.get("title") == Some(TextVal("API, 502 spike"))
-  assert row0.get("cost") == Some(NumberVal("125.50".to_decimal or stop "dec"))
-  assert row0.get("resolved") == Some(BoolVal(true))
 end

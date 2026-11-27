@@ -9,7 +9,10 @@ use Arvo.Modb.Jobs
 use Db
 use Domain.Blocks
 use Domain.Collab{ProposalMeta, WorldBranchArgs, WorldMutation, WorldPatchArgs}
-use Domain.DatabaseModel{CellValue, DbFilterRule, DbRow, DbSortRule, PropertyDef, ViewQueryResult}
+use Domain.DatabaseModel{
+  DbRow,
+  ViewQueryResult
+}
 use Domain.Policy
 use Domain.TaintBridge
 use Domain.Types{
@@ -538,12 +541,10 @@ end
 
 fn decode_ops_and_versions(args: Json) : Result((List(BlockOp), Map(Text, Int)), Text)
   ops_json = try args.get("ops").or_fail("missing 'ops' array")
-  ops = try Json.decode_strict[List(BlockOp)](ops_json.to_text.bytes).map_error(fn(e) e.to_text end)
+  ops = try Blocks.decode_block_ops_json(ops_json.to_text.bytes)
   exp_vers = case args.get("expected_versions")
     None | Some(Json.Null): {}
-    Some(ev): try Json.decode_strict[Map(Text, Int)](ev.to_text.bytes).map_error(
-      fn(e) e.to_text end
-    )
+    Some(ev): try Blocks.decode_version_map_json(ev.to_text.bytes)
   end
   Ok((ops, exp_vers))
 end
@@ -614,9 +615,9 @@ fn handle_mcp_db_create_row(
     Some(cj): cj
     None: return Ok(Mcp.tool_error(id, "missing 'cells' object"))
   end
-  cells = case Json.decode_strict[Map(Text, CellValue)](cells_json.to_text.bytes)
+  cells = case DatabaseModel.decode_cell_map_json(cells_json.to_text.bytes)
     Ok(m): m
-    Error(e): return Ok(Mcp.tool_error(id, "invalid cells: #{e.to_text}"))
+    Error(e): return Ok(Mcp.tool_error(id, "invalid cells: #{e}"))
   end
   case authorize_mcp_write_locked(args, auth, files, "mcp.db_create_row", now)
     Ok(_): Unit
@@ -671,11 +672,12 @@ fn handle_mcp_db_create_row(
           )
         )
       end
+      (t_seq, assigned_cells) = try Db.tx_assign_unique_ids(t1, def, cells)
       row = DbRow(
         id: row_id,
         database_id: def.id,
         page_id: page_id,
-        cells: cells,
+        cells: assigned_cells,
         created_by: auth.principal.id,
         created_at: now,
         updated_at: now,
@@ -686,7 +688,7 @@ fn handle_mcp_db_create_row(
         Some(msg): return Error(BadInput(reason: msg))
         None: Unit
       end
-      row_title = DatabaseModel.extract_row_title(def, cells)
+      row_title = DatabaseModel.extract_row_title(def, assigned_cells)
       page = Page(
         id: page_id,
         collection_id: def.collection_id,
@@ -706,8 +708,11 @@ fn handle_mcp_db_create_row(
         archived_at: None,
         version: 1
       )
-      t2 = try Db.tx_put_db_row(t1, def, row, page, blocks)
-      (t3, _jid) = try Jobs.tx_put(t2, idx_job).map_error(Db.map_table_error)
+      t2 = try Db.tx_put_db_row(t_seq, def, row, page, blocks)
+      t2b = try Table.put(t2, Db.db_row_editors_table(), row.id, auth.principal.id).map_error(
+        Db.map_table_error
+      )
+      (t3, _jid) = try Jobs.tx_put(t2b, idx_job).map_error(Db.map_table_error)
       Ok((t3, (row, page)))
     end
   )
@@ -759,9 +764,9 @@ fn handle_mcp_db_update_row(
     Some(cj): cj
     None: return Ok(Mcp.tool_error(id, "missing 'cells' object"))
   end
-  cell_updates = case Json.decode_strict[Map(Text, CellValue)](cells_json.to_text.bytes)
+  cell_updates = case DatabaseModel.decode_cell_map_json(cells_json.to_text.bytes)
     Ok(m): m
-    Error(e): return Ok(Mcp.tool_error(id, "invalid cells: #{e.to_text}"))
+    Error(e): return Ok(Mcp.tool_error(id, "invalid cells: #{e}"))
   end
   case authorize_mcp_write_locked(args, auth, files, "mcp.db_update_row", now)
     Ok(_): Unit
@@ -814,6 +819,9 @@ fn handle_mcp_db_update_row(
           )
         )
       end
+      try DatabaseModel.check_unique_id_immutable(def, old_row.cells, cell_updates).map_error(fn(msg)
+        BadInput(reason: msg)
+      end)
       var merged_cells = old_row.cells
       for (k, v) in cell_updates.entries
         merged_cells = merged_cells.set(k, v)
@@ -862,6 +870,8 @@ fn handle_mcp_db_update_row(
         version: old_page.version + 1
       )
       t2 = try Db.tx_put_db_row(t1, def, bumped_row, bumped_page, existing_blocks)
+      t2b = try Table.put(t2, Db.db_row_editors_table(), bumped_row.id, auth.principal.id)
+        .map_error(Db.map_table_error)
       final_idx_job = Jobs.JobRecord(
         id: idx_job.id,
         queue: idx_job.queue,
@@ -876,7 +886,7 @@ fn handle_mcp_db_update_row(
         created_at: idx_job.created_at,
         updated_at: idx_job.updated_at
       )
-      (t3, _jid) = try Jobs.tx_put(t2, final_idx_job).map_error(Db.map_table_error)
+      (t3, _jid) = try Jobs.tx_put(t2b, final_idx_job).map_error(Db.map_table_error)
       Ok((t3, (bumped_row, bumped_page)))
     end
   )
@@ -920,17 +930,17 @@ fn decode_mcp_world_mutation(
       Some(j): j
       None: return Error("ops required for page_patch")
     end
-    ops = case Json.decode_strict[List(BlockOp)](ops_j.to_text.bytes)
+    ops = case Blocks.decode_block_ops_json(ops_j.to_text.bytes)
       Ok(o) if not o.empty?: o
       Ok(_): return Error("ops must not be empty")
-      Error(e): return Error("invalid ops: #{e.to_text}")
+      Error(e): return Error("invalid ops: #{e}")
     end
     exp_vers = case item.get("expected_versions")
       None | Some(Json.Null): {}
       Some(evj):
-        case Json.decode_strict[Map(Text, Int)](evj.to_text.bytes)
+        case Blocks.decode_version_map_json(evj.to_text.bytes)
           Ok(m): m
-          Error(e): return Error("invalid expected_versions: #{e.to_text}")
+          Error(e): return Error("invalid expected_versions: #{e}")
         end
     end
     pg = try Ledger.read_locked(
@@ -988,9 +998,9 @@ fn decode_mcp_world_mutation(
       Some(j): j
       None: return Error("cells required for db_row_create")
     end
-    cs = case Json.decode_strict[Map(Text, CellValue)](cj.to_text.bytes)
+    cs = case DatabaseModel.decode_cell_map_json(cj.to_text.bytes)
       Ok(m): m
-      Error(e): return Error("invalid cells: #{e.to_text}")
+      Error(e): return Error("invalid cells: #{e}")
     end
     Ok(
       CreateDbRow(
@@ -1012,9 +1022,9 @@ fn decode_mcp_world_mutation(
       Some(j): j
       None: return Error("cells required for db_row_update")
     end
-    cs = case Json.decode_strict[Map(Text, CellValue)](cj.to_text.bytes)
+    cs = case DatabaseModel.decode_cell_map_json(cj.to_text.bytes)
       Ok(m): m
-      Error(e): return Error("invalid cells: #{e.to_text}")
+      Error(e): return Error("invalid cells: #{e}")
     end
     Ok(
       UpdateDbRow(
@@ -1045,9 +1055,9 @@ fn decode_mcp_world_mutation(
     p_opt = case item.get("properties")
       None | Some(Json.Null): None
       Some(pj):
-        case Json.decode_strict[List(PropertyDef)](pj.to_text.bytes)
+        case DatabaseModel.decode_property_defs_json(pj.to_text.bytes)
           Ok(ps): Some(ps)
-          Error(e): return Error("invalid schema properties: #{e.to_text}")
+          Error(e): return Error("invalid schema properties: #{e}")
         end
     end
     Ok(
@@ -2146,17 +2156,17 @@ fn handle_tool_call(
     filters = case args.get("filters")
       None | Some(Json.Null): []
       Some(fj):
-        case Json.decode_strict[List(DbFilterRule)](fj.to_text.bytes)
+        case DatabaseModel.decode_filter_rules_json(fj.to_text.bytes)
           Ok(fs): fs
-          Error(e): return Ok(Mcp.tool_error(id, "invalid filters: #{e.to_text}"))
+          Error(e): return Ok(Mcp.tool_error(id, "invalid filters: #{e}"))
         end
     end
     sorts = case args.get("sorts")
       None | Some(Json.Null): []
       Some(sj):
-        case Json.decode_strict[List(DbSortRule)](sj.to_text.bytes)
+        case DatabaseModel.decode_sort_rules_json(sj.to_text.bytes)
           Ok(ss): ss
-          Error(e): return Ok(Mcp.tool_error(id, "invalid sorts: #{e.to_text}"))
+          Error(e): return Ok(Mcp.tool_error(id, "invalid sorts: #{e}"))
         end
     end
     read_act = if Policy.action_permitted?(auth, "query_db"): "query_db" else: "read"

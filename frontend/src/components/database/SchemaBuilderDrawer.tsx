@@ -20,9 +20,18 @@ type KindKey =
   | "date_prop"
   | "select"
   | "multi_select"
+  | "status"
   | "checkbox"
   | "person"
+  | "email"
+  | "file_list"
   | "url"
+  | "unique_id"
+  | "formula"
+  | "created_time"
+  | "created_by"
+  | "last_edited_time"
+  | "last_edited_by"
   | "relation"
   | "rollup"
   | "ai_derived";
@@ -36,9 +45,18 @@ const KIND_LABELS: Record<KindKey, string> = {
   date_prop: "Date",
   select: "Select",
   multi_select: "Multi-Select",
+  status: "Status",
   checkbox: "Checkbox",
   person: "Person",
+  email: "Email",
+  file_list: "Files & Media",
   url: "URL",
+  unique_id: "Unique ID",
+  formula: "Formula",
+  created_time: "Created Time",
+  created_by: "Created By",
+  last_edited_time: "Last Edited Time",
+  last_edited_by: "Last Edited By",
   relation: "Relation",
   rollup: "Rollup",
   ai_derived: "AI Compiled",
@@ -52,9 +70,25 @@ function kindKeyOf(kind: PropertyKind): KindKey {
   if ("date_prop" in kind) return "date_prop";
   if ("select" in kind) return "select";
   if ("multi_select" in kind) return "multi_select";
+  if ("status" in kind) return "status";
+  if ("unique_id" in kind) return "unique_id";
+  if ("formula" in kind) return "formula";
   if ("relation" in kind) return "relation";
   if ("ai_derived" in kind) return "ai_derived";
   return "rollup";
+}
+
+function isAutoOrComputedKind(kk: KindKey): boolean {
+  return (
+    kk === "rollup" ||
+    kk === "ai_derived" ||
+    kk === "formula" ||
+    kk === "unique_id" ||
+    kk === "created_time" ||
+    kk === "created_by" ||
+    kk === "last_edited_time" ||
+    kk === "last_edited_by"
+  );
 }
 
 function slugifyId(raw: string): string {
@@ -110,6 +144,10 @@ export default function SchemaBuilderDrawer({
   ]);
   const [newOptLabel, setNewOptLabel] = useState("");
   const [newOptColor, setNewOptColor] = useState<SelectOptionColor>("blue");
+  const [doneOptionIds, setDoneOptionIds] = useState<string[]>(["done"]);
+  const [uniqueIdPrefix, setUniqueIdPrefix] = useState("TSK");
+  const [formulaExpr, setFormulaExpr] = useState("");
+  const [formulaFmt, setFormulaFmt] = useState("");
   const [targetDbId, setTargetDbId] = useState("");
   const [rollupRelPropId, setRollupRelPropId] = useState("");
   const [rollupTargetPropId, setRollupTargetPropId] = useState("");
@@ -137,9 +175,17 @@ export default function SchemaBuilderDrawer({
     setColKind("rich_text");
     setNumFormat("plain");
     setIncludeTime(false);
-    setOptions([{ id: "opt_1", label: "Option 1", color: "blue" }]);
+    setOptions([
+      { id: "todo", label: "Not started", color: "gray" },
+      { id: "in_progress", label: "In progress", color: "blue" },
+      { id: "done", label: "Done", color: "green" },
+    ]);
+    setDoneOptionIds(["done"]);
     setNewOptLabel("");
     setNewOptColor("blue");
+    setUniqueIdPrefix("TSK");
+    setFormulaExpr("");
+    setFormulaFmt("");
     const firstRelTarget = databases.find((d) => d.id !== database.id)?.id ?? databases[0]?.id ?? "";
     setTargetDbId(firstRelTarget);
     const firstRelProp = propsList.find((p) => typeof p.kind === "object" && "relation" in p.kind);
@@ -168,6 +214,15 @@ export default function SchemaBuilderDrawer({
     if (typeof p.kind === "object" && "date_prop" in p.kind) setIncludeTime(p.kind.date_prop.include_time);
     if (typeof p.kind === "object" && "select" in p.kind) setOptions(p.kind.select.options);
     if (typeof p.kind === "object" && "multi_select" in p.kind) setOptions(p.kind.multi_select.options);
+    if (typeof p.kind === "object" && "status" in p.kind) {
+      setOptions(p.kind.status.options);
+      setDoneOptionIds(p.kind.status.done_option_ids);
+    }
+    if (typeof p.kind === "object" && "unique_id" in p.kind) setUniqueIdPrefix(p.kind.unique_id.prefix);
+    if (typeof p.kind === "object" && "formula" in p.kind) {
+      setFormulaExpr(p.kind.formula.expression);
+      setFormulaFmt(p.kind.formula.format);
+    }
     if (typeof p.kind === "object" && "relation" in p.kind) setTargetDbId(p.kind.relation.target_db_id);
     if (typeof p.kind === "object" && "rollup" in p.kind) {
       setRollupRelPropId(p.kind.rollup.relation_prop_id);
@@ -223,12 +278,43 @@ export default function SchemaBuilderDrawer({
           return null;
         }
         return { multi_select: { options } };
+      case "status":
+        if (options.length === 0) {
+          setError("Status column needs at least one option");
+          return null;
+        }
+        return {
+          status: {
+            options,
+            done_option_ids: doneOptionIds.filter((id) => options.some((o) => o.id === id)),
+          },
+        };
       case "checkbox":
         return "checkbox";
       case "person":
         return "person";
+      case "email":
+        return "email";
+      case "file_list":
+        return "file_list";
       case "url":
         return "url";
+      case "unique_id":
+        return { unique_id: { prefix: uniqueIdPrefix.trim() } };
+      case "formula":
+        if (!formulaExpr.trim()) {
+          setError("Formula column requires a non-empty expression");
+          return null;
+        }
+        return { formula: { expression: formulaExpr.trim(), format: formulaFmt } };
+      case "created_time":
+        return "created_time";
+      case "created_by":
+        return "created_by";
+      case "last_edited_time":
+        return "last_edited_time";
+      case "last_edited_by":
+        return "last_edited_by";
       case "relation":
         if (!targetDbId) {
           setError("Select a target database for this Relation");
@@ -293,6 +379,7 @@ export default function SchemaBuilderDrawer({
     }
     const builtKind = buildPropertyKind();
     if (!builtKind) return;
+    const effRequired = isAutoOrComputedKind(colKind) ? false : colRequired;
 
     if (editingId) {
       setDraftProps((prev) =>
@@ -302,8 +389,7 @@ export default function SchemaBuilderDrawer({
                 ...p,
                 name: colName.trim(),
                 kind: builtKind,
-                required:
-                  colKind === "rollup" || colKind === "ai_derived" ? false : colRequired,
+                required: effRequired,
               }
             : p
         )
@@ -315,7 +401,7 @@ export default function SchemaBuilderDrawer({
         id,
         name: colName.trim(),
         kind: builtKind,
-        required: colKind === "rollup" || colKind === "ai_derived" ? false : colRequired,
+        required: effRequired,
         sort_order: nextSortOrder(draftProps),
       };
       const updated = [...draftProps, next];
@@ -525,7 +611,7 @@ export default function SchemaBuilderDrawer({
               </div>
             </div>
 
-            {colKind !== "rollup" && colKind !== "ai_derived" && (
+            {!isAutoOrComputedKind(colKind) && (
               <label className="inline-flex items-center gap-2 text-stone-700">
                 <input
                   type="checkbox"
@@ -565,27 +651,108 @@ export default function SchemaBuilderDrawer({
               </label>
             )}
 
+            {colKind === "unique_id" && (
+              <div>
+                <label className="block text-[11px] font-medium text-stone-600 mb-1">
+                  ID Prefix (optional, e.g. TSK → TSK-1)
+                </label>
+                <input
+                  value={uniqueIdPrefix}
+                  onChange={(e) => setUniqueIdPrefix(e.target.value)}
+                  placeholder="TSK"
+                  className="w-full rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 font-mono text-xs outline-none focus:border-stone-500"
+                />
+              </div>
+            )}
+
+            {colKind === "formula" && (
+              <div className="space-y-2 rounded-xl border border-indigo-200 bg-indigo-50/40 p-3">
+                <div>
+                  <label className="block text-[11px] font-medium text-stone-700 mb-1">
+                    Formula Expression
+                  </label>
+                  <textarea
+                    rows={3}
+                    value={formulaExpr}
+                    onChange={(e) => setFormulaExpr(e.target.value)}
+                    placeholder='e.g. if(empty(prop("Hours")), 0, round(prop("Hours") * 60, 0))'
+                    className="w-full rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 font-mono text-xs outline-none focus:border-indigo-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-stone-600 mb-1">
+                    Display Format
+                  </label>
+                  <select
+                    value={formulaFmt}
+                    onChange={(e) => setFormulaFmt(e.target.value)}
+                    className="w-full rounded-md border border-stone-200 bg-white px-2 py-1 text-xs"
+                  >
+                    <option value="">Auto</option>
+                    <option value="plain">Plain Number</option>
+                    <option value="number">Number</option>
+                    <option value="currency">Currency ($ USD)</option>
+                    <option value="percent">Percent (%)</option>
+                    <option value="text">Text</option>
+                    <option value="date">Date</option>
+                    <option value="bool">Checkbox</option>
+                  </select>
+                </div>
+              </div>
+            )}
+
             {(colKind === "select" ||
               colKind === "multi_select" ||
+              colKind === "status" ||
               (colKind === "ai_derived" && aiOutputKey === "ai_select")) && (
               <div className="space-y-2 rounded-xl border border-stone-200 bg-white p-3">
-                <div className="text-[11px] font-medium text-stone-600">Options</div>
-                <div className="flex flex-wrap gap-1.5">
-                  {options.map((o) => (
-                    <span
-                      key={o.id}
-                      className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium ${SELECT_COLOR_CLASSES[o.color]}`}
-                    >
-                      {o.label}
-                      <button
-                        type="button"
-                        onClick={() => setOptions((prev) => prev.filter((x) => x.id !== o.id))}
-                        className="opacity-60 hover:opacity-100"
-                      >
-                        <X className="h-2.5 w-2.5" />
-                      </button>
+                <div className="flex items-center justify-between">
+                  <div className="text-[11px] font-medium text-stone-600">Options</div>
+                  {colKind === "status" && (
+                    <span className="text-[10px] text-stone-400">
+                      Click ✓ to mark Done-group states
                     </span>
-                  ))}
+                  )}
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {options.map((o) => {
+                    const isDoneOpt = doneOptionIds.includes(o.id);
+                    return (
+                      <span
+                        key={o.id}
+                        className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium ${SELECT_COLOR_CLASSES[o.color]}`}
+                      >
+                        {colKind === "status" && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setDoneOptionIds((prev) =>
+                                prev.includes(o.id)
+                                  ? prev.filter((x) => x !== o.id)
+                                  : [...prev, o.id]
+                              )
+                            }
+                            title={isDoneOpt ? "Counts as Done" : "Mark as Done state"}
+                            className={`rounded-full px-1 text-[10px] ${
+                              isDoneOpt
+                                ? "bg-emerald-600 text-white"
+                                : "bg-black/10 text-stone-500 hover:bg-black/20"
+                            }`}
+                          >
+                            ✓
+                          </button>
+                        )}
+                        {o.label}
+                        <button
+                          type="button"
+                          onClick={() => setOptions((prev) => prev.filter((x) => x.id !== o.id))}
+                          className="opacity-60 hover:opacity-100"
+                        >
+                          <X className="h-2.5 w-2.5" />
+                        </button>
+                      </span>
+                    );
+                  })}
                 </div>
                 <div className="flex items-center gap-1.5">
                   <input
@@ -694,6 +861,7 @@ export default function SchemaBuilderDrawer({
                     <option value="sum_values">Sum Values (Exact Decimal)</option>
                     <option value="count_all">Count All Linked Rows</option>
                     <option value="count_values">Count Non-Empty Values</option>
+                    <option value="percent_per_group">Percent Done (Per Group)</option>
                     <option value="min_value">Minimum Value / Date</option>
                     <option value="max_value">Maximum Value / Date</option>
                   </select>

@@ -2852,6 +2852,301 @@ const hugePresignErr = await apiJson("/api/attachments/presign", {
 });
 assert.equal(hugePresignErr.res.status, 422);
 console.log("✓ Live v3 M1.1 Native Table, H4, Toggle, TOC & 500 MiB Attachment Presign verified");
+
+// 20. Live v3 Milestone 1 Slice 1.2: Status, Email, FileList, UniqueId, Audit Columns, PercentPerGroup & Deterministic Formulas
+const m12TasksRes = await apiJson("/api/databases", {
+  method: "POST",
+  body: JSON.stringify({
+    collection_id: colId,
+    parent_page_id: null,
+    title: "Live M1.2 Tasks",
+    description: "Tracked tasks",
+    properties: [
+      { id: "title", name: "Title", kind: "title", required: true, sort_order: "a" },
+      {
+        id: "status",
+        name: "Status",
+        kind: {
+          status: {
+            options: [
+              { id: "not_started", label: "Not Started", color: "gray" },
+              { id: "in_progress", label: "In Progress", color: "blue" },
+              { id: "done", label: "Done", color: "green" },
+            ],
+            done_option_ids: ["done"],
+          },
+        },
+        required: false,
+        sort_order: "b",
+      },
+      { id: "contact", name: "Contact", kind: "email", required: false, sort_order: "c" },
+      { id: "attachments", name: "Attachments", kind: "file_list", required: false, sort_order: "d" },
+      { id: "ticket_id", name: "Ticket ID", kind: { unique_id: { prefix: "TSK" } }, required: false, sort_order: "e" },
+      { id: "created_at", name: "Created At", kind: "created_time", required: false, sort_order: "f" },
+      { id: "created_by", name: "Created By", kind: "created_by", required: false, sort_order: "g" },
+      { id: "updated_at", name: "Updated At", kind: "last_edited_time", required: false, sort_order: "h" },
+      { id: "updated_by", name: "Updated By", kind: "last_edited_by", required: false, sort_order: "i" },
+      { id: "minutes", name: "Minutes", kind: { number: { format: "plain" } }, required: false, sort_order: "j" },
+      { id: "freq", name: "Freq", kind: { number: { format: "plain" } }, required: false, sort_order: "k" },
+      {
+        id: "hours_saved",
+        name: "Hours saved / year",
+        kind: {
+          formula: {
+            expression: '/* annual */ round((prop("Minutes") * prop("Freq")) / 60, 1)',
+            format: "plain",
+          },
+        },
+        required: false,
+        sort_order: "l",
+      },
+    ],
+  }),
+});
+assert.equal(m12TasksRes.res.status, 201, m12TasksRes.text);
+const m12TasksId = m12TasksRes.json.database.id;
+
+const m12T1 = await apiJson(`/api/databases/${m12TasksId}/rows`, {
+  method: "POST",
+  body: JSON.stringify({
+    cells: {
+      title: { text_val: "Deploy formula compiler" },
+      status: { select_val: { option_id: "done" } },
+      contact: { text_val: "ops@example.test" },
+      attachments: { files_val: { attachment_ids: [attId] } },
+      minutes: { number_val: "10" },
+      freq: { number_val: "52" },
+    },
+    markdown: null,
+    reason: "live m1.2 task 1",
+  }),
+});
+assert.equal(m12T1.res.status, 201, m12T1.text);
+assert.equal(m12T1.json.row.cells.ticket_id?.text_val, "TSK-1");
+const m12T1Id = m12T1.json.row.id;
+
+const m12T2 = await apiJson(`/api/databases/${m12TasksId}/rows`, {
+  method: "POST",
+  body: JSON.stringify({
+    cells: {
+      title: { text_val: "Audit email validation" },
+      status: { select_val: { option_id: "in_progress" } },
+      contact: { text_val: "eng@example.test" },
+      minutes: { number_val: "15" },
+      freq: { number_val: "12" },
+    },
+    markdown: null,
+    reason: "live m1.2 task 2",
+  }),
+});
+assert.equal(m12T2.res.status, 201, m12T2.text);
+assert.equal(m12T2.json.row.cells.ticket_id?.text_val, "TSK-2");
+const m12T2Id = m12T2.json.row.id;
+
+const m12T3 = await apiJson(`/api/databases/${m12TasksId}/rows`, {
+  method: "POST",
+  body: JSON.stringify({
+    cells: {
+      title: { text_val: "Wire Kanban status view" },
+      status: { select_val: { option_id: "in_progress" } },
+      minutes: { number_val: "5" },
+      freq: { number_val: "24" },
+    },
+    markdown: null,
+    reason: "live m1.2 task 3",
+  }),
+});
+assert.equal(m12T3.res.status, 201, m12T3.text);
+assert.equal(m12T3.json.row.cells.ticket_id?.text_val, "TSK-3");
+const m12T3Id = m12T3.json.row.id;
+
+const m12TasksQ = await apiJson(`/api/databases/${m12TasksId}/query`, {
+  method: "POST",
+  body: JSON.stringify({
+    view_id: null,
+    filters: [],
+    filter_match_all: true,
+    sorts: [],
+    from_date: null,
+    to_date: null,
+  }),
+});
+assert.equal(m12TasksQ.res.status, 200, m12TasksQ.text);
+const m12QRow1 = (m12TasksQ.json.rows ?? []).find((er) => er.row.id === m12T1Id);
+assert.ok(m12QRow1, "Task 1 enriched row returned");
+assert.equal(m12QRow1.rollups?.hours_saved?.number_val, "8.7");
+assert.ok(m12QRow1.rollups?.created_at?.text_val, "CreatedTime populated");
+assert.ok(m12QRow1.rollups?.updated_at?.text_val, "LastEditedTime populated");
+assert.ok((m12QRow1.rollups?.created_by?.principal_val ?? []).length >= 1, "CreatedBy populated");
+assert.ok((m12QRow1.rollups?.updated_by?.principal_val ?? []).length >= 1, "LastEditedBy populated");
+
+const m12InitRes = await apiJson("/api/databases", {
+  method: "POST",
+  body: JSON.stringify({
+    collection_id: colId,
+    parent_page_id: null,
+    title: "Live M1.2 Initiatives",
+    description: null,
+    properties: [
+      { id: "title", name: "Title", kind: "title", required: true, sort_order: "a" },
+      {
+        id: "tasks",
+        name: "Tasks",
+        kind: { relation: { target_db_id: m12TasksId, inverse_prop_id: null } },
+        required: false,
+        sort_order: "b",
+      },
+      {
+        id: "completion",
+        name: "Completion",
+        kind: { rollup: { relation_prop_id: "tasks", target_prop_id: "status", agg: "percent_per_group" } },
+        required: false,
+        sort_order: "c",
+      },
+      { id: "demo_date", name: "Demo Date", kind: { date_prop: { include_time: false } }, required: false, sort_order: "d" },
+      {
+        id: "progress_summary",
+        name: "Progress summary",
+        kind: {
+          formula: {
+            expression: 'format(round(prop("Completion") * 100, 0)) + "% complete"',
+            format: "plain",
+          },
+        },
+        required: false,
+        sort_order: "e",
+      },
+      {
+        id: "progress_display",
+        name: "Progress display",
+        kind: {
+          formula: {
+            expression: '"[" + prop("Progress summary") + "]"',
+            format: "plain",
+          },
+        },
+        required: false,
+        sort_order: "f",
+      },
+      {
+        id: "demo_month",
+        name: "Demo month",
+        kind: {
+          formula: {
+            expression: 'if(empty(prop("Demo Date")), empty(), formatDate(prop("Demo Date"), "MMM YYYY"))',
+            format: "plain",
+          },
+        },
+        required: false,
+        sort_order: "g",
+      },
+    ],
+  }),
+});
+assert.equal(m12InitRes.res.status, 201, m12InitRes.text);
+const m12InitId = m12InitRes.json.database.id;
+
+const m12InitRowRes = await apiJson(`/api/databases/${m12InitId}/rows`, {
+  method: "POST",
+  body: JSON.stringify({
+    cells: {
+      title: { text_val: "Live Formula Rollout" },
+      tasks: { relation_val: { row_ids: [m12T1Id, m12T2Id, m12T3Id] } },
+      demo_date: { date_val: { start: "2026-10-15", end_date: null } },
+    },
+    markdown: null,
+    reason: "live m1.2 initiative",
+  }),
+});
+assert.equal(m12InitRowRes.res.status, 201, m12InitRowRes.text);
+
+const m12InitQ = await apiJson(`/api/databases/${m12InitId}/query`, {
+  method: "POST",
+  body: JSON.stringify({
+    view_id: null,
+    filters: [],
+    filter_match_all: true,
+    sorts: [],
+    from_date: null,
+    to_date: null,
+  }),
+});
+assert.equal(m12InitQ.res.status, 200, m12InitQ.text);
+const m12InitRolls = m12InitQ.json.rows?.[0]?.rollups ?? {};
+assert.equal(m12InitRolls.completion?.number_val, "0.3333");
+assert.equal(m12InitRolls.progress_summary?.text_val, "33% complete");
+assert.equal(m12InitRolls.progress_display?.text_val, "[33% complete]");
+assert.equal(m12InitRolls.demo_month?.text_val, "Oct 2026");
+
+const m12BvRes = await apiJson(`/api/databases/${m12TasksId}/views`, {
+  method: "POST",
+  body: JSON.stringify({
+    name: "Status Board",
+    kind: { board_view: { group_by_prop_id: "status", card_prop_ids: ["ticket_id"], hide_empty_groups: false } },
+    filters: [],
+    filter_match_all: true,
+    sorts: [],
+  }),
+});
+assert.equal(m12BvRes.res.status, 201, m12BvRes.text);
+const m12BvId = m12BvRes.json.id;
+
+const m12BvQ = await apiJson(`/api/databases/${m12TasksId}/query`, {
+  method: "POST",
+  body: JSON.stringify({
+    view_id: m12BvId,
+    filters: [],
+    filter_match_all: true,
+    sorts: [],
+    from_date: null,
+    to_date: null,
+  }),
+});
+assert.equal(m12BvQ.res.status, 200, m12BvQ.text);
+const m12Groups = m12BvQ.json.board_groups ?? [];
+assert.equal(m12Groups.length, 4);
+assert.equal(m12Groups[0].group_key, "not_started");
+assert.equal(m12Groups[0].rows.length, 0);
+assert.equal(m12Groups[1].group_key, "in_progress");
+assert.equal(m12Groups[1].rows.length, 2);
+assert.equal(m12Groups[2].group_key, "done");
+assert.equal(m12Groups[2].rows.length, 1);
+
+const m12BadEmail = await apiJson(`/api/databases/${m12TasksId}/rows`, {
+  method: "POST",
+  body: JSON.stringify({
+    cells: { title: { text_val: "Invalid" }, contact: { text_val: "bad-email" } },
+    markdown: null,
+    reason: "verify email validation",
+  }),
+});
+assert.equal(m12BadEmail.res.status, 422);
+
+const m12MutUid = await apiJson(`/api/databases/${m12TasksId}/rows/${m12T2Id}`, {
+  method: "PATCH",
+  body: JSON.stringify({
+    cells: { ticket_id: { text_val: "TSK-999" } },
+    expected_version: 1,
+    reason: "verify unique_id immutability",
+  }),
+});
+assert.equal(m12MutUid.res.status, 422);
+
+const m12BadFormula = await apiJson("/api/databases", {
+  method: "POST",
+  body: JSON.stringify({
+    collection_id: colId,
+    parent_page_id: null,
+    title: "Bad Formula DB",
+    description: null,
+    properties: [
+      { id: "title", name: "Title", kind: "title", required: true, sort_order: "a" },
+      { id: "f", name: "F", kind: { formula: { expression: "if(1, 2", format: "plain" } }, required: false, sort_order: "b" },
+    ],
+  }),
+});
+assert.equal(m12BadFormula.res.status, 422);
+console.log("✓ Live v3 M1.2 Database Schema Parity & Deterministic Notion Formula Engine verified");
 EOF
 
 echo "All Live Vellum E2E checks against mo serve + Dex + VersityGW S3 passed."

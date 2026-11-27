@@ -936,16 +936,16 @@ fn stage_proposal_mutation(
       Some(_) | None: pm.target_page_id
     end
     ops_json = try raw_json.get("ops").or_fail(BadInput(reason: "ops required for page_patch"))
-    ops = try Json.decode_strict[List(BlockOp)](ops_json.to_text.bytes).map_error(fn(e)
-      BadInput(reason: "invalid ops: #{e.to_text}")
+    ops = try Blocks.decode_block_ops_json(ops_json.to_text.bytes).map_error(fn(e)
+      BadInput(reason: "invalid ops: #{e}")
     end)
     if ops.empty?
       return Error(BadInput(reason: "ops must not be empty"))
     end
     exp_vers = case raw_json.get("expected_versions")
       None | Some(Json.Null): {}
-      Some(evj): try Json.decode_strict[Map(Text, Int)](evj.to_text.bytes).map_error(fn(e)
-        BadInput(reason: "invalid expected_versions: #{e.to_text}")
+      Some(evj): try Blocks.decode_version_map_json(evj.to_text.bytes).map_error(fn(e)
+        BadInput(reason: "invalid expected_versions: #{e}")
       end)
     end
     pg = try Ledger.read_locked(
@@ -1006,10 +1006,8 @@ fn stage_proposal_mutation(
       cells_json = try raw_json.get("cells").or_fail(
         BadInput(reason: "cells required for db_row_create")
       )
-      cells = try Json.decode_strict[Map(Text, CellValue)](cells_json.to_text.bytes).map_error(fn(
-        e
-      )
-        BadInput(reason: "invalid cells: #{e.to_text}")
+      cells = try DatabaseModel.decode_cell_map_json(cells_json.to_text.bytes).map_error(fn(e)
+        BadInput(reason: "invalid cells: #{e}")
       end)
       md_opt = raw_json.text_at("markdown")
       new_row_id = "row_#{Id.ulid(rng, clock)}"
@@ -1037,10 +1035,8 @@ fn stage_proposal_mutation(
       cells_json = try raw_json.get("cells").or_fail(
         BadInput(reason: "cells required for db_row_update")
       )
-      cells = try Json.decode_strict[Map(Text, CellValue)](cells_json.to_text.bytes).map_error(fn(
-        e
-      )
-        BadInput(reason: "invalid cells: #{e.to_text}")
+      cells = try DatabaseModel.decode_cell_map_json(cells_json.to_text.bytes).map_error(fn(e)
+        BadInput(reason: "invalid cells: #{e}")
       end)
       exp_ver = raw_json.int_at("expected_version")
       (
@@ -1075,8 +1071,8 @@ fn stage_proposal_mutation(
       props_opt = case raw_json.get("properties")
         None | Some(Json.Null): None
         Some(pj): Some(
-          try Json.decode_strict[List(PropertyDef)](pj.to_text.bytes).map_error(fn(e)
-            BadInput(reason: "invalid schema properties: #{e.to_text}")
+          try DatabaseModel.decode_property_defs_json(pj.to_text.bytes).map_error(fn(e)
+            BadInput(reason: "invalid schema properties: #{e}")
           end)
         )
       end
@@ -2669,7 +2665,7 @@ fn delegate_grant(
     "child_agent_id": Json.String(child_agent_id)
   })
 
-  (child_principal, child_grant, tok) = try Ledger.transact_locked(
+  del_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -2709,15 +2705,26 @@ fn delegate_grant(
         last_used_at: None
       )
       t4 = try Table.put(t3, Db.agent_tokens_table(), t_rec.id, t_rec).map_error(Db.map_table_error)
-      Ok((t4, (p, g, t_rec)))
+      Ok((
+        t4,
+        Json.Object({
+          "grant_id": Json.String(g.id),
+          "principal_handle": Json.String(p.handle),
+          "max_calls": Json.int(g.max_calls),
+          "principal": p.to_json,
+          "grant": g.to_json,
+          "token_id": Json.String(t_rec.id),
+          "token_prefix": Json.String(t_rec.prefix)
+        })
+      ))
     end
   )
 
   del_ev = Json.Object({
-    "grant_id": Json.String(child_grant.id),
+    "grant_id": del_json.get("grant_id") or Json.Null,
     "parent_grant_id": Json.String(auth.grant_id),
-    "principal_handle": Json.String(child_principal.handle),
-    "max_calls": Json.int(child_grant.max_calls),
+    "principal_handle": del_json.get("principal_handle") or Json.Null,
+    "max_calls": del_json.get("max_calls") or Json.Null,
     "actor": Json.String(auth.principal.handle)
   })
   Ok(
@@ -2725,10 +2732,10 @@ fn delegate_grant(
       201,
       Json.Object({
         "raw_token": Json.String(raw_token),
-        "principal": child_principal.to_json,
-        "grant": child_grant.to_json,
-        "token_id": Json.String(tok.id),
-        "token_prefix": Json.String(tok.prefix)
+        "principal": del_json.get("principal") or Json.Null,
+        "grant": del_json.get("grant") or Json.Null,
+        "token_id": del_json.get("token_id") or Json.Null,
+        "token_prefix": del_json.get("token_prefix") or Json.Null
       })
     ).with_sse_publish_json("grants", "grant.delegated", del_ev)
   )
@@ -2932,7 +2939,7 @@ fn events_stream(req: Api.Request, auth: AuthContext, rf: ReadFiles, clock: Cloc
     None: 0
   end
   now = clock.now
-  (topics, entries, active_claims, grants_snap_opt) = try Ledger.read_locked(
+  stream_json = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -3008,10 +3015,45 @@ fn events_stream(req: Api.Request, auth: AuthContext, rf: ReadFiles, clock: Cloc
       end
       audits = try Ledger.audit_tail_store(store, 50).map_error(Db.map_ledger_error)
       claims = try Claims.list_active(store, now).map_error(Db.map_claims_error)
-      Ok((scoped_topics, audits, claims, g_snap_opt))
+      var ev_items = []
+      for e in audits
+        if e.seq > cursor
+          ev_items = ev_items.append(
+            Json.Object({
+              "action": Json.String(e.action),
+              "data": Json.Object({
+                "seq": Json.int(e.seq),
+                "actor": Json.String(e.principal),
+                "action": Json.String(e.action),
+                "summary": Json.String(e.summary)
+              })
+            })
+          )
+        end
+      end
+      Ok(
+        Json.Object({
+          "topics": scoped_topics.to_json,
+          "claims": claims.to_json,
+          "grants_snap": g_snap_opt.to_json,
+          "audits": Json.Array(ev_items)
+        })
+      )
     end
   )
 
+  topics = case stream_json.list_at("topics")
+    Some(xs):
+      var ts = []
+      for x in xs
+        case x
+          Json.String(s): ts = ts.append(s)
+          Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json.Object(_): Unit
+        end
+      end
+      ts
+    None: ["claims"]
+  end
   var sse_events = [
     Sse.SseEvent(
       id: None,
@@ -3020,27 +3062,24 @@ fn events_stream(req: Api.Request, auth: AuthContext, rf: ReadFiles, clock: Cloc
         .to_text,
       retry_ms: Some(3000)
     ),
-    Sse.json_event(None, "claims.snapshot", Json.Object({"claims": active_claims.to_json}))
+    Sse.json_event(
+      None,
+      "claims.snapshot",
+      Json.Object({"claims": stream_json.get("claims") or Json.Array([])})
+    )
   ]
-  case grants_snap_opt
-    Some(gj): sse_events = sse_events.append(Sse.json_event(None, "grants.snapshot", gj))
-    None: Unit
+  case stream_json.get("grants_snap")
+    Some(Json.Object(m)): sse_events = sse_events.append(
+      Sse.json_event(None, "grants.snapshot", Json.Object(m))
+    )
+    Some(Json.Null) | Some(Json.Boolean(_)) | Some(Json.Number(_)) | Some(Json.String(_)) | Some(
+      Json.Array(_)
+    ) | None: Unit
   end
-  for e in entries
-    if e.seq > cursor
-      sse_events = sse_events.append(
-        Sse.json_event(
-          None,
-          "audit.#{e.action}",
-          Json.Object({
-            "seq": Json.int(e.seq),
-            "actor": Json.String(e.principal),
-            "action": Json.String(e.action),
-            "summary": Json.String(e.summary)
-          })
-        )
-      )
-    end
+  for item in stream_json.list_at("audits") or []
+    act_str = item.text_at("action") or ""
+    data_j = item.get("data") or Json.Object({})
+    sse_events = sse_events.append(Sse.json_event(None, "audit.#{act_str}", data_j))
   end
   Ok(Sse.response(sse_events).with_sse_subscribe(topics, last_id))
 end
@@ -3147,7 +3186,7 @@ fn create_proposal_comment(
     "proposal_id": Json.String(id),
     "target_kind": Json.String(tk)
   })
-  (saved_pm, saved_cmt) = try Ledger.transact_locked(
+  pm_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -3163,24 +3202,34 @@ fn create_proposal_comment(
       end
       try Policy.require_collection_access(auth, act, pm.collection_id)
       t2 = try Table.put(t1, Db.proposal_comments_table(), cmt.id, cmt).map_error(Db.map_table_error)
-      Ok((t2, (pm, cmt)))
+      Ok((
+        t2,
+        Json.Object({
+          "collection_id": Json.String(pm.collection_id),
+          "target_page_id": Json.String(pm.target_page_id),
+          "target_database_id": pm.target_database_id.to_json
+        })
+      ))
     end
   )
+  pm_col = pm_json.text_at("collection_id") or ""
+  pm_pg = pm_json.text_at("target_page_id") or ""
+  pm_db = pm_json.text_at("target_database_id")
   ev = Json.Object({
-    "proposal_id": Json.String(saved_pm.id),
-    "comment_id": Json.String(saved_cmt.id),
-    "page_id": Json.String(saved_pm.target_page_id),
+    "proposal_id": Json.String(id),
+    "comment_id": Json.String(cmt.id),
+    "page_id": Json.String(pm_pg),
     "actor": Json.String(auth.principal.handle)
   })
-  var resp = json_ok(201, Json.Object({"comment": saved_cmt.to_json})).with_sse_publish_json(
-    "collection:#{saved_pm.collection_id}",
+  var resp = json_ok(201, Json.Object({"comment": cmt.to_json})).with_sse_publish_json(
+    "collection:#{pm_col}",
     "proposal.commented",
     ev
   )
-  if not saved_pm.target_page_id.trim.empty?
-    resp = resp.with_sse_publish_json("page:#{saved_pm.target_page_id}", "proposal.commented", ev)
+  if not pm_pg.trim.empty?
+    resp = resp.with_sse_publish_json("page:#{pm_pg}", "proposal.commented", ev)
   end
-  case saved_pm.target_database_id
+  case pm_db
     Some(did) if not did.trim.empty?:
       resp = resp.with_sse_publish_json("database:#{did}", "proposal.commented", ev)
     Some(_) | None: Unit
@@ -3220,7 +3269,7 @@ fn resolve_proposal_comment(
     "proposal_id": Json.String(id),
     "resolved": Json.Boolean(resolve?)
   })
-  (saved_pm, saved_cmt) = try Ledger.transact_locked(
+  res_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -3258,24 +3307,32 @@ fn resolve_proposal_comment(
       t2 = try Table.put(t1, Db.proposal_comments_table(), next_c.id, next_c).map_error(
         Db.map_table_error
       )
-      Ok((t2, (pm, next_c)))
+      Ok((
+        t2,
+        Json.Object({
+          "collection_id": Json.String(pm.collection_id),
+          "target_page_id": Json.String(pm.target_page_id),
+          "target_database_id": pm.target_database_id.to_json,
+          "comment": next_c.to_json
+        })
+      ))
     end
   )
+  pm_col = res_json.text_at("collection_id") or ""
+  pm_pg = res_json.text_at("target_page_id") or ""
+  pm_db = res_json.text_at("target_database_id")
   ev = Json.Object({
-    "proposal_id": Json.String(saved_pm.id),
-    "comment_id": Json.String(saved_cmt.id),
-    "page_id": Json.String(saved_pm.target_page_id),
+    "proposal_id": Json.String(id),
+    "comment_id": Json.String(comment_id),
+    "page_id": Json.String(pm_pg),
     "actor": Json.String(auth.principal.handle)
   })
-  var resp = json_ok(200, Json.Object({"comment": saved_cmt.to_json})).with_sse_publish_json(
-    "collection:#{saved_pm.collection_id}",
-    "proposal.commented",
-    ev
-  )
-  if not saved_pm.target_page_id.trim.empty?
-    resp = resp.with_sse_publish_json("page:#{saved_pm.target_page_id}", "proposal.commented", ev)
+  var resp = json_ok(200, Json.Object({"comment": res_json.get("comment") or Json.Null}))
+    .with_sse_publish_json("collection:#{pm_col}", "proposal.commented", ev)
+  if not pm_pg.trim.empty?
+    resp = resp.with_sse_publish_json("page:#{pm_pg}", "proposal.commented", ev)
   end
-  case saved_pm.target_database_id
+  case pm_db
     Some(did) if not did.trim.empty?:
       resp = resp.with_sse_publish_json("database:#{did}", "proposal.commented", ev)
     Some(_) | None: Unit

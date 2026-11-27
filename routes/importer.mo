@@ -305,7 +305,21 @@ fn import_notion(
           Db.map_table_error
         )
         for (r, rp) in rows_and_pages
-          cur = try Db.tx_put_db_row(cur, def, r, rp, [])
+          (next_cur, assigned_cells) = try Db.tx_assign_unique_ids(cur, def, r.cells)
+          r_final = DbRow(
+            id: r.id,
+            database_id: r.database_id,
+            page_id: r.page_id,
+            cells: assigned_cells,
+            created_by: r.created_by,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+            archived_at: r.archived_at,
+            version: r.version
+          )
+          cur = try Db.tx_put_db_row(next_cur, def, r_final, rp, [])
+          cur = try Table.put(cur, Db.db_row_editors_table(), r_final.id, auth.principal.id)
+            .map_error(Db.map_table_error)
           cur = try TaintBridge.tx_mark_provenance(
             cur,
             "vlm_db_rows",
