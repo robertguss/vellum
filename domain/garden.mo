@@ -177,7 +177,8 @@ end
 
 ## Parses a GitHub `pull_request` webhook JSON payload into a typed `GithubPrEvent`.
 fn parse_github_pr_webhook(body: Bytes) : Result(GithubPrEvent, Text)
-  j = try Json.decode_strict[Json](body).map_error(fn(e) "invalid GitHub JSON: #{e.to_text}" end)
+  raw_txt = try body.decode_utf8.or_fail("invalid GitHub JSON: non-UTF8 body")
+  j = try Json.parse(raw_txt).map_error(fn(e) "invalid GitHub JSON: #{e.to_text}" end)
   action = (j.text_at("action") or "").trim.ascii_lowercase
   pr = case j.get("pull_request")
     Some(p): p
@@ -200,9 +201,11 @@ fn parse_github_pr_webhook(body: Bytes) : Result(GithubPrEvent, Text)
   end
   var changed_files = []
   for item in raw_files
-    case Json.decode_strict[Text](item.to_text.bytes)
-      Ok(f) if not f.trim.empty?: changed_files = changed_files.append(f.trim)
-      Ok(_) | Error(_): Unit
+    case item
+      Json.String(f) if not f.trim.empty?: changed_files = changed_files.append(f.trim)
+      Json.String(_) | Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json.Object(
+        _
+      ): Unit
     end
   end
 

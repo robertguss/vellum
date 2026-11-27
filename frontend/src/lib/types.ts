@@ -197,8 +197,22 @@ export interface SearchResultItem {
   vec_score?: number | null;
 }
 
+export interface ChatSearchHit {
+  message_id: string;
+  channel_id: string;
+  channel_name: string;
+  channel_kind: "public" | "private" | "dm" | string;
+  collection_id: string | null;
+  parent_message_id: string | null;
+  author_handle: string;
+  snippet: string;
+  is_decision: boolean;
+  created_at: string | null;
+}
+
 export interface SearchResponse {
   results: SearchResultItem[];
+  chat_results?: ChatSearchHit[];
   mode?: SearchMode;
   vector_backend?: "neural" | "sketch" | "none";
 }
@@ -1140,4 +1154,75 @@ export interface VaultStatusResponse {
   collections: VaultCollectionSummary[];
   principals: VaultPrincipalSummary[];
   recent_audit: FerpaAuditEntry[];
+}
+
+export interface ChatAttachmentSummary {
+  id: string;
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  download_url: string;
+}
+
+export interface ChatPrincipalSummary {
+  id: string;
+  kind: PrincipalKind | string;
+  handle: string;
+  display_name: string;
+  role: WorkspaceRole | string;
+}
+
+export interface ChatChannel {
+  id: string;
+  kind: "public" | "private" | "dm";
+  collection_id: string | null;
+  slug: string;
+  name: string;
+  topic: string;
+  member_principal_ids: string[];
+  archived_at: string | null;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+  last_message_at: string | null;
+  last_message_id: string | null;
+  unread_count?: number;
+  ferpa_restricted?: boolean;
+  security_tier?: "standard" | "ferpa_restricted" | string;
+}
+
+export interface ChatMessage {
+  id: string;
+  channel_id: string;
+  parent_message_id: string | null;
+  author_id: string;
+  author_handle: string;
+  author_display_name: string;
+  author_kind: "human" | "agent" | string;
+  body_markdown: string;
+  attachment_ids: string[];
+  attachments?: ChatAttachmentSummary[];
+  reactions: Record<string, string[]>;
+  linked_row_ids: string[];
+  linked_proposal_ids: string[];
+  is_decision: boolean;
+  client_msg_id: string | null;
+  edited_at: string | null;
+  deleted_at: string | null;
+  created_at: string;
+  reply_count?: number;
+}
+
+export interface ChatInboxItem {
+  id: string;
+  recipient_principal_id: string;
+  kind: "mention" | "thread_reply" | "dm" | string;
+  channel_id: string;
+  message_id: string;
+  parent_message_id: string | null;
+  actor_id: string;
+  actor_handle: string;
+  preview: string;
+  read_at: string | null;
+  created_at: string;
 }

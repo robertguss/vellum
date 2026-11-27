@@ -319,23 +319,43 @@ fn vellum_resources_for(auth: AuthContext, rf: ReadFiles) : List(Mcp.ResourceDef
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
-    fn(db) Packs.list_permitted_packs(Ledger.store(db), auth) end
+    fn(db)
+      pks = try Packs.list_permitted_packs(Ledger.store(db), auth)
+      Ok(
+        Json.Array(
+          pks.map(fn(pk)
+            Json.Object({
+              "slug": Json.String(pk.slug),
+              "name": Json.String(pk.name),
+              "token_budget": Json.int(pk.token_budget),
+              "description": Json.String(pk.description)
+            })
+          end)
+        )
+      )
+    end
   )
   case pack_res
     Error(_): base
-    Ok(pks):
+    Ok(Json.Array(pks)):
       var out = base
       for pk in pks
+        slug = pk.text_at("slug") or ""
+        name = pk.text_at("name") or ""
+        budget = pk.int_at("token_budget") or 0
+        desc = pk.text_at("description") or ""
         out = out.append(
           Mcp.ResourceDef(
-            uri: "vellum://packs/#{pk.slug}",
-            name: pk.name,
-            description: "Context Pack (#{pk.token_budget} tok): #{pk.description}",
+            uri: "vellum://packs/#{slug}",
+            name: name,
+            description: "Context Pack (#{budget} tok): #{desc}",
             mime_type: "text/markdown"
           )
         )
       end
       out
+    Ok(Json.Null) | Ok(Json.Boolean(_)) | Ok(Json.Number(_)) | Ok(Json.String(_)) | Ok(Json.Object(_)):
+      base
   end
 end
 
@@ -711,23 +731,39 @@ fn handle_mcp_db_create_row(
       t2 = try Db.tx_put_db_row(t_seq, def, row, page, blocks)
       t2b = try Db.tx_put_db_row_editor(t2, row.id, auth.principal.id)
       (t3, _jid) = try Jobs.tx_put(t2b, idx_job).map_error(Db.map_table_error)
-      Ok((t3, (row, page)))
+      Ok((
+        t3,
+        Json.Object({
+          "row": row.to_json,
+          "page": page.to_json,
+          "database_id": Json.String(row.database_id),
+          "row_id": Json.String(row.id),
+          "page_id": Json.String(page.id),
+          "collection_id": Json.String(page.collection_id)
+        })
+      ))
     end
   )
   case res
-    Ok((saved_row, saved_page)):
+    Ok(saved_j):
+      row_j = saved_j.get("row") or Json.Null
+      page_j = saved_j.get("page") or Json.Null
+      s_db_id = saved_j.text_at("database_id") or db_id
+      s_row_id = saved_j.text_at("row_id") or row_id
+      s_page_id = saved_j.text_at("page_id") or page_id
+      s_col_id = saved_j.text_at("collection_id") or ""
       row_ev = Json.Object({
-        "database_id": Json.String(saved_row.database_id),
-        "row_id": Json.String(saved_row.id),
-        "page_id": Json.String(saved_page.id),
-        "collection_id": Json.String(saved_page.collection_id),
+        "database_id": Json.String(s_db_id),
+        "row_id": Json.String(s_row_id),
+        "page_id": Json.String(s_page_id),
+        "collection_id": Json.String(s_col_id),
         "actor": Json.String(auth.principal.handle)
       })
-      payload = Json.Object({"row": saved_row.to_json, "page": saved_page.to_json})
+      payload = Json.Object({"row": row_j, "page": page_j})
       Ok(
-        Mcp.tool_ok(id, "Created row #{saved_row.id} in database #{db_id}.", Some(payload))
-          .with_sse_publish_json("database:#{saved_row.database_id}", "db.row_created", row_ev)
-          .with_sse_publish_json("collection:#{saved_page.collection_id}", "db.row_created", row_ev)
+        Mcp.tool_ok(id, "Created row #{s_row_id} in database #{db_id}.", Some(payload))
+          .with_sse_publish_json("database:#{s_db_id}", "db.row_created", row_ev)
+          .with_sse_publish_json("collection:#{s_col_id}", "db.row_created", row_ev)
       )
     Error(e): Ok(Mcp.tool_error(id, e.to_text))
   end
@@ -884,24 +920,42 @@ fn handle_mcp_db_update_row(
         updated_at: idx_job.updated_at
       )
       (t3, _jid) = try Jobs.tx_put(t2b, final_idx_job).map_error(Db.map_table_error)
-      Ok((t3, (bumped_row, bumped_page)))
+      Ok((
+        t3,
+        Json.Object({
+          "row": bumped_row.to_json,
+          "page": bumped_page.to_json,
+          "database_id": Json.String(bumped_row.database_id),
+          "row_id": Json.String(bumped_row.id),
+          "page_id": Json.String(bumped_page.id),
+          "collection_id": Json.String(bumped_page.collection_id),
+          "version": Json.int(bumped_row.version)
+        })
+      ))
     end
   )
   case res
-    Ok((next_row, next_page)):
+    Ok(next_j):
+      row_j = next_j.get("row") or Json.Null
+      page_j = next_j.get("page") or Json.Null
+      n_db_id = next_j.text_at("database_id") or db_id
+      n_row_id = next_j.text_at("row_id") or row_id
+      n_page_id = next_j.text_at("page_id") or ""
+      n_col_id = next_j.text_at("collection_id") or ""
+      n_ver = next_j.int_at("version") or 1
       row_ev = Json.Object({
-        "database_id": Json.String(next_row.database_id),
-        "row_id": Json.String(next_row.id),
-        "page_id": Json.String(next_page.id),
-        "collection_id": Json.String(next_page.collection_id),
-        "version": Json.int(next_row.version),
+        "database_id": Json.String(n_db_id),
+        "row_id": Json.String(n_row_id),
+        "page_id": Json.String(n_page_id),
+        "collection_id": Json.String(n_col_id),
+        "version": Json.int(n_ver),
         "actor": Json.String(auth.principal.handle)
       })
-      payload = Json.Object({"row": next_row.to_json, "page": next_page.to_json})
+      payload = Json.Object({"row": row_j, "page": page_j})
       Ok(
-        Mcp.tool_ok(id, "Updated row #{next_row.id} (v#{next_row.version}).", Some(payload))
-          .with_sse_publish_json("database:#{next_row.database_id}", "db.row_updated", row_ev)
-          .with_sse_publish_json("collection:#{next_page.collection_id}", "db.row_updated", row_ev)
+        Mcp.tool_ok(id, "Updated row #{n_row_id} (v#{n_ver}).", Some(payload))
+          .with_sse_publish_json("database:#{n_db_id}", "db.row_updated", row_ev)
+          .with_sse_publish_json("collection:#{n_col_id}", "db.row_updated", row_ev)
       )
     Error(e): Ok(Mcp.tool_error(id, e.to_text))
   end
@@ -1297,17 +1351,21 @@ fn handle_mcp_proposal_comments(
         Db.proposal_comments_by_proposal(),
         pid
       ).map_error(Db.map_table_error)
-      Ok(pairs.map(fn(p) p.1 end).sort_by(fn(c) c.id end))
+      cmts = pairs.map(fn(p) p.1 end).sort_by(fn(c) c.id end)
+      Ok(Json.Object({"comments": cmts.to_json, "count": Json.int(cmts.size)}))
     end
   )
   case cres
-    Ok(cmts): Ok(
-      Mcp.tool_ok(
-        id,
-        "Returned #{cmts.size} comments for proposal #{pid}.",
-        Some(Json.Object({"proposal_id": Json.String(pid), "comments": cmts.to_json}))
+    Ok(cj):
+      cnt = cj.int_at("count") or 0
+      cmts_j = cj.get("comments") or Json.Array([])
+      Ok(
+        Mcp.tool_ok(
+          id,
+          "Returned #{cnt} comments for proposal #{pid}.",
+          Some(Json.Object({"proposal_id": Json.String(pid), "comments": cmts_j}))
+        )
       )
-    )
     Error(e): Ok(Mcp.tool_error(id, e.to_text))
   end
 end
@@ -1335,11 +1393,18 @@ fn handle_mcp_rlm_query(
   end
   kinds_opt = case args.get("block_kinds")
     None | Some(Json.Null): None
-    Some(kj):
-      case Json.decode_strict[List(Text)](kj.to_text.bytes)
-        Ok(xs): Some(xs)
-        Error(e): return Ok(Mcp.tool_error(id, "invalid block_kinds: #{e.to_text}"))
+    Some(Json.Array(items)):
+      var ks = []
+      for item in items
+        case item
+          Json.String(s): ks = ks.append(s)
+          Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json.Object(_): return Ok(
+            Mcp.tool_error(id, "invalid block_kinds: expected array of strings")
+          )
+        end
       end
+      Some(ks)
+    Some(_): return Ok(Mcp.tool_error(id, "invalid block_kinds: expected array of strings"))
   end
   inc_dbs_opt = args.bool_at("include_databases")
   max_pages_opt = args.int_at("max_pages")
@@ -1438,7 +1503,7 @@ fn handle_tool_call(
     if not Policy.action_permitted?(auth, "read")
       return Ok(Mcp.tool_error(id, "grant '#{auth.grant_id}' does not permit 'read'"))
     end
-    cols = try Ledger.read_locked(
+    cols_res = try Ledger.read_locked(
       files.read_only,
       Db.ledger_db_path,
       Db.vellum_schema(),
@@ -1447,18 +1512,19 @@ fn handle_tool_call(
         rows = try Table.scan(Ledger.store(db), Db.collections_table(), None, None, 200).map_error(
           Db.map_table_error
         )
-        Ok(
-          rows.filter(fn(p)
-            p.1.archived_at == None and Policy.collection_permitted?(auth, p.1.id)
-          end).map(fn(p) p.1 end)
-        )
+        cols = rows.filter(fn(p)
+          p.1.archived_at == None and Policy.collection_permitted?(auth, p.1.id)
+        end).map(fn(p) p.1 end)
+        Ok(Json.Object({"collections": cols.to_json, "count": Json.int(cols.size)}))
       end
     )
+    cols_cnt = cols_res.int_at("count") or 0
+    cols_j = cols_res.get("collections") or Json.Array([])
     return Ok(
       Mcp.tool_ok(
         id,
-        "Found #{cols.size} collections.",
-        Some(Json.Object({"collections": cols.to_json}))
+        "Found #{cols_cnt} collections.",
+        Some(Json.Object({"collections": cols_j}))
       )
     )
   end
@@ -1508,7 +1574,7 @@ fn handle_tool_call(
         case col_filter
           Some(cid):
             try Policy.require_collection_access(auth, "read", cid)
-            Ok([cid])
+            Ok(Json.Array([Json.String(cid)]))
           None:
             rows = try Table.scan(store, Db.collections_table(), None, None, 200).map_error(
               Db.map_table_error
@@ -1516,15 +1582,25 @@ fn handle_tool_call(
             var out = []
             for (_id, c) in rows
               if c.archived_at == None and Policy.collection_permitted?(auth, c.id)
-                out = out.append(c.id)
+                out = out.append(Json.String(c.id))
               end
             end
-            Ok(out)
+            Ok(Json.Array(out))
         end
       end
     )
     target_cids = case cids_res
-      Ok(xs): xs
+      Ok(Json.Array(xs)):
+        var s_out = []
+        for item in xs
+          case item
+            Json.String(s): s_out = s_out.append(s)
+            Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Object(_) | Json.Array(_): Unit
+          end
+        end
+        s_out
+      Ok(Json.Null) | Ok(Json.Boolean(_)) | Ok(Json.Number(_)) | Ok(Json.String(_)) | Ok(Json.Object(_)):
+        []
       Error(e): return Ok(Mcp.tool_error(id, e.to_text))
     end
     (raw_qv_opt, vec_idx, vec_backend, min_vec) = try mcp_search_vec_setup(
@@ -1576,7 +1652,7 @@ fn handle_tool_call(
       end
     end
     sorted_hits = raw_hits.sort_by(fn(h) -h.score end).take(20)
-    (items_json, untrusted_srcs) = try Ledger.read_locked(
+    search_res_json = try Ledger.read_locked(
       files.read_only,
       Db.ledger_db_path,
       Db.vellum_schema(),
@@ -1637,9 +1713,17 @@ fn handle_tool_call(
             end
           end
         end
-        Ok((items, srcs))
+        Ok(Json.Object({"items": Json.Array(items), "untrusted_srcs": srcs.to_json}))
       end
     )
+    items_json = search_res_json.list_at("items") or []
+    var untrusted_srcs = []
+    for sitem in search_res_json.list_at("untrusted_srcs") or []
+      case sitem
+        Json.String(s): untrusted_srcs = untrusted_srcs.append(s)
+        Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json.Object(_): Unit
+      end
+    end
     for usrc in untrusted_srcs
       _ts = try TaintBridge.record_untrusted_read_locked(
         files,
@@ -1721,11 +1805,20 @@ fn handle_tool_call(
           None: "trusted"
         end
         untrusted_src_opt = untrusted_w.map(fn(w) "page:#{pg.id}(#{w})" end)
-        Ok((pg, blks, trust_tier, untrusted_src_opt))
+        Ok(
+          Json.Object({
+            "page": pg.to_json,
+            "blocks": blks.to_json,
+            "anchored": Json.String(Blocks.to_anchored_markdown(blks)),
+            "trust_tier": Json.String(trust_tier),
+            "untrusted_src": untrusted_src_opt.to_json
+          })
+        )
       end
     )
     return case res
-      Ok((pg, blks, trust_tier, untrusted_src_opt)):
+      Ok(res_j):
+        untrusted_src_opt = res_j.text_at("untrusted_src")
         case untrusted_src_opt
           Some(src):
             _ts = try TaintBridge.record_untrusted_read_locked(
@@ -1748,10 +1841,11 @@ fn handle_tool_call(
             Ok(sopt.map(fn(s) TaintBridge.taint_session_to_json(s) end).to_json)
           end
         )
-        anchored = Blocks.to_anchored_markdown(blks)
+        anchored = res_j.text_at("anchored") or ""
+        trust_tier = res_j.text_at("trust_tier") or "trusted"
         payload = Json.Object({
-          "page": pg.to_json,
-          "blocks": blks.to_json,
+          "page": res_j.get("page") or Json.Null,
+          "blocks": res_j.get("blocks") or Json.Array([]),
           "anchored_markdown": Json.String(anchored),
           "trust_tier": Json.String(trust_tier),
           "taint_session": sess_json
@@ -1825,11 +1919,13 @@ fn handle_tool_call(
         (t2, rep) = try Db.tx_apply_world_patch(t1, patch_args.to_json).map_error(fn(m)
           BadInput(reason: m)
         end)
-        Ok((t2, (rep, old_pg.collection_id)))
+        Ok((t2, Json.Object({"rep": rep, "collection_id": Json.String(old_pg.collection_id)})))
       end
     )
     return case res
-      Ok((rep, col_id)):
+      Ok(rj):
+        rep = rj.get("rep") or Json.Null
+        col_id = rj.text_at("collection_id") or ""
         blocks_ev = Json.Object({
           "page_id": Json.String(pid),
           "collection_id": Json.String(col_id),
@@ -1887,15 +1983,15 @@ fn handle_tool_call(
           now,
           now + ttl.seconds
         ).map_error(Db.map_claims_error)
-        Ok((t2, cl))
+        Ok((t2, cl.to_json))
       end
     )
     return case res
-      Ok(cl): Ok(
-        Mcp.tool_ok(id, "Acquired claim on #{resource}.", Some(cl.to_json)).with_sse_publish_json(
+      Ok(cl_json): Ok(
+        Mcp.tool_ok(id, "Acquired claim on #{resource}.", Some(cl_json)).with_sse_publish_json(
           "claims",
           "claim.acquired",
-          Json.Object({"claim": cl.to_json, "actor": Json.String(auth.principal.handle)})
+          Json.Object({"claim": cl_json, "actor": Json.String(auth.principal.handle)})
         )
       )
       Error(e): Ok(Mcp.tool_error(id, e.to_text))
@@ -2185,11 +2281,19 @@ fn handle_tool_call(
           DatabaseModel.matches_filters?(er, filters, true)
         end)
         sorted = DatabaseModel.sort_enriched_rows(filtered, sorts)
-        Ok(ViewQueryResult(view: None, rows: sorted, board_groups: None, total_count: sorted.size))
+        Ok(
+          Json.Object({
+            "vq": ViewQueryResult(view: None, rows: sorted, board_groups: None, total_count: sorted.size).to_json,
+            "total_count": Json.int(sorted.size)
+          })
+        )
       end
     )
     return case qres
-      Ok(vq): Ok(Mcp.tool_ok(id, "Returned #{vq.total_count} rows.", Some(vq.to_json)))
+      Ok(qj):
+        cnt = qj.int_at("total_count") or 0
+        vq_j = qj.get("vq") or Json.Null
+        Ok(Mcp.tool_ok(id, "Returned #{cnt} rows.", Some(vq_j)))
       Error(e): Ok(Mcp.tool_error(id, e.to_text))
     end
   end
@@ -2228,12 +2332,18 @@ fn handle_tool_call(
       Db.ledger_db_path,
       Db.vellum_schema(),
       Db.map_ledger_error,
-      fn(db) Packs.list_permitted_summaries(Ledger.store(db), auth, col_f, kind_f) end
+      fn(db)
+        sums = try Packs.list_permitted_summaries(Ledger.store(db), auth, col_f, kind_f)
+        Ok(Json.Object({"summaries": sums.to_json, "count": Json.int(sums.size)}))
+      end
     )
     return case res
-      Ok(sums): Ok(
-        Mcp.tool_ok(id, "Returned #{sums.size} living summaries.", Some(Json.Object({"summaries": sums.to_json})))
-      )
+      Ok(sj):
+        cnt = sj.int_at("count") or 0
+        sums_j = sj.get("summaries") or Json.Array([])
+        Ok(
+          Mcp.tool_ok(id, "Returned #{cnt} living summaries.", Some(Json.Object({"summaries": sums_j})))
+        )
       Error(e): Ok(Mcp.tool_error(id, e.to_text))
     end
   end
@@ -2244,12 +2354,18 @@ fn handle_tool_call(
       Db.ledger_db_path,
       Db.vellum_schema(),
       Db.map_ledger_error,
-      fn(db) Packs.list_permitted_packs(Ledger.store(db), auth) end
+      fn(db)
+        pks = try Packs.list_permitted_packs(Ledger.store(db), auth)
+        Ok(Json.Object({"packs": pks.to_json, "count": Json.int(pks.size)}))
+      end
     )
     return case res
-      Ok(pks): Ok(
-        Mcp.tool_ok(id, "Returned #{pks.size} context packs.", Some(Json.Object({"packs": pks.to_json})))
-      )
+      Ok(pj):
+        cnt = pj.int_at("count") or 0
+        pks_j = pj.get("packs") or Json.Array([])
+        Ok(
+          Mcp.tool_ok(id, "Returned #{cnt} context packs.", Some(Json.Object({"packs": pks_j})))
+        )
       Error(e): Ok(Mcp.tool_error(id, e.to_text))
     end
   end
@@ -2268,16 +2384,32 @@ fn handle_tool_call(
       Db.ledger_db_path,
       Db.vellum_schema(),
       Db.map_ledger_error,
-      fn(db) Packs.compile_pack_from_store(Ledger.store(db), auth, slug, q_hint, now) end
+      fn(db)
+        compiled = try Packs.compile_pack_from_store(Ledger.store(db), auth, slug, q_hint, now)
+        Ok(
+          Json.Object({
+            "slug": Json.String(compiled.pack.slug),
+            "tokens_used": Json.int(compiled.tokens_used),
+            "token_budget": Json.int(compiled.token_budget),
+            "markdown": Json.String(compiled.markdown),
+            "json": compiled.to_json
+          })
+        )
+      end
     )
     return case res
-      Ok(compiled): Ok(
-        Mcp.tool_ok(
-          id,
-          "Compiled pack '#{compiled.pack.slug}' (#{compiled.tokens_used}/#{compiled.token_budget} tok).\n\n#{compiled.markdown}",
-          Some(compiled.to_json)
+      Ok(cj):
+        c_slug = cj.text_at("slug") or slug
+        tok_used = cj.int_at("tokens_used") or 0
+        tok_budget = cj.int_at("token_budget") or 0
+        c_md = cj.text_at("markdown") or ""
+        Ok(
+          Mcp.tool_ok(
+            id,
+            "Compiled pack '#{c_slug}' (#{tok_used}/#{tok_budget} tok).\n\n#{c_md}",
+            Some(cj.get("json") or Json.Null)
+          )
         )
-      )
       Error(e): Ok(Mcp.tool_error(id, e.to_text))
     end
   end
@@ -2329,13 +2461,16 @@ fn handle_resource_read(
         Db.ledger_db_path,
         Db.vellum_schema(),
         Db.map_ledger_error,
-        fn(db) Packs.compile_pack_from_store(Ledger.store(db), auth, slug.trim, None, now) end
+        fn(db)
+          compiled = try Packs.compile_pack_from_store(Ledger.store(db), auth, slug.trim, None, now)
+          Ok(Json.Object({"markdown": Json.String(compiled.markdown)}))
+        end
       )
       return case pk_res
-        Ok(compiled): Ok(
+        Ok(pj): Ok(
           Mcp.resource_response(
             id,
-            [Mcp.ResourceContent(uri: uri, mime_type: "text/markdown", text: compiled.markdown)]
+            [Mcp.ResourceContent(uri: uri, mime_type: "text/markdown", text: pj.text_at("markdown") or "")]
           )
         )
         Error(e): Ok(

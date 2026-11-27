@@ -46,9 +46,13 @@ mo check domain/collab.mo
 mo check domain/secrets.mo
 mo check domain/notion-import.mo
 mo check db.mo
+mo check vault-ops.mo
+mo check chat-ops.mo
 mo check erasure-ops.mo
 mo check routes/auth.mo
 mo check routes/workspace.mo
+mo check routes/vault.mo
+mo check routes/chat.mo
 mo check routes/databases.mo
 mo check routes/collab.mo
 mo check routes/mcp.mo
@@ -88,9 +92,12 @@ mo check tests/unit-domain-misc.mo
 mo check tests/unit-rlm.mo
 mo check tests/unit-sync-cli.mo
 mo check tests/unit-vault.mo
+mo check tests/unit-chat.mo
 mo check tests/unit-backup.mo
 mo check tests/v3m2a.mo
 mo check tests/v3m2b.mo
+mo check tests/v3m3a.mo
+mo check tests/v3m3a-vault.mo
 
 mo test domain/blocks.mo
 mo test domain/policy.mo
@@ -123,8 +130,11 @@ mo test tests/v3m1.mo
 mo test tests/v3m1b.mo
 mo test tests/v3m1c.mo
 mo test tests/unit-vault.mo
+mo test tests/unit-chat.mo
 mo test tests/unit-backup.mo
 mo test tests/v3m2a.mo
 mo test tests/v3m2b.mo
+mo test tests/v3m3a.mo
+mo test tests/v3m3a-vault.mo
 
 echo "All Vellum Stage 1-5 checks, frontend build checks, and tests passed."

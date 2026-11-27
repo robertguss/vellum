@@ -496,8 +496,14 @@ fn packs_page(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: E
     return Error(Forbidden(reason: "grant '#{a.grant_id}' does not permit 'read'"))
   end
 
-  (cols, dbs, sums, packs, llms) = if not rf.exists?(Db.ledger_db_path)
-    ([], [], [], [], "# Vellum Workspace Index (/llms.txt)\n\n_Empty workspace._")
+  pack_data = if not rf.exists?(Db.ledger_db_path)
+    Json.Object({
+      "collections": Json.Array([]),
+      "databases": Json.Array([]),
+      "summaries": Json.Array([]),
+      "packs": Json.Array([]),
+      "llms_txt": Json.String("# Vellum Workspace Index (/llms.txt)\n\n_Empty workspace._")
+    })
   else
     try Ledger.read_locked(
       rf,
@@ -511,24 +517,21 @@ fn packs_page(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: E
         s_list = try list_permitted_summaries(store, a, None, None)
         p_list = try list_permitted_packs(store, a)
         txt = try render_llms_txt_from_store(store, a)
-        Ok((c_list, d_list, s_list, p_list, txt))
+        Ok(
+          Json.Object({
+            "collections": c_list.to_json,
+            "databases": d_list.to_json,
+            "summaries": s_list.to_json,
+            "packs": p_list.to_json,
+            "llms_txt": Json.String(txt)
+          })
+        )
       end
     )
   end
 
   if Auth.wants_json?(req)
-    return Ok(
-      json_ok(
-        200,
-        Json.Object({
-          "collections": cols.to_json,
-          "databases": dbs.to_json,
-          "summaries": sums.to_json,
-          "packs": packs.to_json,
-          "llms_txt": Json.String(llms)
-        })
-      )
-    )
+    return Ok(json_ok(200, pack_data))
   end
 
   icfg = try Auth.load_inertia_config(rf, env)
@@ -541,11 +544,11 @@ fn packs_page(req: Api.Request, auth: Option(AuthContext), rf: ReadFiles, env: E
     icfg,
     "Workspace/Packs",
     {
-      "collections": cols.to_json,
-      "databases": dbs.to_json,
-      "summaries": sums.to_json,
-      "packs": packs.to_json,
-      "llms_txt": Json.String(llms)
+      "collections": pack_data.get("collections") or Json.Array([]),
+      "databases": pack_data.get("databases") or Json.Array([]),
+      "summaries": pack_data.get("summaries") or Json.Array([]),
+      "packs": pack_data.get("packs") or Json.Array([]),
+      "llms_txt": pack_data.get("llms_txt") or Json.String("")
     },
     shared
   )
@@ -565,14 +568,17 @@ fn list_summaries(req: Api.Request, auth: AuthContext, rf: ReadFiles) : Result(
   end
   col_f = req.query_param("collection_id")
   kind_f = req.query_param("kind")
-  sums = try Ledger.read_locked(
+  sums_json = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
-    fn(db) list_permitted_summaries(Ledger.store(db), auth, col_f, kind_f) end
+    fn(db)
+      sums = try list_permitted_summaries(Ledger.store(db), auth, col_f, kind_f)
+      Ok(sums.to_json)
+    end
   )
-  Ok(json_ok(200, Json.Object({"summaries": sums.to_json})))
+  Ok(json_ok(200, Json.Object({"summaries": sums_json})))
 end
 
 ## `GET /api/packs` — Lists accessible `ContextPack` definitions (`ReadFiles`-only).
@@ -583,26 +589,41 @@ fn list_packs(_req: Api.Request, auth: AuthContext, rf: ReadFiles) : Result(Api.
   if not rf.exists?(Db.ledger_db_path)
     return Ok(json_ok(200, Json.Object({"packs": Json.Array([])})))
   end
-  packs = try Ledger.read_locked(
+  packs_json = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
-    fn(db) list_permitted_packs(Ledger.store(db), auth) end
+    fn(db)
+      packs = try list_permitted_packs(Ledger.store(db), auth)
+      Ok(packs.to_json)
+    end
   )
-  Ok(json_ok(200, Json.Object({"packs": packs.to_json})))
+  Ok(json_ok(200, Json.Object({"packs": packs_json})))
 end
 
 ## `POST /api/packs` — Creates a token-budgeted `ContextPack`.
 fn create_pack(
   req: Api.Request,
   auth: AuthContext,
-  input: CreatePackInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = CreatePackInput(
+    slug: try VaultOps.req_text(rj, "slug"),
+    name: try VaultOps.req_text(rj, "name"),
+    description: rj.text_at("description"),
+    collection_ids: VaultOps.json_text_list_raw(rj, "collection_ids"),
+    pinned_page_ids: VaultOps.json_text_list_raw(rj, "pinned_page_ids"),
+    database_ids: VaultOps.json_text_list_raw(rj, "database_ids"),
+    query_hint: rj.text_at("query_hint"),
+    fresh_only: rj.bool_at("fresh_only"),
+    include_full_blocks: rj.bool_at("include_full_blocks"),
+    token_budget: rj.int_at("token_budget")
+  )
   can_write? = not auth.principal.suspended and
     (Policy.action_permitted?(auth, "manage_schema") or
       Policy.action_permitted?(auth, "write_direct"))
@@ -646,7 +667,7 @@ fn create_pack(
     at: now
   )
   audit_payload = Json.Object({"pack_id": Json.String(pk.id), "slug": Json.String(pk.slug)})
-  created = try Ledger.transact_locked(
+  created_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -658,10 +679,10 @@ fn create_pack(
       t1 = try tx_authorize_if_agent(tx, auth, act, now)
       try validate_pack_targets_tx(t1, auth, pk)
       t2 = try Table.put(t1, Db.packs_table(), pk.id, pk).map_error(Db.map_table_error)
-      Ok((t2, pk))
+      Ok((t2, pk.to_json))
     end
   )
-  Ok(json_ok(201, created.to_json))
+  Ok(json_ok(201, created_json))
 end
 
 ## `PUT /api/packs/:id` — Updates a `ContextPack` with optimistic `expected_version` check.
@@ -669,11 +690,24 @@ fn update_pack(
   req: Api.Request,
   id: Text,
   auth: AuthContext,
-  input: UpdatePackInput,
   files: Files,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = UpdatePackInput(
+    slug: rj.text_at("slug"),
+    name: rj.text_at("name"),
+    description: rj.text_at("description"),
+    collection_ids: VaultOps.json_text_list_opt(rj, "collection_ids"),
+    pinned_page_ids: VaultOps.json_text_list_opt(rj, "pinned_page_ids"),
+    database_ids: VaultOps.json_text_list_opt(rj, "database_ids"),
+    query_hint: rj.text_at("query_hint"),
+    fresh_only: rj.bool_at("fresh_only"),
+    include_full_blocks: rj.bool_at("include_full_blocks"),
+    token_budget: rj.int_at("token_budget"),
+    expected_version: rj.int_at("expected_version")
+  )
   can_write? = not auth.principal.suspended and
     (Policy.action_permitted?(auth, "manage_schema") or
       Policy.action_permitted?(auth, "write_direct"))
@@ -693,7 +727,7 @@ fn update_pack(
   )
   audit_payload = Json.Object({"pack_id": Json.String(id)})
 
-  updated = try Ledger.transact_locked(
+  updated_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -754,10 +788,10 @@ fn update_pack(
       end
       try validate_pack_targets_tx(t1, auth, next_pk)
       t2 = try Table.put(t1, Db.packs_table(), next_pk.id, next_pk).map_error(Db.map_table_error)
-      Ok((t2, next_pk))
+      Ok((t2, next_pk.to_json))
     end
   )
-  Ok(json_ok(200, updated.to_json))
+  Ok(json_ok(200, updated_json))
 end
 
 ## `DELETE /api/packs/:id` — Deletes a `ContextPack`.
@@ -785,7 +819,7 @@ fn delete_pack(req: Api.Request, id: Text, auth: AuthContext, files: Files, cloc
   )
   audit_payload = Json.Object({"pack_id": Json.String(id)})
 
-  deleted_id = try Ledger.transact_locked(
+  _deleted = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -805,10 +839,10 @@ fn delete_pack(req: Api.Request, id: Text, auth: AuthContext, files: Files, cloc
         )
       end
       t2 = try Table.delete(t1, Db.packs_table(), id).map_error(Db.map_table_error)
-      Ok((t2, id))
+      Ok((t2, Unit))
     end
   )
-  Ok(json_ok(200, Json.Object({"deleted": Json.Boolean(true), "id": Json.String(deleted_id)})))
+  Ok(json_ok(200, Json.Object({"deleted": Json.Boolean(true), "id": Json.String(id)})))
 end
 
 ## `GET /api/packs/:slug` — Compiles a `ContextPack` (JSON by default, or Markdown when requested).
@@ -827,12 +861,22 @@ fn compile_pack_json(
   end
   now = clock.now
   q_over = req.query_param("q")
-  compiled = try Ledger.read_locked(
+  compiled_wrap = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
-    fn(db) compile_pack_from_store(Ledger.store(db), auth, slug, q_over, now) end
+    fn(db)
+      compiled = try compile_pack_from_store(Ledger.store(db), auth, slug, q_over, now)
+      Ok(
+        Json.Object({
+          "json": compiled.to_json,
+          "markdown": Json.String(compiled.markdown),
+          "tokens_used": Json.int(compiled.tokens_used),
+          "token_budget": Json.int(compiled.token_budget)
+        })
+      )
+    end
   )
   accept = (req.header("Accept") or "").ascii_lowercase
   want_md? = req.query_param("format") == Some("md") or
@@ -841,15 +885,15 @@ fn compile_pack_json(
     Ok(
       markdown_ok(
         200,
-        compiled.markdown,
+        compiled_wrap.text_at("markdown") or "",
         [
-          ("X-Vellum-Tokens-Used", compiled.tokens_used.to_text),
-          ("X-Vellum-Token-Budget", compiled.token_budget.to_text)
+          ("X-Vellum-Tokens-Used", (compiled_wrap.int_at("tokens_used") or 0).to_text),
+          ("X-Vellum-Token-Budget", (compiled_wrap.int_at("token_budget") or 0).to_text)
         ]
       )
     )
   else
-    Ok(json_ok(200, compiled.to_json))
+    Ok(json_ok(200, compiled_wrap.get("json") or Json.Null))
   end
 end
 
@@ -869,20 +913,29 @@ fn compile_pack_markdown(
   end
   now = clock.now
   q_over = req.query_param("q")
-  compiled = try Ledger.read_locked(
+  compiled_wrap = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
-    fn(db) compile_pack_from_store(Ledger.store(db), auth, slug, q_over, now) end
+    fn(db)
+      compiled = try compile_pack_from_store(Ledger.store(db), auth, slug, q_over, now)
+      Ok(
+        Json.Object({
+          "markdown": Json.String(compiled.markdown),
+          "tokens_used": Json.int(compiled.tokens_used),
+          "token_budget": Json.int(compiled.token_budget)
+        })
+      )
+    end
   )
   Ok(
     markdown_ok(
       200,
-      compiled.markdown,
+      compiled_wrap.text_at("markdown") or "",
       [
-        ("X-Vellum-Tokens-Used", compiled.tokens_used.to_text),
-        ("X-Vellum-Token-Budget", compiled.token_budget.to_text)
+        ("X-Vellum-Tokens-Used", (compiled_wrap.int_at("tokens_used") or 0).to_text),
+        ("X-Vellum-Token-Budget", (compiled_wrap.int_at("token_budget") or 0).to_text)
       ]
     )
   )

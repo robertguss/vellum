@@ -18,7 +18,6 @@ use Domain.Types{
   AppError,
   AuthContext,
   AuthorKind,
-  Block,
   Collection,
   Page,
   PageKind,
@@ -362,7 +361,7 @@ fn sync_push_create(
     reason: reason_str,
     at: now
   )
-  (saved_page, bp_opt, pm_opt) = try Ledger.transact_locked(
+  push_doc_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -379,21 +378,22 @@ fn sync_push_create(
       end
       t3 = try Db.tx_save_page_and_blocks(t2, page, blocks)
       (t4, _jid) = try Jobs.tx_put(t3, idx_job).map_error(Db.map_table_error)
-      Ok((t4, (page, b_opt, m_opt)))
+      built_doc = Blueprints.to_yaml_frontmatter(
+        page,
+        b_opt,
+        m_opt,
+        Blocks.to_anchored_markdown(blocks)
+      )
+      Ok((t4, Json.Object({"doc": Json.String(built_doc)})))
     end
   )
 
-  doc = Blueprints.to_yaml_frontmatter(
-    saved_page,
-    bp_opt,
-    pm_opt,
-    Blocks.to_anchored_markdown(blocks)
-  )
-  rel = Sync.page_rel_path(col.slug, saved_page.title, saved_page.id)
+  doc = push_doc_json.text_at("doc") or ""
+  rel = Sync.page_rel_path(col.slug, page.title, page.id)
   ev = Json.Object({
-    "page_id": Json.String(saved_page.id),
+    "page_id": Json.String(page.id),
     "collection_id": Json.String(col.id),
-    "version": Json.int(saved_page.version),
+    "version": Json.int(page.version),
     "actor": Json.String(auth.principal.handle)
   })
   Ok(
@@ -401,7 +401,7 @@ fn sync_push_create(
       201,
       Json.Object({
         "outcome": Json.String("created"),
-        "page": saved_page.to_json,
+        "page": page.to_json,
         "rel_path": Json.String(rel),
         "markdown_document": Json.String(doc),
         "content_sha256": Json.String(Sync.sha256_text(doc)),
@@ -411,50 +411,36 @@ fn sync_push_create(
   )
 end
 
-fn sync_push_stage_proposal(
+fn sync_push_stage_proposal_from_json(
   auth: AuthContext,
-  old_page: Page,
-  col: Collection,
-  old_blocks: List(Block),
-  bp_opt: Option(BlueprintDef),
-  pm_opt: Option(PageBlueprintMeta),
-  fm: Blueprints.ParsedFrontmatter,
+  old_page_json: Json,
+  old_page_id: Text,
+  old_page_title: Text,
+  old_page_version: Int,
+  col_id: Text,
+  _col_slug: Text,
+  ops_size: Int,
+  wargs_json: Json,
+  live_doc: Text,
+  live_sha: Text,
+  live_rel: Text,
   expected_ver: Int,
   conflict_reason: Text,
   reason_str: Text,
-  prov: Provenance,
   files: Files,
   rng: SecureRandom,
   clock: Clock,
   now: Time
 ) : Result(Api.Response, AppError)
-  try Policy.require_collection_access(auth, "propose", col.id)
-  id_prefix = Id.ulid(rng, clock)
-  incoming = Blocks.reconcile_blocks_from_markdown(
-    old_page.id,
-    old_blocks,
-    fm.body_markdown,
-    prov,
-    id_prefix
-  )
-  (ops, new_ids) = Blocks.diff_blocks_to_ops(old_blocks, incoming)
+  try Policy.require_collection_access(auth, "propose", col_id)
 
-  live_doc = Blueprints.to_yaml_frontmatter(
-    old_page,
-    bp_opt,
-    pm_opt,
-    Blocks.to_anchored_markdown(old_blocks)
-  )
-  live_sha = Sync.sha256_text(live_doc)
-  live_rel = Sync.page_rel_path(col.slug, old_page.title, old_page.id)
-
-  if ops.empty?
+  if ops_size == 0
     return Ok(
       json_ok(
         200,
         Json.Object({
           "outcome": Json.String("unchanged"),
-          "page": old_page.to_json,
+          "page": old_page_json,
           "rel_path": Json.String(live_rel),
           "markdown_document": Json.String(live_doc),
           "content_sha256": Json.String(live_sha),
@@ -476,24 +462,7 @@ fn sync_push_stage_proposal(
     now + 7.days
   ).map_error(Db.map_world_error)
 
-  prop_reason = "#{reason_str} (#{conflict_reason}: expected v#{expected_ver}, live v#{old_page.version})"
-  prop_prov = Provenance(
-    author_id: auth.principal.id,
-    author_kind: prov.author_kind,
-    grant_id: prov.grant_id,
-    proposal_id: Some(prop_id),
-    reason: Some(prop_reason),
-    citations: [],
-    updated_at: now
-  )
-  wargs = WorldPatchArgs(
-    page_id: old_page.id,
-    ops: ops,
-    new_ids: new_ids,
-    provenance: prop_prov,
-    expected_versions: {},
-    updated_at: now
-  )
+  prop_reason = "#{reason_str} (#{conflict_reason}: expected v#{expected_ver}, live v#{old_page_version})"
   _step = try World.world_call_locked(
     files,
     Db.ledger_db_path,
@@ -501,7 +470,7 @@ fn sync_push_stage_proposal(
     Db.world_catalog(),
     world_id,
     "propose",
-    wargs.to_json,
+    wargs_json,
     prop_reason,
     now
   ).map_error(Db.map_world_error)
@@ -509,11 +478,11 @@ fn sync_push_stage_proposal(
   pm = ProposalMeta(
     id: prop_id,
     world_id: world_id,
-    collection_id: col.id,
-    target_page_id: old_page.id,
+    collection_id: col_id,
+    target_page_id: old_page_id,
     target_database_id: None,
     branch_kind: "proposal",
-    title: "Sync: #{old_page.title}",
+    title: "Sync: #{old_page_title}",
     reason: prop_reason,
     author_id: auth.principal.id,
     author_handle: auth.principal.handle,
@@ -535,10 +504,10 @@ fn sync_push_stage_proposal(
     Db.ledger_db_path,
     Db.vellum_schema(),
     meta,
-    "staged sync proposal #{pm.id} on #{old_page.id}",
+    "staged sync proposal #{pm.id} on #{old_page_id}",
     Json.Object({
       "proposal_id": Json.String(pm.id),
-      "page_id": Json.String(old_page.id),
+      "page_id": Json.String(old_page_id),
       "conflict_reason": Json.String(conflict_reason)
     }),
     Db.map_ledger_error,
@@ -551,8 +520,8 @@ fn sync_push_stage_proposal(
 
   prop_ev = Json.Object({
     "proposal_id": Json.String(saved_pm.id),
-    "page_id": Json.String(old_page.id),
-    "collection_id": Json.String(col.id),
+    "page_id": Json.String(old_page_id),
+    "collection_id": Json.String(col_id),
     "title": Json.String(saved_pm.title),
     "actor": Json.String(auth.principal.handle)
   })
@@ -563,26 +532,81 @@ fn sync_push_stage_proposal(
         "outcome": Json.String("proposal_opened"),
         "conflict_reason": Json.String(conflict_reason),
         "expected_version": Json.int(expected_ver),
-        "live_version": Json.int(old_page.version),
-        "ops_staged": Json.int(ops.size),
-        "page": old_page.to_json,
+        "live_version": Json.int(old_page_version),
+        "ops_staged": Json.int(ops_size),
+        "page": old_page_json,
         "proposal": saved_pm.to_json,
         "review_url": Json.String("/proposals"),
         "live_markdown_document": Json.String(live_doc),
         "live_content_sha256": Json.String(live_sha)
       })
-    ).with_sse_publish_json("page:#{old_page.id}", "proposal.opened", prop_ev)
-      .with_sse_publish_json("collection:#{col.id}", "proposal.opened", prop_ev)
+    ).with_sse_publish_json("page:#{old_page_id}", "proposal.opened", prop_ev)
+      .with_sse_publish_json("collection:#{col_id}", "proposal.opened", prop_ev)
+  )
+end
+
+fn prep_sync_stage_json(
+  _auth: AuthContext,
+  pid: Text,
+  fm: Blueprints.ParsedFrontmatter,
+  id_prefix: Text,
+  prov: Provenance,
+  files: Files
+) : Result(Json, AppError)
+  Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      pg = case try Table.get(store, Db.pages_table(), pid).map_error(Db.map_table_error)
+        Some(p) if p.archived_at == None: p
+        Some(_) | None: return Error(Missing(entity: "page", id: pid))
+      end
+      col = case try Table.get(store, Db.collections_table(), pg.collection_id).map_error(
+        Db.map_table_error
+      )
+        Some(c): c
+        None: return Error(Missing(entity: "collection", id: pg.collection_id))
+      end
+      blks = try Db.load_page_blocks(store, pg.id)
+      (bp_o, pm_o) = try load_page_bp_meta(store, pg.id)
+      incoming = Blocks.reconcile_blocks_from_markdown(pg.id, blks, fm.body_markdown, prov, id_prefix)
+      (ops, new_ids) = Blocks.diff_blocks_to_ops(blks, incoming)
+      live_doc = Blueprints.to_yaml_frontmatter(pg, bp_o, pm_o, Blocks.to_anchored_markdown(blks))
+      wargs = WorldPatchArgs(
+        page_id: pg.id,
+        ops: ops,
+        new_ids: new_ids,
+        provenance: prov,
+        expected_versions: {},
+        updated_at: prov.updated_at
+      )
+      Ok(
+        Json.Object({
+          "page": pg.to_json,
+          "page_id": Json.String(pg.id),
+          "page_title": Json.String(pg.title),
+          "page_version": Json.int(pg.version),
+          "col_id": Json.String(col.id),
+          "col_slug": Json.String(col.slug),
+          "ops_size": Json.int(ops.size),
+          "wargs": wargs.to_json,
+          "live_doc": Json.String(live_doc),
+          "live_sha": Json.String(Sync.sha256_text(live_doc)),
+          "live_rel": Json.String(Sync.page_rel_path(col.slug, pg.title, pg.id))
+        })
+      )
+    end
   )
 end
 
 fn sync_push_direct_update(
   auth: AuthContext,
-  old_page: Page,
-  col: Collection,
-  old_blocks: List(Block),
-  cur_bp_opt: Option(BlueprintDef),
-  cur_pm_opt: Option(PageBlueprintMeta),
+  pid: Text,
+  col_id: Text,
+  col_slug: Text,
   fm: Blueprints.ParsedFrontmatter,
   expected_ver: Int,
   reason_str: Text,
@@ -597,7 +621,7 @@ fn sync_push_direct_update(
     rng,
     clock,
     "vellum.page.indexed",
-    Json.Object({"page_id": Json.String(old_page.id)})
+    Json.Object({"page_id": Json.String(pid)})
   )
   meta = Ledger.WriteMeta(
     principal: auth.principal.handle,
@@ -610,20 +634,31 @@ fn sync_push_direct_update(
     Db.ledger_db_path,
     Db.vellum_schema(),
     meta,
-    "vellum sync updated #{old_page.id}",
+    "vellum sync updated #{pid}",
     Json.Object({
-      "page_id": Json.String(old_page.id),
+      "page_id": Json.String(pid),
       "expected_version": Json.int(expected_ver)
     }),
     Db.map_ledger_error,
     fn(tx)
       t1 = try tx_authorize_if_agent(tx, auth, "write_direct", now)
-      live = case try Table.tx_get(t1, Db.pages_table(), old_page.id).map_error(Db.map_table_error)
+      live = case try Table.tx_get(t1, Db.pages_table(), pid).map_error(Db.map_table_error)
         Some(p) if p.archived_at == None: p
-        Some(_) | None: return Error(Missing(entity: "page", id: old_page.id))
+        Some(_) | None: return Error(Missing(entity: "page", id: pid))
       end
       if live.version != expected_ver
         return Error(Conflict(reason: "version_mismatch"))
+      end
+
+      (cur_bp_opt, cur_pm_opt) = case try Table.tx_get(t1, Db.page_meta_table(), live.id).map_error(
+        Db.map_table_error
+      )
+        Some(pm):
+          bp = try Table.tx_get(t1, Db.blueprints_table(), pm.blueprint_id).map_error(
+            Db.map_table_error
+          )
+          (bp, Some(pm))
+        None: (None, None)
       end
 
       (next_bp_opt, next_pm_opt) = case fm.blueprint_slug
@@ -668,43 +703,62 @@ fn sync_push_direct_update(
       )
       t3 = try Db.tx_save_page_and_blocks(t2, bumped_page, reconciled)
       (t4, _jid) = try Jobs.tx_put(t3, idx_job).map_error(Db.map_table_error)
-      Ok((t4, (bumped_page, reconciled, next_bp_opt, next_pm_opt)))
+      doc = Blueprints.to_yaml_frontmatter(
+        bumped_page,
+        next_bp_opt,
+        next_pm_opt,
+        Blocks.to_anchored_markdown(reconciled)
+      )
+      rel = Sync.page_rel_path(col_slug, bumped_page.title, bumped_page.id)
+      Ok(
+        (
+          t4,
+          Json.Object({
+            "page": bumped_page.to_json,
+            "page_id": Json.String(bumped_page.id),
+            "version": Json.int(bumped_page.version),
+            "rel_path": Json.String(rel),
+            "markdown_document": Json.String(doc),
+            "content_sha256": Json.String(Sync.sha256_text(doc))
+          })
+        )
+      )
     end
   )
 
   case tx_res
     Error(Conflict(reason: _)):
       # Concurrent edit landed before lock acquisition: route safely to Change Proposal!
-      sync_push_stage_proposal(
+      sp = try prep_sync_stage_json(auth, pid, fm, Id.ulid(rng, clock), prov, files)
+      sync_push_stage_proposal_from_json(
         auth,
-        old_page,
-        col,
-        old_blocks,
-        cur_bp_opt,
-        cur_pm_opt,
-        fm,
+        sp.get("page") or Json.Null,
+        pid,
+        sp.text_at("page_title") or "",
+        sp.int_at("page_version") or expected_ver,
+        sp.text_at("col_id") or col_id,
+        sp.text_at("col_slug") or col_slug,
+        sp.int_at("ops_size") or 0,
+        sp.get("wargs") or Json.Null,
+        sp.text_at("live_doc") or "",
+        sp.text_at("live_sha") or "",
+        sp.text_at("live_rel") or "",
         expected_ver,
         "version_mismatch",
         reason_str,
-        prov,
         files,
         rng,
         clock,
         now
       )
     Error(e): Error(e)
-    Ok((saved_page, saved_blocks, bp_opt, pm_opt)):
-      doc = Blueprints.to_yaml_frontmatter(
-        saved_page,
-        bp_opt,
-        pm_opt,
-        Blocks.to_anchored_markdown(saved_blocks)
-      )
-      rel = Sync.page_rel_path(col.slug, saved_page.title, saved_page.id)
+    Ok(res_j):
+      saved_pid = res_j.text_at("page_id") or pid
+      saved_ver = res_j.int_at("version") or (expected_ver + 1)
       ev = Json.Object({
-        "page_id": Json.String(saved_page.id),
-        "collection_id": Json.String(col.id),
-        "version": Json.int(saved_page.version),
+        "page_id": Json.String(saved_pid),
+        "collection_id": Json.String(col_id),
+        "version": Json.int(saved_ver),
         "actor": Json.String(auth.principal.handle),
         "reason": Json.String(reason_str)
       })
@@ -713,14 +767,14 @@ fn sync_push_direct_update(
           200,
           Json.Object({
             "outcome": Json.String("applied"),
-            "page": saved_page.to_json,
-            "rel_path": Json.String(rel),
-            "markdown_document": Json.String(doc),
-            "content_sha256": Json.String(Sync.sha256_text(doc)),
+            "page": res_j.get("page") or Json.Null,
+            "rel_path": res_j.get("rel_path") or Json.Null,
+            "markdown_document": res_j.get("markdown_document") or Json.Null,
+            "content_sha256": res_j.get("content_sha256") or Json.Null,
             "proposal": Json.Null
           })
-        ).with_sse_publish_json("page:#{saved_page.id}", "page.blocks_updated", ev)
-          .with_sse_publish_json("collection:#{col.id}", "page.blocks_updated", ev)
+        ).with_sse_publish_json("page:#{saved_pid}", "page.blocks_updated", ev)
+          .with_sse_publish_json("collection:#{col_id}", "page.blocks_updated", ev)
       )
   end
 end
@@ -730,12 +784,20 @@ end
 fn sync_push(
   req: Api.Request,
   auth: AuthContext,
-  input: SyncPushInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = SyncPushInput(
+    page_id: rj.text_at("page_id"),
+    collection_id: rj.text_at("collection_id"),
+    rel_path: try VaultOps.req_text(rj, "rel_path"),
+    markdown_document: try VaultOps.req_text(rj, "markdown_document"),
+    expected_version: rj.int_at("expected_version"),
+    reason: rj.text_at("reason")
+  )
   if auth.principal.suspended
     return Error(Forbidden(reason: "principal '#{auth.principal.handle}' is suspended"))
   end
@@ -759,7 +821,8 @@ fn sync_push(
     return Error(Missing(entity: "page", id: pid))
   end
 
-  (old_page, col, old_blocks, bp_opt, pm_opt) = try Ledger.read_locked(
+  stage_id_prefix = Id.ulid(rng, clock)
+  pre_json = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -780,28 +843,76 @@ fn sync_push(
         Some(col_rec): col_rec
         None: return Error(Missing(entity: "collection", id: pg.collection_id))
       end
-      blks = try Db.load_page_blocks(store, pg.id)
-      (bp_o, pm_o) = try load_page_bp_meta(store, pg.id)
-      Ok((pg, c, blks, bp_o, pm_o))
+      expected_ver_in = case input.expected_version
+        Some(v): v
+        None: fm.version or 0
+      end
+      version_conflict? = pg.version != expected_ver_in
+      can_direct? = Policy.can_write_page_direct?(auth, c) and
+        Policy.action_permitted?(auth, "write_direct")
+      if (not version_conflict?) and can_direct?
+        Ok(
+          Json.Object({
+            "direct": Json.Boolean(true),
+            "col_id": Json.String(c.id),
+            "col_slug": Json.String(c.slug)
+          })
+        )
+      else
+        blks = try Db.load_page_blocks(store, pg.id)
+        (bp_o, pm_o) = try load_page_bp_meta(store, pg.id)
+        incoming = Blocks.reconcile_blocks_from_markdown(
+          pg.id,
+          blks,
+          fm.body_markdown,
+          prov,
+          stage_id_prefix
+        )
+        (ops, new_ids) = Blocks.diff_blocks_to_ops(blks, incoming)
+        live_doc = Blueprints.to_yaml_frontmatter(pg, bp_o, pm_o, Blocks.to_anchored_markdown(blks))
+        wargs = WorldPatchArgs(
+          page_id: pg.id,
+          ops: ops,
+          new_ids: new_ids,
+          provenance: prov,
+          expected_versions: {},
+          updated_at: now
+        )
+        conflict_reason = if version_conflict?: "version_mismatch" else: "policy_requires_proposal"
+        Ok(
+          Json.Object({
+            "direct": Json.Boolean(false),
+            "page": pg.to_json,
+            "page_id": Json.String(pg.id),
+            "page_title": Json.String(pg.title),
+            "page_version": Json.int(pg.version),
+            "col_id": Json.String(c.id),
+            "col_slug": Json.String(c.slug),
+            "expected_ver": Json.int(expected_ver_in),
+            "conflict_reason": Json.String(conflict_reason),
+            "ops_size": Json.int(ops.size),
+            "wargs": wargs.to_json,
+            "live_doc": Json.String(live_doc),
+            "live_sha": Json.String(Sync.sha256_text(live_doc)),
+            "live_rel": Json.String(Sync.page_rel_path(c.slug, pg.title, pg.id))
+          })
+        )
+      end
     end
   )
 
-  expected_ver = case input.expected_version
-    Some(v): v
-    None: fm.version or 0
-  end
-  version_conflict? = old_page.version != expected_ver
-  can_direct? = Policy.can_write_page_direct?(auth, col) and
-    Policy.action_permitted?(auth, "write_direct")
-
-  if (not version_conflict?) and can_direct?
+  col_id = pre_json.text_at("col_id") or ""
+  col_slug = pre_json.text_at("col_slug") or ""
+  if pre_json.bool_at("direct") == Some(true)
+    expected_ver = case input.expected_version
+      Some(v): v
+      None: fm.version or 0
+    end
     sync_push_direct_update(
       auth,
-      old_page,
-      col,
-      old_blocks,
-      bp_opt,
-      pm_opt,
+      pid,
+      col_id,
+      col_slug,
       fm,
       expected_ver,
       reason_str,
@@ -812,23 +923,22 @@ fn sync_push(
       now
     )
   else
-    conflict_reason = if version_conflict?
-      "version_mismatch"
-    else
-      "policy_requires_proposal"
-    end
-    sync_push_stage_proposal(
+    sync_push_stage_proposal_from_json(
       auth,
-      old_page,
-      col,
-      old_blocks,
-      bp_opt,
-      pm_opt,
-      fm,
-      expected_ver,
-      conflict_reason,
+      pre_json.get("page") or Json.Null,
+      pid,
+      pre_json.text_at("page_title") or "",
+      pre_json.int_at("page_version") or 0,
+      col_id,
+      col_slug,
+      pre_json.int_at("ops_size") or 0,
+      pre_json.get("wargs") or Json.Null,
+      pre_json.text_at("live_doc") or "",
+      pre_json.text_at("live_sha") or "",
+      pre_json.text_at("live_rel") or "",
+      pre_json.int_at("expected_ver") or 0,
+      pre_json.text_at("conflict_reason") or "version_mismatch",
       reason_str,
-      prov,
       files,
       rng,
       clock,

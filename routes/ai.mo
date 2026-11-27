@@ -283,7 +283,10 @@ fn fetch_embedding(cfg: EmbedConfig, input_text: Text, net: Network) : Result(
   if http_res.status < 200 or http_res.status >= 300
     return Error(ServerFailed(reason: "Embedding provider returned HTTP #{http_res.status}"))
   end
-  parsed = try Json.decode_strict[Json](http_res.body).map_error(fn(e)
+  raw_txt = try http_res.body.decode_utf8.or_fail(
+    ServerFailed(reason: "Embedding JSON response is not valid UTF-8")
+  )
+  parsed = try Json.parse(raw_txt).map_error(fn(e)
     ServerFailed(reason: "invalid embedding JSON response: #{e.to_text}")
   end)
   raw_list = case parsed.list_at("data.0.embedding")
@@ -360,7 +363,10 @@ fn build_llm_request(cfg: AiConfig, system_prompt: Text, user_prompt: Text) : Ht
 end
 
 fn extract_llm_text(cfg: AiConfig, body: Bytes) : Result(Text, AppError)
-  parsed = try Json.decode_strict[Json](body).map_error(fn(e)
+  raw_txt = try body.decode_utf8.or_fail(
+    ServerFailed(reason: "LLM JSON response is not valid UTF-8")
+  )
+  parsed = try Json.parse(raw_txt).map_error(fn(e)
     ServerFailed(reason: "invalid LLM JSON response: #{e.to_text}")
   end)
   txt_opt = if cfg.provider == "anthropic"
@@ -503,12 +509,18 @@ end
 fn ask_workspace(
   req: Api.Request,
   auth: AuthContext,
-  input: AskWorkspaceInput,
   rf: ReadFiles,
   env: Env,
   net: Network
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = AskWorkspaceInput(
+    question: try VaultOps.req_text(rj, "question"),
+    collection_id: rj.text_at("collection_id"),
+    max_sources: rj.int_at("max_sources"),
+    stream: rj.bool_at("stream")
+  )
   if not Policy.action_permitted?(auth, "read")
     return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'read'"))
   end
@@ -552,8 +564,8 @@ fn ask_workspace(
     env,
     net
   )
-  (citations, context_lines) = if search_out.results.empty? or not rf.exists?(Db.ledger_db_path)
-    ([], [])
+  ask_ctx = if search_out.results.empty? or not rf.exists?(Db.ledger_db_path)
+    Json.Object({"citations": Json.Array([]), "ctx": Json.Array([])})
   else
     try Ledger.read_locked(
       rf,
@@ -594,10 +606,12 @@ fn ask_workspace(
           )
           ctx = ctx.append("[#{hit.title} §#{blk_id}]\n#{Blocks.blocks_plain_text(blks)}")
         end
-        Ok((cites, ctx))
+        Ok(Json.Object({"citations": Json.Array(cites), "ctx": ctx.to_json}))
       end
     )
   end
+  citations = ask_ctx.list_at("citations") or []
+  context_lines = VaultOps.json_text_list_raw(ask_ctx, "ctx")
 
   sys_prompt = "You are Vellum Workspace Assistant. Answer strictly from the provided workspace excerpts and cite [Title §block_id]."
   ctx_body = if context_lines.empty?
@@ -657,7 +671,6 @@ end
 fn draft_blocks(
   req: Api.Request,
   auth: AuthContext,
-  input: DraftBlockInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock,
@@ -665,6 +678,12 @@ fn draft_blocks(
   net: Network
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = DraftBlockInput(
+    page_id: try VaultOps.req_text(rj, "page_id"),
+    instruction: try VaultOps.req_text(rj, "instruction"),
+    as_proposal: rj.bool_at("as_proposal")
+  )
   inst = input.instruction.trim
   if inst.empty?
     return Error(BadInput(reason: "instruction must not be empty"))
@@ -678,7 +697,7 @@ fn draft_blocks(
     Error(_): None
   end
   local_only_ai? = VaultOps.env_ai_local_only?(env)
-  (page, existing_blocks) = try Ledger.read_locked(
+  draft_ctx = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -701,15 +720,26 @@ fn draft_blocks(
         None: Unit
       end
       blks = try Db.load_page_blocks(store, pg.id)
-      Ok((pg, blks))
+      Ok(
+        Json.Object({
+          "page_id": Json.String(pg.id),
+          "collection_id": Json.String(pg.collection_id),
+          "title": Json.String(pg.title),
+          "anchored": Json.String(Blocks.to_anchored_markdown(blks)),
+          "last_block_id": blks.last.map(fn(b) b.id end).to_json
+        })
+      )
     end
   )
+  page_id = draft_ctx.text_at("page_id") or input.page_id
+  page_collection_id = draft_ctx.text_at("collection_id") or ""
+  page_title = draft_ctx.text_at("title") or ""
+  anchored_md = draft_ctx.text_at("anchored") or ""
+  var prev_anchor = draft_ctx.text_at("last_block_id")
 
   cfg = try ai_config(env)
   sys_prompt = "You draft concise Markdown sections for Vellum documents. Output Markdown blocks only."
-  usr_prompt = "Page: #{page.title}\nExisting content:\n#{Blocks.to_anchored_markdown(
-    existing_blocks
-  )}\n\nInstruction: #{inst}"
+  usr_prompt = "Page: #{page_title}\nExisting content:\n#{anchored_md}\n\nInstruction: #{inst}"
   http_res = try Http.send(build_llm_request(cfg, sys_prompt, usr_prompt), net).map_error(fn(e)
     ServerFailed(reason: "LLM HTTP request failed: #{e.to_text}")
   end)
@@ -721,7 +751,7 @@ fn draft_blocks(
   now = clock.now
   draft_prefix = "blk_#{Id.ulid(rng, clock)}"
   prov = make_provenance(auth, "AI draft: #{inst}", now)
-  parsed_blocks = Blocks.parse_markdown_blocks(page.id, draft_md, prov, draft_prefix)
+  parsed_blocks = Blocks.parse_markdown_blocks(page_id, draft_md, prov, draft_prefix)
 
   if input.as_proposal != Some(true)
     return Ok(
@@ -736,7 +766,7 @@ fn draft_blocks(
     )
   end
 
-  try Policy.require_collection_access(auth, "propose", page.collection_id)
+  try Policy.require_collection_access(auth, "propose", page_collection_id)
   if parsed_blocks.empty?
     return Error(BadInput(reason: "LLM returned empty draft"))
   end
@@ -755,7 +785,6 @@ fn draft_blocks(
 
   var new_ids = []
   var ops = []
-  var prev_anchor = existing_blocks.last.map(fn(b) b.id end)
   for db_item in parsed_blocks
     nid = "blk_#{Id.ulid(rng, clock)}"
     new_ids = new_ids.append(nid)
@@ -773,11 +802,11 @@ fn draft_blocks(
   pm = ProposalMeta(
     id: prop_id,
     world_id: world_id,
-    collection_id: page.collection_id,
-    target_page_id: page.id,
+    collection_id: page_collection_id,
+    target_page_id: page_id,
     target_database_id: None,
     branch_kind: "proposal",
-    title: "AI Draft: #{page.title}",
+    title: "AI Draft: #{page_title}",
     reason: "AI inline draft: #{inst}",
     author_id: auth.principal.id,
     author_handle: auth.principal.handle,
@@ -789,7 +818,7 @@ fn draft_blocks(
     decided_at: None
   )
   wargs = WorldPatchArgs(
-    page_id: page.id,
+    page_id: page_id,
     ops: ops,
     new_ids: new_ids,
     provenance: prov,
@@ -811,7 +840,7 @@ fn draft_blocks(
   meta = Ledger.WriteMeta(
     principal: auth.principal.handle,
     action: "ai.draft_proposal",
-    reason: "open AI draft proposal on #{page.id}",
+    reason: "open AI draft proposal on #{page_id}",
     at: now
   )
   saved = try Ledger.transact_locked(
@@ -820,7 +849,7 @@ fn draft_blocks(
     Db.vellum_schema(),
     meta,
     "created AI draft proposal #{prop_id}",
-    Json.Object({"proposal_id": Json.String(prop_id), "page_id": Json.String(page.id)}),
+    Json.Object({"proposal_id": Json.String(prop_id), "page_id": Json.String(page_id)}),
     Db.map_ledger_error,
     fn(tx)
       t1 = if auth.principal.kind == Agent
@@ -992,14 +1021,17 @@ fn run_garden(auth: AuthContext, rf: ReadFiles, clock: Clock) : Result(Api.Respo
       )
     )
   end
-  rep = try Ledger.read_locked(
+  rep_json = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
-    fn(db) scan_garden_report(Ledger.store(db), Some(auth), now) end
+    fn(db)
+      rep = try scan_garden_report(Ledger.store(db), Some(auth), now)
+      Ok(rep.to_json)
+    end
   )
-  Ok(json_ok(200, rep.to_json))
+  Ok(json_ok(200, rep_json))
 end
 
 ## Scheduled Knowledge Gardening scan (`job "vellum.garden" ... every 1.hour`), read-only over `vellum.modb`.
@@ -1008,37 +1040,58 @@ fn garden_job(_payload: Json, files: Files, clock: Clock) : Result(Unit, AppErro
     return Ok(Unit)
   end
   now = clock.now
-  _rep = try Ledger.read_locked(
+  Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
-    fn(db) scan_garden_report(Ledger.store(db), None, now) end
+    fn(db)
+      _rep = try scan_garden_report(Ledger.store(db), None, now)
+      Ok(Unit)
+    end
   )
-  Ok(Unit)
+end
+
+fn citations_from_json_list(items: List(Json)) : List(Citation)
+  var out = []
+  for item in items
+    out = out.append(
+      Citation(
+        source_kind: item.text_at("source_kind") or "page",
+        source_ref: item.text_at("source_ref") or "",
+        label: item.text_at("label") or "",
+        excerpt: item.text_at("excerpt")
+      )
+    )
+  end
+  out
 end
 
 fn garden_draft_note(
   kind: Text,
-  target_pg: Page,
-  target_blks: List(Block),
-  rel_pg_opt: Option(Page),
-  rel_blk_opt: Option(Block),
+  info: Json,
   custom_reason: Text,
   use_det?: Bool,
   env: Env,
   net: Network
 ) : Result((Text, Text), AppError)
-  det_note = case (kind, rel_pg_opt, rel_blk_opt)
-    ("citation_drift", Some(rp), Some(rb)):
-      "Gardener sync review: cited source [#{rp.title} §#{rb.id}] (v#{rb.version}) changed:\n#{rb
-        .markdown}"
-    ("duplicate_contradiction", Some(rp), _):
-      "Gardener contradiction check: reconcile overlap/conflict with '#{rp.title}' (#{rp.id}). #{custom_reason}"
-    (_, Some(rp), _):
-      "Gardener review suggested against '#{rp.title}': #{custom_reason}"
-    (_, None, _):
-      "Gardener verification reminder for '#{target_pg.title}': #{custom_reason}"
+  t_title = info.text_at("target_title") or ""
+  target_ctx = info.text_at("target_excerpt") or ""
+  rel_pg_title_opt = info.text_at("rel_page_title")
+  rel_pg_id_opt = info.text_at("rel_page_id")
+  rel_blk_id_opt = info.text_at("rel_block_id")
+  rel_blk_ver = info.int_at("rel_block_version") or 1
+  rel_blk_md = info.text_at("rel_block_markdown") or ""
+
+  det_note = case (kind, rel_pg_title_opt, rel_pg_id_opt, rel_blk_id_opt)
+    ("citation_drift", Some(rp_t), _, Some(rb_id)):
+      "Gardener sync review: cited source [#{rp_t} §#{rb_id}] (v#{rel_blk_ver}) changed:\n#{rel_blk_md}"
+    ("duplicate_contradiction", Some(rp_t), Some(rp_id), _):
+      "Gardener contradiction check: reconcile overlap/conflict with '#{rp_t}' (#{rp_id}). #{custom_reason}"
+    (_, Some(rp_t), _, _):
+      "Gardener review suggested against '#{rp_t}': #{custom_reason}"
+    (_, _, _, _):
+      "Gardener verification reminder for '#{t_title}': #{custom_reason}"
   end
   if use_det?
     return Ok((det_note, "deterministic-gardener"))
@@ -1047,13 +1100,13 @@ fn garden_draft_note(
     Error(_): Ok((det_note, "deterministic-gardener"))
     Ok(cfg):
       sys = "You are Vellum Knowledge Gardener. Draft a crisp, actionable 1-2 sentence Markdown reconciliation callout for a Modb.World Change Proposal. Return plain Markdown text only."
-      target_ctx = Blocks.blocks_plain_text(target_blks.take(6))
-      rel_ctx = case (rel_pg_opt, rel_blk_opt)
-        (Some(rp), Some(rb)): "\nCited Block [#{rp.title} §#{rb.id} v#{rb.version}]:\n#{rb.markdown}"
-        (Some(rp), None): "\nRelated Page [#{rp.title} (#{rp.id})]"
-        (_, _): ""
+      rel_ctx = case (rel_pg_title_opt, rel_pg_id_opt, rel_blk_id_opt)
+        (Some(rp_t), _, Some(rb_id)):
+          "\nCited Block [#{rp_t} §#{rb_id} v#{rel_blk_ver}]:\n#{rel_blk_md}"
+        (Some(rp_t), Some(rp_id), None): "\nRelated Page [#{rp_t} (#{rp_id})]"
+        (_, _, _): ""
       end
-      usr = "Kind: #{kind}\nTarget Page: #{target_pg.title}\nReason: #{custom_reason}\nTarget Excerpt:\n#{target_ctx}#{rel_ctx}"
+      usr = "Kind: #{kind}\nTarget Page: #{t_title}\nReason: #{custom_reason}\nTarget Excerpt:\n#{target_ctx}#{rel_ctx}"
       http_res = try Http.send(build_llm_request(cfg, sys, usr), net).map_error(fn(e)
         ServerFailed(reason: "Gardener LLM request failed: #{e.to_text}")
       end)
@@ -1074,7 +1127,6 @@ end
 fn propose_garden_fix(
   req: Api.Request,
   auth: AuthContext,
-  input: GardenProposeInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock,
@@ -1082,6 +1134,16 @@ fn propose_garden_fix(
   net: Network
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = GardenProposeInput(
+    kind: try VaultOps.req_text(rj, "kind"),
+    target_page_id: try VaultOps.req_text(rj, "target_page_id"),
+    target_block_id: rj.text_at("target_block_id"),
+    related_page_id: rj.text_at("related_page_id"),
+    related_block_id: rj.text_at("related_block_id"),
+    reason: rj.text_at("reason"),
+    deterministic_fallback: rj.bool_at("deterministic_fallback")
+  )
   kind = input.kind.trim.ascii_lowercase
   if kind != "citation_drift" and kind != "duplicate_contradiction" and kind != "stale_refresh"
     return Error(
@@ -1099,7 +1161,7 @@ fn propose_garden_fix(
     Error(_): None
   end
   local_only_ai? = VaultOps.env_ai_local_only?(env)
-  (target_pg, target_blks, rel_pg_opt, rel_blk_opt) = try Ledger.read_locked(
+  g_ctx = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -1151,9 +1213,41 @@ fn propose_garden_fix(
           end
         Some(_) | None: None
       end
-      Ok((tpg, tblks, rpg_opt, rblk_opt))
+      var tb_ver_opt = None
+      var tb_md_opt = None
+      case input.target_block_id
+        Some(tbid) if not tbid.trim.empty?:
+          case tblks.find(fn(b) b.id == tbid.trim end)
+            Some(tb):
+              tb_ver_opt = Some(tb.version)
+              tb_md_opt = Some(tb.markdown)
+            None: Unit
+          end
+        Some(_) | None: Unit
+      end
+      last_bid_opt = tblks.last.map(fn(b) b.id end)
+      Ok(
+        Json.Object({
+          "target_id": Json.String(tpg.id),
+          "target_title": Json.String(tpg.title),
+          "target_col_id": Json.String(tpg.collection_id),
+          "target_excerpt": Json.String(Blocks.blocks_plain_text(tblks.take(6))),
+          "last_block_id": last_bid_opt.to_json,
+          "target_block_ver": tb_ver_opt.to_json,
+          "target_block_md": tb_md_opt.to_json,
+          "rel_page_id": rpg_opt.map(fn(p) p.id end).to_json,
+          "rel_page_title": rpg_opt.map(fn(p) p.title end).to_json,
+          "rel_block_id": rblk_opt.map(fn(b) b.id end).to_json,
+          "rel_block_page_id": rblk_opt.map(fn(b) b.page_id end).to_json,
+          "rel_block_version": rblk_opt.map(fn(b) b.version end).to_json,
+          "rel_block_markdown": rblk_opt.map(fn(b) b.markdown end).to_json
+        })
+      )
     end
   )
+  target_pg_id = g_ctx.text_at("target_id") or input.target_page_id
+  target_pg_title = g_ctx.text_at("target_title") or ""
+  target_col_id = g_ctx.text_at("target_col_id") or ""
 
   reason_str = case input.reason
     Some(r) if not r.trim.empty?: r.trim
@@ -1161,10 +1255,7 @@ fn propose_garden_fix(
   end
   (note_md, model_label) = try garden_draft_note(
     kind,
-    target_pg,
-    target_blks,
-    rel_pg_opt,
-    rel_blk_opt,
+    g_ctx,
     reason_str,
     input.deterministic_fallback or false,
     env,
@@ -1172,28 +1263,28 @@ fn propose_garden_fix(
   )
 
   var cits = []
-  case rel_blk_opt
-    Some(rb):
-      src_title = rel_pg_opt.map(fn(p) p.title end) or rb.page_id
+  case g_ctx.text_at("rel_block_id")
+    Some(rb_id):
+      src_title = g_ctx.text_at("rel_page_title") or (g_ctx.text_at("rel_block_page_id") or "")
       cits = cits.append(
         Citation(
           source_kind: "block",
-          source_ref: rb.id,
-          label: "#{src_title} §#{rb.id}",
-          excerpt: Some(rb.markdown)
+          source_ref: rb_id,
+          label: "#{src_title} §#{rb_id}",
+          excerpt: g_ctx.text_at("rel_block_markdown")
         )
       )
     None:
-      case rel_pg_opt
-        Some(rp): cits = cits.append(
+      case (g_ctx.text_at("rel_page_id"), g_ctx.text_at("rel_page_title"))
+        (Some(rp_id), Some(rp_t)): cits = cits.append(
           Citation(
             source_kind: "page",
-            source_ref: "/p/#{rp.id}",
-            label: rp.title,
+            source_ref: "/p/#{rp_id}",
+            label: rp_t,
             excerpt: None
           )
         )
-        None: Unit
+        (_, _): Unit
       end
   end
 
@@ -1219,30 +1310,26 @@ fn propose_garden_fix(
     citations: cits,
     updated_at: now
   )
-  target_blk_opt = case input.target_block_id
-    Some(tbid) if not tbid.trim.empty?: target_blks.find(fn(b) b.id == tbid.trim end)
-    Some(_) | None: None
-  end
-  (ops, new_ids) = case target_blk_opt
-    Some(tb) if kind == "citation_drift":
+  (ops, new_ids) = case (input.target_block_id, g_ctx.int_at("target_block_ver"), g_ctx.text_at("target_block_md"))
+    (Some(tbid), Some(tbv), Some(tbm)) if kind == "citation_drift" and not tbid.trim.empty?:
       (
         [
           ReplaceBlock(
-            block_id: tb.id,
-            expected_version: tb.version,
+            block_id: tbid.trim,
+            expected_version: tbv,
             kind: None,
-            markdown: "#{tb.markdown}\n\n#{note_md}"
+            markdown: "#{tbm}\n\n#{note_md}"
           )
         ],
         []
       )
-    Some(_) | None:
+    (_, _, _):
       new_bid = "blk_#{Id.ulid(rng, clock)}"
       tone = if kind == "duplicate_contradiction": "WARNING" else: "NOTE"
       (
         [
           InsertBlockAfter(
-            after_block_id: target_blks.last.map(fn(b) b.id end),
+            after_block_id: g_ctx.text_at("last_block_id"),
             parent_block_id: None,
             kind: Callout(tone: tone, icon: Some("leaf")),
             markdown: note_md
@@ -1253,7 +1340,7 @@ fn propose_garden_fix(
   end
 
   wargs = WorldPatchArgs(
-    page_id: target_pg.id,
+    page_id: target_pg_id,
     ops: ops,
     new_ids: new_ids,
     provenance: prop_prov,
@@ -1273,17 +1360,17 @@ fn propose_garden_fix(
   ).map_error(Db.map_world_error)
 
   prop_title = if kind == "citation_drift"
-    "Gardener Drift: #{target_pg.title}"
+    "Gardener Drift: #{target_pg_title}"
   else if kind == "duplicate_contradiction"
-    "Gardener Reconcile: #{target_pg.title}"
+    "Gardener Reconcile: #{target_pg_title}"
   else
-    "Gardener Refresh: #{target_pg.title}"
+    "Gardener Refresh: #{target_pg_title}"
   end
   pm = ProposalMeta(
     id: prop_id,
     world_id: world_id,
-    collection_id: target_pg.collection_id,
-    target_page_id: target_pg.id,
+    collection_id: target_col_id,
+    target_page_id: target_pg_id,
     target_database_id: None,
     branch_kind: "proposal",
     title: prop_title,
@@ -1311,7 +1398,7 @@ fn propose_garden_fix(
     "staged gardener proposal #{pm.id}",
     Json.Object({
       "proposal_id": Json.String(pm.id),
-      "page_id": Json.String(target_pg.id),
+      "page_id": Json.String(target_pg_id),
       "kind": Json.String(kind)
     }),
     Db.map_ledger_error,
@@ -1331,8 +1418,8 @@ fn propose_garden_fix(
 
   prop_ev = Json.Object({
     "proposal_id": Json.String(saved.id),
-    "page_id": Json.String(target_pg.id),
-    "collection_id": Json.String(target_pg.collection_id),
+    "page_id": Json.String(target_pg_id),
+    "collection_id": Json.String(target_col_id),
     "title": Json.String(saved.title),
     "actor": Json.String(auth.principal.handle)
   })
@@ -1342,12 +1429,12 @@ fn propose_garden_fix(
       Json.Object({
         "proposal": saved.to_json,
         "kind": Json.String(kind),
-        "target_page_id": Json.String(target_pg.id),
+        "target_page_id": Json.String(target_pg_id),
         "citations": cits.to_json,
         "model": Json.String(model_label)
       })
-    ).with_sse_publish_json("page:#{target_pg.id}", "proposal.opened", prop_ev)
-      .with_sse_publish_json("collection:#{target_pg.collection_id}", "proposal.opened", prop_ev)
+    ).with_sse_publish_json("page:#{target_pg_id}", "proposal.opened", prop_ev)
+      .with_sse_publish_json("collection:#{target_col_id}", "proposal.opened", prop_ev)
   )
 end
 
@@ -1386,7 +1473,6 @@ end
 fn refresh_ai_brief(
   req: Api.Request,
   auth: AuthContext,
-  input: RefreshAiBriefInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock,
@@ -1394,6 +1480,12 @@ fn refresh_ai_brief(
   net: Network
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = RefreshAiBriefInput(
+    page_id: try VaultOps.req_text(rj, "page_id"),
+    block_id: try VaultOps.req_text(rj, "block_id"),
+    deterministic_fallback: rj.bool_at("deterministic_fallback")
+  )
   if auth.principal.suspended
     return Error(Forbidden(reason: "principal '#{auth.principal.handle}' is suspended"))
   end
@@ -1406,7 +1498,7 @@ fn refresh_ai_brief(
     Error(_): None
   end
   local_only_ai? = VaultOps.env_ai_local_only?(env)
-  (pg, target_blk, brief_prompt, scope_opt, sum_lines, cits) = try Ledger.read_locked(
+  brief_ctx = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -1493,9 +1585,30 @@ fn refresh_ai_brief(
           )
         end
       end
-      Ok((pg, tblk, pr_txt, sc_opt, lines, citations))
+      Ok(
+        Json.Object({
+          "page_id": Json.String(pg.id),
+          "page_title": Json.String(pg.title),
+          "collection_id": Json.String(pg.collection_id),
+          "block_id": Json.String(tblk.id),
+          "block_version": Json.int(tblk.version),
+          "brief_prompt": Json.String(pr_txt),
+          "scope": sc_opt.to_json,
+          "sum_lines": lines.to_json,
+          "citations": citations.to_json
+        })
+      )
     end
   )
+  pg_id = brief_ctx.text_at("page_id") or input.page_id.trim
+  pg_title = brief_ctx.text_at("page_title") or ""
+  pg_collection_id = brief_ctx.text_at("collection_id") or ""
+  target_blk_id = brief_ctx.text_at("block_id") or input.block_id.trim
+  target_blk_ver = brief_ctx.int_at("block_version") or 1
+  brief_prompt = brief_ctx.text_at("brief_prompt") or ""
+  scope_opt = brief_ctx.text_at("scope")
+  sum_lines = VaultOps.json_text_list_raw(brief_ctx, "sum_lines")
+  cits = citations_from_json_list(brief_ctx.list_at("citations") or [])
 
   digest = if sum_lines.empty?
     "- No accessible workspace summaries in scope yet."
@@ -1506,7 +1619,7 @@ fn refresh_ai_brief(
   (brief_md, model_name) = case ai_config(env)
     Ok(cfg):
       sys_prompt = "You maintain a concise Living Brief card inside a Vellum knowledge document. Synthesize strictly from the provided workspace summaries using crisp Markdown bullet points."
-      usr_prompt = "Document: #{pg.title}\nBrief Goal: #{brief_prompt}\n\nAccessible Living Summaries:\n#{digest}"
+      usr_prompt = "Document: #{pg_title}\nBrief Goal: #{brief_prompt}\n\nAccessible Living Summaries:\n#{digest}"
       http_res = try Http.send(build_llm_request(cfg, sys_prompt, usr_prompt), net).map_error(fn(e)
         ServerFailed(reason: "AI brief LLM request failed: #{e.to_text}")
       end)
@@ -1539,8 +1652,8 @@ fn refresh_ai_brief(
   next_kind = AiBrief(prompt: brief_prompt, source_scope: scope_opt, refreshed_at: Some(now.to_text))
   ops = [
     ReplaceBlock(
-      block_id: target_blk.id,
-      expected_version: target_blk.version,
+      block_id: target_blk_id,
+      expected_version: target_blk_ver,
       kind: Some(next_kind),
       markdown: brief_md
     )
@@ -1559,11 +1672,11 @@ fn refresh_ai_brief(
   ).map_error(Db.map_world_error)
 
   wargs = WorldPatchArgs(
-    page_id: pg.id,
+    page_id: pg_id,
     ops: ops,
     new_ids: [],
     provenance: prov,
-    expected_versions: {target_blk.id: target_blk.version},
+    expected_versions: {target_blk_id: target_blk_ver},
     updated_at: now
   )
   _step = try World.world_call_locked(
@@ -1581,12 +1694,12 @@ fn refresh_ai_brief(
   pm = ProposalMeta(
     id: prop_id,
     world_id: world_id,
-    collection_id: pg.collection_id,
-    target_page_id: pg.id,
+    collection_id: pg_collection_id,
+    target_page_id: pg_id,
     target_database_id: None,
     branch_kind: "proposal",
     title: "Refresh Living Brief: #{brief_prompt}",
-    reason: "Proposals-only Living AI Brief refresh on '#{target_blk.id}'",
+    reason: "Proposals-only Living AI Brief refresh on '#{target_blk_id}'",
     author_id: auth.principal.id,
     author_handle: auth.principal.handle,
     grant_id: auth.grant_id,
@@ -1600,7 +1713,7 @@ fn refresh_ai_brief(
   meta = Ledger.WriteMeta(
     principal: auth.principal.handle,
     action: "ai.refresh_brief_proposal",
-    reason: "stage refreshed ai-brief proposal on #{pg.id}",
+    reason: "stage refreshed ai-brief proposal on #{pg_id}",
     at: now
   )
   saved = try Ledger.transact_locked(
@@ -1608,8 +1721,8 @@ fn refresh_ai_brief(
     Db.ledger_db_path,
     Db.vellum_schema(),
     meta,
-    "created AI brief proposal #{prop_id} for #{pg.id}",
-    Json.Object({"proposal_id": Json.String(prop_id), "page_id": Json.String(pg.id)}),
+    "created AI brief proposal #{prop_id} for #{pg_id}",
+    Json.Object({"proposal_id": Json.String(prop_id), "page_id": Json.String(pg_id)}),
     Db.map_ledger_error,
     fn(tx)
       t1 = if auth.principal.kind == Agent
@@ -1631,7 +1744,7 @@ fn refresh_ai_brief(
       Json.Object({
         "proposal": saved.to_json,
         "draft_markdown": Json.String(brief_md),
-        "block_id": Json.String(target_blk.id),
+        "block_id": Json.String(target_blk_id),
         "model": Json.String(model_name)
       })
     )
@@ -2022,7 +2135,6 @@ fn run_ai_column(
   id: Text,
   prop_id: Text,
   auth: AuthContext,
-  input: RunAiColumnInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock,
@@ -2030,6 +2142,13 @@ fn run_ai_column(
   net: Network
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = RunAiColumnInput(
+    row_ids: VaultOps.json_text_list_opt(rj, "row_ids"),
+    only_stale: rj.bool_at("only_stale"),
+    mode_override: rj.text_at("mode_override"),
+    deterministic_fallback: rj.bool_at("deterministic_fallback")
+  )
   if auth.principal.suspended or not Policy.action_permitted?(auth, "read")
     return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'read'"))
   end
@@ -2040,55 +2159,44 @@ fn run_ai_column(
   now = clock.now
   day_iso = now.to_text.bytes.slice(0, 10).decode_utf8 or "1970-01-01"
 
-  (def_check, col_check, prop, prompt_str, src_ids, include_body?, out_kind, col_mode, daily_cap) = try Ledger
-    .read_locked(
-      files.read_only,
-      Db.ledger_db_path,
-      Db.vellum_schema(),
-      Db.map_ledger_error,
-      fn(db)
-        store = Ledger.store(db)
-        d = case try Table.get(store, Db.databases_table(), id).map_error(Db.map_table_error)
-          Some(x): x
-          None: return Error(Missing(entity: "database", id: id))
-        end
-        try Policy.require_collection_access(auth, "read", d.collection_id)
-        c = case try Table.get(store, Db.collections_table(), d.collection_id).map_error(
-          Db.map_table_error
-        )
-          Some(x): x
-          None: return Error(Missing(entity: "collection", id: d.collection_id))
-        end
-        var found_p = None
-        for p in d.properties
-          if p.id == prop_id
-            found_p = Some(p)
-            break
-          end
-        end
-        prp = try found_p.or_fail(Missing(entity: "property", id: prop_id))
-        case prp.kind
-          AiDerived(
-            prompt: pr_t,
-            source_prop_ids: sids,
-            include_row_body: inc_b,
-            output_kind: ok_k,
-            mode: cm,
-            daily_call_cap: cap
-          ): Ok((d, c, prp, pr_t, sids, inc_b, ok_k, cm, cap))
-          Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
-            options: _
-          ) | Status(options: _, done_option_ids: _) | Checkbox | Person | Email | FileList | Url | UniqueId(
-            prefix: _
-          ) | Formula(expression: _, format: _) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
-            target_db_id: _,
-            inverse_prop_id: _
-          ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): Error(
-            BadInput(reason: "property '#{prop_id}' is not an AI-compiled column")
-          )
-        end
+  def_check = try Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      d = case try Table.get(store, Db.databases_table(), id).map_error(Db.map_table_error)
+        Some(x): x
+        None: return Error(Missing(entity: "database", id: id))
       end
+      try Policy.require_collection_access(auth, "read", d.collection_id)
+      Ok(d)
+    end
+  )
+  prop = try def_check.properties.find(fn(p) p.id == prop_id end).or_fail(
+    Missing(entity: "property", id: prop_id)
+  )
+  (prompt_str, src_ids, include_body?, out_kind, col_mode, daily_cap) = case prop.kind
+    AiDerived(
+      prompt: pr_t,
+      source_prop_ids: sids,
+      include_row_body: inc_b,
+      output_kind: ok_k,
+      mode: cm,
+      daily_call_cap: cap
+    ): (pr_t, sids, inc_b, ok_k, cm, cap)
+    Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
+      options: _
+    ) | Status(options: _, done_option_ids: _) | Checkbox | Person | Email | FileList | Url | UniqueId(
+      prefix: _
+    ) | Formula(expression: _, format: _) | CreatedTime | CreatedBy | LastEditedTime | LastEditedBy | Relation(
+      target_db_id: _,
+      inverse_prop_id: _
+    ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): return Error(
+      BadInput(reason: "property '#{prop_id}' is not an AI-compiled column")
     )
+  end
 
   base_mode = case input.mode_override
     None: col_mode
@@ -2104,24 +2212,6 @@ fn run_ai_column(
         return Error(BadInput(reason: "mode_override must be 'auto' or 'proposal'"))
       end
   end
-  eff_mode = if col_check.write_policy == ProposalsRequiredForAll or
-    (col_check.write_policy == ProposalsRequiredForAgents and auth.principal.kind == Agent)
-    StageProposal
-  else
-    base_mode
-  end
-
-  write_act = if eff_mode == AutoApply
-    if Policy.action_permitted?(auth, "write_db")
-      "write_db"
-    else
-      "write_direct"
-    end
-  else
-    "propose"
-  end
-  try Policy.require_collection_access(auth, write_act, col_check.id)
-
   # Sync Modb.Feeds O(diff) staleness cursor before evaluating target rows
   _feed_sync = try Db.sync_ai_col_feed_locked(files, def_check.id, now)
 
@@ -2137,13 +2227,31 @@ fn run_ai_column(
     Error(_): None
   end
   local_only_ai? = VaultOps.env_ai_local_only?(env)
-  (used_before, candidates, row_blocks_map) = try Ledger.read_locked(
+  col_pre = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.map_ledger_error,
     fn(db)
       store = Ledger.store(db)
+      col_check = case try Table.get(store, Db.collections_table(), def_check.collection_id).map_error(
+        Db.map_table_error
+      )
+        Some(x): x
+        None: return Error(Missing(entity: "collection", id: def_check.collection_id))
+      end
+      eff_m = if col_check.write_policy == ProposalsRequiredForAll or
+        (col_check.write_policy == ProposalsRequiredForAgents and auth.principal.kind == Agent)
+        StageProposal
+      else
+        base_mode
+      end
+      write_act = if eff_m == AutoApply
+        if Policy.action_permitted?(auth, "write_db"): "write_db" else: "write_direct"
+      else
+        "propose"
+      end
+      try Policy.require_collection_access(auth, write_act, col_check.id)
       case cfg_url_opt
         Some(url):
           try VaultOps.require_ai_allowed_for_collection(
@@ -2172,7 +2280,6 @@ fn run_ai_column(
       end
 
       var out_cands = []
-      var blk_map = {}
       for r in active_rows
         in_row_filter = case row_filter
           Some(xs): xs.contains?(r.id)
@@ -2200,13 +2307,33 @@ fn run_ai_column(
           true
         end
         if need_eval
-          out_cands = out_cands.append((r, in_h))
-          blk_map = blk_map.set(r.id, blks)
+          (rt, st, rcits) = build_row_ai_context(def_check, r, src_ids, include_body?, blks)
+          out_cands = out_cands.append(
+            Json.Object({
+              "row_id": Json.String(r.id),
+              "row_version": Json.int(r.version),
+              "in_h": Json.String(in_h),
+              "row_title": Json.String(rt),
+              "src_txt": Json.String(st),
+              "citations": rcits.to_json
+            })
+          )
         end
       end
-      Ok((used, out_cands, blk_map))
+      Ok(
+        Json.Object({
+          "used_before": Json.int(used),
+          "auto_apply": Json.Boolean(eff_m == AutoApply),
+          "write_act": Json.String(write_act),
+          "candidates": Json.Array(out_cands)
+        })
+      )
     end
   )
+  eff_mode = if col_pre.bool_at("auto_apply") == Some(true): AutoApply else: StageProposal
+  write_act = col_pre.text_at("write_act") or "propose"
+  used_before = col_pre.int_at("used_before") or 0
+  candidates = col_pre.list_at("candidates") or []
 
   remaining = if daily_cap > used_before: daily_cap - used_before else: 0
   if remaining <= 0 and not candidates.empty?
@@ -2226,15 +2353,13 @@ fn run_ai_column(
   var result_items = []
   var used_model = "none"
 
-  for (row, in_h) in to_eval
-    blks = row_blocks_map.get(row.id) or []
-    (row_title, src_txt, cits) = build_row_ai_context(
-      def_check,
-      row,
-      src_ids,
-      include_body?,
-      blks
-    )
+  for cand in to_eval
+    cand_row_id = cand.text_at("row_id") or ""
+    cand_row_ver = cand.int_at("row_version") or 1
+    in_h = cand.text_at("in_h") or ""
+    row_title = cand.text_at("row_title") or ""
+    src_txt = cand.text_at("src_txt") or ""
+    cits = citations_from_json_list(cand.list_at("citations") or [])
     attempted_calls += 1
 
     eval_out = case cfg_res
@@ -2278,7 +2403,7 @@ fn run_ai_column(
       Error(parse_msg):
         result_items = result_items.append(
           Json.Object({
-            "row_id": Json.String(row.id),
+            "row_id": Json.String(cand_row_id),
             "status": Json.String("validation_error"),
             "error": Json.String(parse_msg)
           })
@@ -2288,16 +2413,24 @@ fn run_ai_column(
           Some(val_msg):
             result_items = result_items.append(
               Json.Object({
-                "row_id": Json.String(row.id),
+                "row_id": Json.String(cand_row_id),
                 "status": Json.String("validation_error"),
                 "error": Json.String(val_msg)
               })
             )
           None:
-            valid_updates = valid_updates.append((row, cell_val, rat_opt, cits, in_h, mname))
+            valid_updates = valid_updates.append((
+              cand_row_id,
+              cand_row_ver,
+              cell_val,
+              rat_opt,
+              cits,
+              in_h,
+              mname
+            ))
             result_items = result_items.append(
               Json.Object({
-                "row_id": Json.String(row.id),
+                "row_id": Json.String(cand_row_id),
                 "status": Json.String(
                   if eff_mode == AutoApply: "applied" else: "staged"
                 ),
@@ -2319,7 +2452,7 @@ fn run_ai_column(
       reason: "AI-compiled column '#{prop.id}' evaluated #{attempted_calls} rows",
       at: now
     )
-    (next_usage, updated_cnt) = try Ledger.transact_locked(
+    auto_res_json = try Ledger.transact_locked(
       files,
       Db.ledger_db_path,
       Db.vellum_schema(),
@@ -2360,14 +2493,14 @@ fn run_ai_column(
         )
 
         var applied = 0
-        for (orig_row, cell_val, rat_opt, cits, in_h, mname) in valid_updates
+        for (orig_row_id, _orig_ver, cell_val, rat_opt, cits, in_h, mname) in valid_updates
           cur_def = case try Table.tx_get(t, Db.databases_table(), def_check.id).map_error(
             Db.map_table_error
           )
             Some(d): d
             None: def_check
           end
-          cur_row = case try Table.tx_get(t, Db.db_rows_table(), orig_row.id).map_error(
+          cur_row = case try Table.tx_get(t, Db.db_rows_table(), orig_row_id).map_error(
             Db.map_table_error
           )
             Some(r) if r.archived_at == None: r
@@ -2431,12 +2564,19 @@ fn run_ai_column(
           t = try Db.tx_put_ai_cell_meta(t, cmeta)
           applied += 1
         end
-        Ok((t, (new_u, applied)))
+        Ok((
+          t,
+          Json.Object({
+            "calls_used": Json.int(new_u.calls_used),
+            "updated_cnt": Json.int(applied)
+          })
+        ))
       end
     )
-
-    rem_after = if daily_cap > next_usage.calls_used
-      daily_cap - next_usage.calls_used
+    auto_used = auto_res_json.int_at("calls_used") or 0
+    updated_cnt = auto_res_json.int_at("updated_cnt") or 0
+    rem_after = if daily_cap > auto_used
+      daily_cap - auto_used
     else
       0
     end
@@ -2452,7 +2592,7 @@ fn run_ai_column(
           "updated_count": Json.int(updated_cnt),
           "skipped_budget_count": Json.int(skipped_budget),
           "usage": Json.Object({
-            "calls_used": Json.int(next_usage.calls_used),
+            "calls_used": Json.int(auto_used),
             "daily_call_cap": Json.int(daily_cap),
             "remaining_calls": Json.int(rem_after),
             "day_iso": Json.String(day_iso)
@@ -2471,7 +2611,7 @@ fn run_ai_column(
     reason: "debit AI column call budget on '#{prop.id}'",
     at: now
   )
-  next_usage = try Ledger.transact_locked(
+  usage_res_json = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -2509,16 +2649,17 @@ fn run_ai_column(
       t1 = try Table.put(t, Db.ai_col_usage_table(), new_u.id, new_u).map_error(
         Db.map_table_error
       )
-      Ok((t1, new_u))
+      Ok((t1, Json.Object({"calls_used": Json.int(new_u.calls_used)})))
     end
   )
-  rem_after = if daily_cap > next_usage.calls_used
-    daily_cap - next_usage.calls_used
+  st_used = usage_res_json.int_at("calls_used") or 0
+  rem_after = if daily_cap > st_used
+    daily_cap - st_used
   else
     0
   end
   usage_json = Json.Object({
-    "calls_used": Json.int(next_usage.calls_used),
+    "calls_used": Json.int(st_used),
     "daily_call_cap": Json.int(daily_cap),
     "remaining_calls": Json.int(rem_after),
     "day_iso": Json.String(day_iso)
@@ -2557,7 +2698,7 @@ fn run_ai_column(
   ).map_error(Db.map_world_error)
 
   base_prov = make_provenance(auth, "AI-compiled column '#{prop.name}'", now)
-  for (row, cell_val, rat_opt, cits, in_h, mname) in valid_updates
+  for (cand_row_id, cand_row_ver, cell_val, rat_opt, cits, in_h, mname) in valid_updates
     row_prov = Provenance(
       author_id: base_prov.author_id,
       author_kind: base_prov.author_kind,
@@ -2569,9 +2710,9 @@ fn run_ai_column(
     )
     row_mut = UpdateDbRow(
       database_id: def_check.id,
-      row_id: row.id,
+      row_id: cand_row_id,
       cells: {prop.id: cell_val},
-      expected_version: Some(row.version),
+      expected_version: Some(cand_row_ver),
       provenance: row_prov
     )
     _s1 = try World.world_call_locked(
@@ -2582,14 +2723,14 @@ fn run_ai_column(
       world_id,
       "propose",
       WorldBranchArgs(mutation: row_mut, updated_at: now).to_json,
-      "stage AI cell #{prop.id} on #{row.id}",
+      "stage AI cell #{prop.id} on #{cand_row_id}",
       now
     ).map_error(Db.map_world_error)
 
     cmeta = AiCellMeta(
-      id: DatabaseModel.ai_cell_meta_key(def_check.id, row.id, prop.id),
+      id: DatabaseModel.ai_cell_meta_key(def_check.id, cand_row_id, prop.id),
       database_id: def_check.id,
-      row_id: row.id,
+      row_id: cand_row_id,
       prop_id: prop.id,
       model: mname,
       prompt_hash: pr_hash,
@@ -2608,7 +2749,7 @@ fn run_ai_column(
       world_id,
       "propose",
       WorldBranchArgs(mutation: PutAiCellMeta(meta: cmeta), updated_at: now).to_json,
-      "stage AI cell metadata #{prop.id} on #{row.id}",
+      "stage AI cell metadata #{prop.id} on #{cand_row_id}",
       now
     ).map_error(Db.map_world_error)
   end
@@ -2696,7 +2837,6 @@ fn steer_proposal(
   req: Api.Request,
   id: Text,
   auth: AuthContext,
-  input: SteerProposalInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock,
@@ -2704,6 +2844,13 @@ fn steer_proposal(
   net: Network
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = SteerProposalInput(
+    target_block_id: rj.text_at("target_block_id"),
+    target_page_id: rj.text_at("target_page_id"),
+    instruction: try VaultOps.req_text(rj, "instruction"),
+    deterministic_fallback: rj.bool_at("deterministic_fallback")
+  )
   clean_instr = input.instruction.trim
   if clean_instr.empty?
     return Error(BadInput(reason: "steer instruction must not be empty"))
@@ -2717,7 +2864,7 @@ fn steer_proposal(
     Error(_): None
   end
   local_only_ai? = VaultOps.env_ai_local_only?(env)
-  (pm, target_pid, page_title, spec_blk, live_md) = try Ledger.read_locked(
+  st_ctx = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -2807,16 +2954,39 @@ fn steer_proposal(
         Some(bb): bb.markdown
         None: ""
       end
-      Ok((found, pid, ptitle, chosen, cur_live))
+      Ok(
+        Json.Object({
+          "proposal": found.to_json,
+          "proposal_id": Json.String(found.id),
+          "collection_id": Json.String(found.collection_id),
+          "world_id": Json.String(found.world_id),
+          "target_pid": Json.String(pid),
+          "page_title": Json.String(ptitle),
+          "block_id": Json.String(chosen.id),
+          "block_version": Json.int(chosen.version),
+          "block_markdown": Json.String(chosen.markdown),
+          "live_md": Json.String(cur_live)
+        })
+      )
     end
   )
+  pm_json = st_ctx.get("proposal") or Json.Null
+  pm_id = st_ctx.text_at("proposal_id") or id
+  pm_collection_id = st_ctx.text_at("collection_id") or ""
+  pm_world_id = st_ctx.text_at("world_id") or ""
+  target_pid = st_ctx.text_at("target_pid") or ""
+  page_title = st_ctx.text_at("page_title") or ""
+  spec_blk_id = st_ctx.text_at("block_id") or ""
+  spec_blk_ver = st_ctx.int_at("block_version") or 1
+  spec_blk_md = st_ctx.text_at("block_markdown") or ""
+  live_md = st_ctx.text_at("live_md") or ""
 
   # Execute LLM call strictly outside any MoDB lock
   (sys_prompt, usr_prompt) = build_steer_prompts(
     page_title,
-    spec_blk.id,
+    spec_blk_id,
     live_md,
-    spec_blk.markdown,
+    spec_blk_md,
     clean_instr
   )
   use_det? = input.deterministic_fallback or false
@@ -2840,7 +3010,7 @@ fn steer_proposal(
         return Error(BadInput(reason: "AI provider not configured for Steer-in-Place: #{e.to_text}"))
     end
   else
-    ("#{spec_blk.markdown.trim} [Steered: #{clean_instr}]", "deterministic-steer")
+    ("#{spec_blk_md.trim} [Steered: #{clean_instr}]", "deterministic-steer")
   end
 
   now = clock.now
@@ -2848,7 +3018,7 @@ fn steer_proposal(
     author_id: auth.principal.id,
     author_kind: AgentAuthor(model: Some(model_name)),
     grant_id: if auth.principal.kind == Agent: Some(auth.grant_id) else: None,
-    proposal_id: Some(pm.id),
+    proposal_id: Some(pm_id),
     reason: Some("Steered in-place: #{clean_instr}"),
     citations: [],
     updated_at: now
@@ -2857,8 +3027,8 @@ fn steer_proposal(
     page_id: target_pid,
     ops: [
       ReplaceBlock(
-        block_id: spec_blk.id,
-        expected_version: spec_blk.version,
+        block_id: spec_blk_id,
+        expected_version: spec_blk_ver,
         kind: None,
         markdown: revised_md
       )
@@ -2872,10 +3042,10 @@ fn steer_proposal(
     Db.ledger_db_path,
     Db.vellum_schema(),
     Db.world_catalog(),
-    pm.world_id,
+    pm_world_id,
     "propose",
     WorldBranchArgs(mutation: patch_mut, updated_at: now).to_json,
-    "steer block #{spec_blk.id} in #{pm.id}",
+    "steer block #{spec_blk_id} in #{pm_id}",
     now
   ).map_error(Db.map_world_error)
 
@@ -2885,9 +3055,9 @@ fn steer_proposal(
   end
   human_cmt = ProposalComment(
     id: "pcmt_#{Id.ulid(rng, clock)}",
-    proposal_id: pm.id,
+    proposal_id: pm_id,
     target_kind: "block",
-    target_ref: Some(spec_blk.id),
+    target_ref: Some(spec_blk_id),
     parent_comment_id: None,
     author_id: auth.principal.id,
     author_handle: auth.principal.handle,
@@ -2899,14 +3069,14 @@ fn steer_proposal(
   )
   agent_cmt = ProposalComment(
     id: "pcmt_#{Id.ulid(rng, clock)}",
-    proposal_id: pm.id,
+    proposal_id: pm_id,
     target_kind: "block",
-    target_ref: Some(spec_blk.id),
+    target_ref: Some(spec_blk_id),
     parent_comment_id: Some(human_cmt.id),
     author_id: auth.principal.id,
     author_handle: "@vellum-steer",
     author_kind: AgentAuthor(model: Some(model_name)),
-    body_markdown: "Revised block `#{spec_blk.id}` in-place inside branch `#{pm.world_id}`.",
+    body_markdown: "Revised block `#{spec_blk_id}` in-place inside branch `#{pm_world_id}`.",
     steer_requested: false,
     resolved_at: None,
     created_at: now
@@ -2914,12 +3084,12 @@ fn steer_proposal(
   cmeta = Ledger.WriteMeta(
     principal: auth.principal.handle,
     action: "proposal.steer",
-    reason: "steer block '#{spec_blk.id}' inside proposal '#{pm.id}'",
+    reason: "steer block '#{spec_blk_id}' inside proposal '#{pm_id}'",
     at: now
   )
   audit_payload = Json.Object({
-    "proposal_id": Json.String(pm.id),
-    "block_id": Json.String(spec_blk.id),
+    "proposal_id": Json.String(pm_id),
+    "block_id": Json.String(spec_blk_id),
     "model": Json.String(model_name)
   })
   try Ledger.transact_locked(
@@ -2927,7 +3097,7 @@ fn steer_proposal(
     Db.ledger_db_path,
     Db.vellum_schema(),
     cmeta,
-    "steered block #{spec_blk.id} in proposal #{pm.id}",
+    "steered block #{spec_blk_id} in proposal #{pm_id}",
     audit_payload,
     Db.map_ledger_error,
     fn(tx)
@@ -2946,23 +3116,23 @@ fn steer_proposal(
   )
 
   steer_ev = Json.Object({
-    "proposal_id": Json.String(pm.id),
+    "proposal_id": Json.String(pm_id),
     "page_id": Json.String(target_pid),
-    "block_id": Json.String(spec_blk.id),
+    "block_id": Json.String(spec_blk_id),
     "actor": Json.String(auth.principal.handle)
   })
   var resp = json_ok(
     200,
     Json.Object({
-      "proposal": pm.to_json,
+      "proposal": pm_json,
       "human_comment": human_cmt.to_json,
       "agent_comment": agent_cmt.to_json,
-      "revised_block_id": Json.String(spec_blk.id),
+      "revised_block_id": Json.String(spec_blk_id),
       "revised_markdown": Json.String(revised_md),
       "model": Json.String(model_name)
     })
-  ).with_sse_publish_json("collection:#{pm.collection_id}", "proposal.updated", steer_ev)
-    .with_sse_publish_json("collection:#{pm.collection_id}", "proposal.commented", steer_ev)
+  ).with_sse_publish_json("collection:#{pm_collection_id}", "proposal.updated", steer_ev)
+    .with_sse_publish_json("collection:#{pm_collection_id}", "proposal.commented", steer_ev)
   if not target_pid.trim.empty?
     resp = resp.with_sse_publish_json("page:#{target_pid}", "proposal.updated", steer_ev)
       .with_sse_publish_json("page:#{target_pid}", "proposal.commented", steer_ev)
@@ -3042,7 +3212,7 @@ fn rlm_target_collections(
       None: Ok(([], []))
     end
   end
-  cols = try Ledger.read_locked(
+  cols_json = try Ledger.read_locked(
     rf,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -3055,20 +3225,20 @@ fn rlm_target_collections(
       active = pairs.filter(fn(p) p.1.archived_at == None end).map(fn(p) p.1 end).sort_by(
         fn(c) c.id end
       )
-      case (filter_opt, ai_url_opt)
+      ok_cols = case (filter_opt, ai_url_opt)
         (Some(cid), Some(url)):
           if active.any?(fn(c) c.id == cid end)
             try Policy.require_collection_access(auth, "read", cid)
             try VaultOps.require_ai_allowed_for_collection(store, cid, url, local_only_ai?)
           end
-          Ok(active)
+          active
         (Some(cid), None):
           if active.any?(fn(c) c.id == cid end)
             try Policy.require_collection_access(auth, "read", cid)
           end
-          Ok(active)
+          active
         (None, Some(url)):
-          var ok_cols = []
+          var xs = []
           for c in active
             if Policy.collection_permitted?(auth, c.id) and try VaultOps.ai_allowed_for_collection(
               store,
@@ -3076,24 +3246,33 @@ fn rlm_target_collections(
               url,
               local_only_ai?
             )
-              ok_cols = ok_cols.append(c)
+              xs = xs.append(c)
             end
           end
-          Ok(ok_cols)
-        (None, None): Ok(active)
+          xs
+        (None, None): active
       end
+      Ok(
+        Json.Object({
+          "all_ids": ok_cols.map(fn(c) c.id end).to_json,
+          "permitted_ids": ok_cols
+            .filter(fn(c) Policy.collection_permitted?(auth, c.id) end)
+            .map(fn(c) c.id end)
+            .to_json
+        })
+      )
     end
   )
+  all_col_ids = VaultOps.json_text_list_raw(cols_json, "all_ids")
+  perm_col_ids = VaultOps.json_text_list_raw(cols_json, "permitted_ids")
   case filter_opt
     Some(cid):
-      if not cols.any?(fn(c) c.id == cid end)
+      if not all_col_ids.contains?(cid)
         return Error(Missing(entity: "collection", id: cid))
       end
       try Policy.require_collection_access(auth, "read", cid)
       Ok(([cid], [cid]))
-    None:
-      cids = cols.filter(fn(c) Policy.collection_permitted?(auth, c.id) end).map(fn(c) c.id end)
-      Ok((cids, cids))
+    None: Ok((perm_col_ids, perm_col_ids))
   end
 end
 
@@ -3635,7 +3814,7 @@ fn debit_agent_rlm_call(
     reason: reason,
     at: now
   )
-  Ledger.transact_locked(
+  _u = try Ledger.transact_locked(
     files,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -3647,9 +3826,10 @@ fn debit_agent_rlm_call(
       (tg, _g) = try Grants.tx_authorize(tx, auth.grant_id, "read", now).map_error(
         Db.map_grants_error
       )
-      Ok((tg, 1))
+      Ok((tg, Unit))
     end
   )
+  Ok(1)
 end
 
 ## Formats the Planner LLM prompt that emits a capability-confined Mo Micro-REPL script.
@@ -3674,7 +3854,7 @@ end
 
 fn extract_planned_script(raw: Text) : Text
   trimmed = raw.trim
-  case Json.decode_strict[Json](trimmed.bytes)
+  case Json.parse(trimmed)
     Ok(j):
       case j.text_at("script")
         Some(sc) if not sc.trim.empty?: return sc.trim
@@ -4072,7 +4252,7 @@ fn rlm_vm_run_blocks(
   end
   has_heading? = eff_heading != None
 
-  col_pids = try Ledger.read_locked(
+  col_pids_json = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -4099,9 +4279,22 @@ fn rlm_vm_run_blocks(
           Some(_) | None: Unit
         end
       end
-      Ok(col_order.map(fn(cid) (cid, by_col.get(cid) or []) end))
+      Ok(
+        Json.Array(
+          col_order.map(fn(cid)
+            Json.Object({
+              "cid": Json.String(cid),
+              "ids": Json.Array((by_col.get(cid) or []).map(fn(x) Json.String(x) end))
+            })
+          end)
+        )
+      )
     end
   ).map_error(fn(e) RlmVm.HostAppError(err: e) end)
+  col_pids = case col_pids_json
+    Json.Array(xs): xs
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Object(_): []
+  end
 
   cat = Db.rlm_view_catalog(catalog_cids)
   var raw_rows = []
@@ -4110,7 +4303,20 @@ fn rlm_vm_run_blocks(
   var traces = []
   var tm = taint_merge_init()
 
-  for (cid, pids) in col_pids
+  for col_entry in col_pids
+    cid = col_entry.text_at("cid") or ""
+    pids = case col_entry.get("ids")
+      Some(Json.Array(items)):
+        var s_ids = []
+        for it in items
+          case it
+            Json.String(s): s_ids = s_ids.append(s)
+            Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Object(_) | Json.Array(_): Unit
+          end
+        end
+        s_ids
+      Some(_) | None: []
+    end
     if not pids.empty?
       pid_pred = Views.InList(field: "page_id", values: pids.map(fn(x) Json.String(x) end))
       where_pred = if (not has_heading?) and (not eff_kinds.empty?)
@@ -4204,7 +4410,7 @@ fn rlm_vm_run_db_rows(
     return Ok(RlmVm.plain_delta(RlmVm.VList([])))
   end
 
-  col_dids = try Ledger.read_locked(
+  col_dids_json = try Ledger.read_locked(
     files.read_only,
     Db.ledger_db_path,
     Db.vellum_schema(),
@@ -4231,9 +4437,22 @@ fn rlm_vm_run_db_rows(
           Some(_) | None: Unit
         end
       end
-      Ok(col_order.map(fn(cid) (cid, by_col.get(cid) or []) end))
+      Ok(
+        Json.Array(
+          col_order.map(fn(cid)
+            Json.Object({
+              "cid": Json.String(cid),
+              "ids": Json.Array((by_col.get(cid) or []).map(fn(x) Json.String(x) end))
+            })
+          end)
+        )
+      )
     end
   ).map_error(fn(e) RlmVm.HostAppError(err: e) end)
+  col_dids = case col_dids_json
+    Json.Array(xs): xs
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Object(_): []
+  end
 
   cat = Db.rlm_view_catalog(catalog_cids)
   var db_slices = []
@@ -4242,7 +4461,20 @@ fn rlm_vm_run_db_rows(
   var traces = []
   var tm = taint_merge_init()
 
-  for (cid, dids) in col_dids
+  for col_entry in col_dids
+    cid = col_entry.text_at("cid") or ""
+    dids = case col_entry.get("ids")
+      Some(Json.Array(items)):
+        var s_ids = []
+        for it in items
+          case it
+            Json.String(s): s_ids = s_ids.append(s)
+            Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Object(_) | Json.Array(_): Unit
+          end
+        end
+        s_ids
+      Some(_) | None: []
+    end
     if not dids.empty?
       prog = Views.ReadProgram(
         view: "rlm_db_rows:#{cid}",
@@ -4984,9 +5216,21 @@ fn deep_research(
   net: Network
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
-  input = try Json.decode_strict[DeepResearchInput](body.to_text.bytes).map_error(fn(e)
-    BadInput(reason: "invalid deep-research payload: #{e.to_text}")
-  end)
+  input = DeepResearchInput(
+    question: try VaultOps.req_text(body, "question"),
+    collection_id: body.text_at("collection_id"),
+    block_kinds: VaultOps.json_text_list_opt(body, "block_kinds"),
+    heading_contains: body.text_at("heading_contains"),
+    include_databases: body.bool_at("include_databases"),
+    max_pages: body.int_at("max_pages"),
+    max_blocks_per_page: body.int_at("max_blocks_per_page"),
+    max_subcalls: body.int_at("max_subcalls"),
+    max_rows_scanned: body.int_at("max_rows_scanned"),
+    session_id: body.text_at("session_id"),
+    tier: body.text_at("tier"),
+    script: body.text_at("script"),
+    max_depth: body.int_at("max_depth")
+  )
   out = try execute_deep_research(auth, input, files, clock, env, net)
   Ok(json_ok(200, deep_research_outcome_to_json(out)))
 end

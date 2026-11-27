@@ -4072,6 +4072,457 @@ pack(sys.argv[3], sys.argv[4])`,
 
   console.log("✓ Live v3 M2.2 Extended PII Erasure (Pages + DB Rows) & Encrypted S3 Backup/Verify/Restore verified");
 }
+
+// 24. Live v3 M3.1: Unified Vellum Chat Core, Live SSE, VersityGW Attachments, FERPA Vault Isolation & Modb.Erasure Chat Scrub
+{
+  const vStat24 = await apiJson("/api/admin/vault/status");
+  assert.equal(vStat24.res.status, 200, vStat24.text);
+  const adaPr24 = (vStat24.json.principals ?? []).find((p) => p.kind === "human" || p.role === "owner");
+  assert.ok(adaPr24?.id, "Found live admin principal for chat E2E");
+
+  const chatBotMint = await apiJson("/api/admin/agents", {
+    method: "POST",
+    body: JSON.stringify({
+      handle: "chat-e2e-bot",
+      display_name: "Chat E2E Bot",
+      model_id: "gpt-4o-mini",
+      label: "chat-e2e",
+      allowed_actions: ["read", "comment", "write_direct", "upload_attachment"],
+      allowed_collections: null,
+      max_calls: 100,
+      ttl_days: 7,
+    }),
+  });
+  assert.equal(chatBotMint.res.status, 201, chatBotMint.text);
+  const chatBotToken = chatBotMint.json.raw_token;
+  const chatBotGrantId = chatBotMint.json.grant.id;
+  const chatBotPid = chatBotMint.json.principal.id;
+  const chatBotHeaders = {
+    Authorization: `Bearer ${chatBotToken}`,
+    Accept: "application/json",
+    "Content-Type": "application/json",
+  };
+
+  // Public, Private (admin-only), and deduplicated 1:1 DM
+  const pubChRes = await apiJson("/api/v1/chat/channels", {
+    method: "POST",
+    body: JSON.stringify({
+      kind: "public",
+      collection_id: colId,
+      name: "Live Ops Chat",
+      topic: "Incidents",
+      member_principal_ids: [],
+    }),
+  });
+  assert.equal(pubChRes.res.status, 201, pubChRes.text);
+  const pubChId = pubChRes.json.channel.id;
+
+  const privChRes = await apiJson("/api/v1/chat/channels", {
+    method: "POST",
+    body: JSON.stringify({
+      kind: "private",
+      collection_id: colId,
+      name: "Live Private Chat",
+      topic: "Internal",
+      member_principal_ids: [adaPr24.id],
+    }),
+  });
+  assert.equal(privChRes.res.status, 201, privChRes.text);
+  const privChId = privChRes.json.channel.id;
+
+  const dm1Res = await apiJson("/api/v1/chat/channels", {
+    method: "POST",
+    body: JSON.stringify({
+      kind: "dm",
+      collection_id: null,
+      name: "",
+      topic: "",
+      member_principal_ids: [chatBotPid],
+    }),
+  });
+  assert.equal(dm1Res.res.status, 201, dm1Res.text);
+  assert.equal(dm1Res.json.existing, false);
+  const dmChId = dm1Res.json.channel.id;
+
+  const dm2Http = await fetch(`${BASE}/api/v1/chat/channels`, {
+    method: "POST",
+    headers: chatBotHeaders,
+    body: JSON.stringify({
+      kind: "dm",
+      collection_id: null,
+      name: "",
+      topic: "",
+      member_principal_ids: [adaPr24.id],
+    }),
+  });
+  assert.equal(dm2Http.status, 200);
+  const dm2Json = await dm2Http.json();
+  assert.equal(dm2Json.existing, true);
+  assert.equal(dm2Json.channel?.id, dmChId);
+
+  // Non-member bot denied on private channel & its SSE stream
+  assert.equal(
+    (await fetch(`${BASE}/api/v1/chat/channels/${privChId}/messages`, { headers: chatBotHeaders })).status,
+    403
+  );
+  assert.equal(
+    (await fetch(`${BASE}/api/v1/events?channel_id=${encodeURIComponent(privChId)}`, { headers: chatBotHeaders })).status,
+    403
+  );
+
+  // Live SSE stream + idempotent message creation
+  const chatSse = await openLiveSse(`/api/v1/events?channel_id=${encodeURIComponent(pubChId)}`);
+  await chatSse.waitFor((e) => e.event === "connected", 5000);
+
+  const m1Res = await apiJson(`/api/v1/chat/channels/${pubChId}/messages`, {
+    method: "POST",
+    body: JSON.stringify({
+      body_markdown: "Live chat launch checklist e2echattoken101",
+      client_msg_id: "e2e_idem_1",
+    }),
+  });
+  assert.equal(m1Res.res.status, 201, m1Res.text);
+  assert.equal(m1Res.json.deduplicated, false);
+  const m1Id = m1Res.json.message.id;
+
+  const sseMsgEv = await chatSse.waitFor(
+    (e) => e.event === "chat.message_created" && e.data.includes(m1Id),
+    5000
+  );
+  assert.ok(sseMsgEv.data.includes("e2echattoken101"));
+  chatSse.close();
+
+  const m1DupRes = await apiJson(`/api/v1/chat/channels/${pubChId}/messages`, {
+    method: "POST",
+    body: JSON.stringify({
+      body_markdown: "Live chat launch checklist e2echattoken101",
+      client_msg_id: "e2e_idem_1",
+    }),
+  });
+  assert.equal(m1DupRes.res.status, 200, m1DupRes.text);
+  assert.equal(m1DupRes.json.deduplicated, true);
+  assert.equal(m1DupRes.json.message?.id, m1Id);
+
+  await new Promise((r) => setTimeout(r, 10));
+
+  // VersityGW S3 chat attachment on public channel + 302 -> 200 GET, and 403 for non-member on private attachment
+  const chatAttBytes = Buffer.from("live-chat-s3-diagram\n", "utf8");
+  const chatAttSha = createHash("sha256").update(chatAttBytes).digest("hex");
+  const cPreRes = await apiJson("/api/attachments/presign", {
+    method: "POST",
+    body: JSON.stringify({
+      page_id: pubChId,
+      filename: "chat-runbook.txt",
+      content_type: "text/plain",
+      size_bytes: chatAttBytes.length,
+      sha256_hex: chatAttSha,
+    }),
+  });
+  assert.equal(cPreRes.res.status, 201, cPreRes.text);
+  const cAttId = cPreRes.json.attachment.id;
+  const cPutHdrs = {};
+  for (const h of cPreRes.json.required_headers ?? []) cPutHdrs[h.name] = h.value;
+  assert.equal(
+    (
+      await fetch(cPreRes.json.upload_url, {
+        method: cPreRes.json.method || "PUT",
+        headers: cPutHdrs,
+        body: chatAttBytes,
+      })
+    ).status,
+    200
+  );
+  assert.equal(
+    (await apiJson(`/api/attachments/${cAttId}/commit`, { method: "POST", body: "{}" })).res.status,
+    200
+  );
+
+  const cAttMsg = await apiJson(`/api/v1/chat/channels/${pubChId}/messages`, {
+    method: "POST",
+    body: JSON.stringify({
+      body_markdown: "Attached chat runbook @chat-e2e-bot",
+      attachment_ids: [cAttId],
+    }),
+  });
+  assert.equal(cAttMsg.res.status, 201, cAttMsg.text);
+  assert.equal((cAttMsg.json.message?.attachments ?? []).length, 1);
+
+  const cDlRedirect = await rawFetch(`${BASE}/api/attachments/${cAttId}/download`);
+  assert.equal(cDlRedirect.status, 302);
+  const cS3Get = await fetch(cDlRedirect.headers.get("location"));
+  assert.equal(cS3Get.status, 200);
+  assert.deepEqual(Buffer.from(await cS3Get.arrayBuffer()), chatAttBytes);
+
+  const pAttPre = await apiJson("/api/attachments/presign", {
+    method: "POST",
+    body: JSON.stringify({
+      page_id: privChId,
+      filename: "priv-chat-secret.txt",
+      content_type: "text/plain",
+      size_bytes: chatAttBytes.length,
+      sha256_hex: chatAttSha,
+    }),
+  });
+  assert.equal(pAttPre.res.status, 201, pAttPre.text);
+  const pAttId = pAttPre.json.attachment.id;
+  const pPutHdrs = {};
+  for (const h of pAttPre.json.required_headers ?? []) pPutHdrs[h.name] = h.value;
+  assert.equal(
+    (
+      await fetch(pAttPre.json.upload_url, {
+        method: pAttPre.json.method || "PUT",
+        headers: pPutHdrs,
+        body: chatAttBytes,
+      })
+    ).status,
+    200
+  );
+  assert.equal(
+    (await apiJson(`/api/attachments/${pAttId}/commit`, { method: "POST", body: "{}" })).res.status,
+    200
+  );
+  assert.equal(
+    (await fetch(`${BASE}/api/attachments/${pAttId}/download`, { headers: chatBotHeaders })).status,
+    403
+  );
+
+  await new Promise((r) => setTimeout(r, 10));
+
+  // Side-thread reply, reaction toggle, edit+decision, pagination, Calm Inbox/ack, read cursor, search & Inertia /chat
+  const thrRes = await fetch(`${BASE}/api/v1/chat/channels/${pubChId}/messages`, {
+    method: "POST",
+    headers: chatBotHeaders,
+    body: JSON.stringify({
+      body_markdown: "Bot thread followup",
+      parent_message_id: m1Id,
+    }),
+  });
+  assert.equal(thrRes.status, 201);
+
+  const reactRes = await apiJson(`/api/v1/chat/channels/${pubChId}/messages/${m1Id}/reactions`, {
+    method: "POST",
+    body: JSON.stringify({ emoji: "👍" }),
+  });
+  assert.equal(reactRes.res.status, 200, reactRes.text);
+  assert.ok(Array.isArray(reactRes.json.reactions?.["👍"]));
+
+  const editRes = await apiJson(`/api/v1/chat/channels/${pubChId}/messages/${m1Id}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      body_markdown: "Live chat launch checklist e2echattoken101 approved",
+      is_decision: true,
+    }),
+  });
+  assert.equal(editRes.res.status, 200, editRes.text);
+  assert.equal(editRes.json.message?.is_decision, true);
+
+  const pgTop = await apiJson(`/api/v1/chat/channels/${pubChId}/messages?limit=1`);
+  assert.equal(pgTop.res.status, 200, pgTop.text);
+  assert.equal(pgTop.json.has_more, true);
+  assert.ok(pgTop.json.next_before_cursor);
+  const pgOlder = await apiJson(
+    `/api/v1/chat/channels/${pubChId}/messages?before=${encodeURIComponent(
+      pgTop.json.next_before_cursor
+    )}&limit=5`
+  );
+  assert.equal(pgOlder.res.status, 200, pgOlder.text);
+  assert.ok((pgOlder.json.messages ?? []).length >= 1);
+
+  // DM trigger -> Calm Inbox check -> ack + read cursor
+  const dmPost = await apiJson(`/api/v1/chat/channels/${dmChId}/messages`, {
+    method: "POST",
+    body: JSON.stringify({ body_markdown: "Direct ping for live bot" }),
+  });
+  assert.equal(dmPost.res.status, 201, dmPost.text);
+
+  const botInbox = await (await fetch(`${BASE}/api/v1/chat/inbox?unread_only=1`, { headers: chatBotHeaders })).json();
+  assert.ok((botInbox.unread_count ?? 0) >= 2, "Bot Calm Inbox received mention + DM");
+  const botAck = await (
+    await fetch(`${BASE}/api/v1/chat/inbox/ack`, {
+      method: "POST",
+      headers: chatBotHeaders,
+      body: JSON.stringify({ all: true }),
+    })
+  ).json();
+  assert.equal(botAck.unread_count, 0);
+
+  const botRead = await (
+    await fetch(`${BASE}/api/v1/chat/channels/${pubChId}/read`, {
+      method: "POST",
+      headers: chatBotHeaders,
+      body: JSON.stringify({}),
+    })
+  ).json();
+  assert.equal(botRead.unread_count, 0);
+
+  const chatSearch = await apiJson(`/api/v1/chat/search?q=e2echattoken101`);
+  assert.equal(chatSearch.res.status, 200, chatSearch.text);
+  assert.ok((chatSearch.json.results ?? []).length >= 1);
+
+  const unifiedSearch = await apiJson(`/api/search?q=e2echattoken101&include_chat=1`);
+  assert.equal(unifiedSearch.res.status, 200, unifiedSearch.text);
+  assert.ok((unifiedSearch.json.chat_results ?? []).length >= 1);
+
+  const chatHtmlRes = await rawFetch(`${BASE}/chat?channel=${encodeURIComponent(pubChId)}`);
+  assert.equal(chatHtmlRes.status, 200);
+  const chatHtml = await chatHtmlRes.text();
+  assert.ok(chatHtml.includes("Workspace/Chat"), "Inertia /chat HTML rendered Workspace/Chat");
+
+  // FERPA Vault chat isolation + audit + cleanup
+  const fChatColRes = await apiJson("/api/collections", {
+    method: "POST",
+    body: JSON.stringify({
+      slug: "ferpa-chat-e2e",
+      name: "FERPA Chat E2E",
+      description: null,
+      icon: null,
+      write_policy: "direct_with_audit",
+      freshness_ttl_days: null,
+    }),
+  });
+  assert.equal(fChatColRes.res.status, 201, fChatColRes.text);
+  const fChatColId = fChatColRes.json.id;
+
+  const chatGrpRes = await apiJson("/api/admin/groups", {
+    method: "POST",
+    body: JSON.stringify({
+      name: "RegistrarChat",
+      slug: null,
+      description: "Live E2E FERPA Chat Group",
+      member_principal_ids: [adaPr24.id],
+    }),
+  });
+  assert.equal(chatGrpRes.res.status, 201, chatGrpRes.text);
+  const chatGrpId = chatGrpRes.json.group.id;
+
+  assert.equal(
+    (
+      await apiJson(`/api/collections/${fChatColId}/security`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          security_tier: "ferpa_restricted",
+          allowed_group_ids: [chatGrpId],
+          allowed_principal_ids: [],
+          allow_local_ai: false,
+          reason: "lock live FERPA chat",
+        }),
+      })
+    ).res.status,
+    200
+  );
+
+  const fChRes = await apiJson("/api/v1/chat/channels", {
+    method: "POST",
+    body: JSON.stringify({
+      kind: "public",
+      collection_id: fChatColId,
+      name: "FERPA Case Room",
+      topic: "Confidential",
+      member_principal_ids: [],
+    }),
+  });
+  assert.equal(fChRes.res.status, 201, fChRes.text);
+  const fChatId = fChRes.json.channel.id;
+
+  assert.equal(
+    (
+      await apiJson(`/api/v1/chat/channels/${fChatId}/messages`, {
+        method: "POST",
+        body: JSON.stringify({ body_markdown: "Protected @chat-e2e-bot ferpachate2e771" }),
+      })
+    ).res.status,
+    201
+  );
+
+  assert.equal(
+    (await fetch(`${BASE}/api/v1/chat/channels/${fChatId}/messages`, { headers: chatBotHeaders })).status,
+    403
+  );
+  assert.equal(
+    (await fetch(`${BASE}/api/v1/events?channel_id=${encodeURIComponent(fChatId)}`, { headers: chatBotHeaders })).status,
+    403
+  );
+  const botInboxAfterFerpa = await (await fetch(`${BASE}/api/v1/chat/inbox`, { headers: chatBotHeaders })).text();
+  assert.ok(!botInboxAfterFerpa.includes(fChatId) && !botInboxAfterFerpa.includes("ferpachate2e771"));
+  const botFerpaCS = await (
+    await fetch(`${BASE}/api/v1/chat/search?q=ferpachate2e771`, { headers: chatBotHeaders })
+  ).json();
+  assert.equal((botFerpaCS.results ?? []).length, 0);
+  const botFerpaUS = await (
+    await fetch(`${BASE}/api/search?q=ferpachate2e771&include_chat=1`, { headers: chatBotHeaders })
+  ).json();
+  assert.equal((botFerpaUS.chat_results ?? []).length, 0);
+
+  assert.equal((await apiJson(`/api/v1/chat/channels/${fChatId}/messages`)).res.status, 200);
+  const fChatAud = await apiJson(`/api/admin/ferpa/audit?collection_id=${encodeURIComponent(fChatColId)}`);
+  assert.equal(fChatAud.res.status, 200, fChatAud.text);
+  assert.ok(
+    (fChatAud.json.entries ?? []).some((e) => e.action === "chat.channel_viewed"),
+    "Recorded chat.channel_viewed FERPA audit"
+  );
+
+  // Declassify FERPA chat collection, delete group & revoke temporary chat bot
+  assert.equal(
+    (
+      await apiJson(`/api/collections/${fChatColId}/security`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          security_tier: "standard",
+          allowed_group_ids: [],
+          allowed_principal_ids: [],
+          allow_local_ai: false,
+          reason: "revert E2E FERPA chat",
+        }),
+      })
+    ).res.status,
+    200
+  );
+  assert.equal((await apiJson(`/api/admin/groups/${chatGrpId}`, { method: "DELETE" })).res.status, 200);
+  await apiJson(`/api/admin/grants/${chatBotGrantId}/revoke`, { method: "POST", body: "{}" });
+
+  // Live Modb.Erasure chat SSN purge
+  const chatSsn = "214-88-4321";
+  assert.equal(
+    (
+      await apiJson(`/api/v1/chat/channels/${pubChId}/messages`, {
+        method: "POST",
+        body: JSON.stringify({ body_markdown: `Synthetic chat SSN ${chatSsn}` }),
+      })
+    ).res.status,
+    201
+  );
+  const chatEstB = await apiJson("/api/admin/erasure/status");
+  assert.equal(chatEstB.res.status, 200, chatEstB.text);
+  assert.ok(!chatEstB.text.includes(chatSsn));
+  assert.ok(
+    (chatEstB.json.findings ?? []).some((f) => f.kind === "us_ssn" && f.target_kind === "chat_message"),
+    "Erasure status detects us_ssn in chat_message"
+  );
+
+  const chatPurge = await apiJson("/api/admin/erasure/purge", {
+    method: "POST",
+    body: JSON.stringify({
+      mode: "redact",
+      compact: true,
+      reason: `E2E chat SSN scrub ${chatSsn}`,
+    }),
+  });
+  assert.equal(chatPurge.res.status, 200, chatPurge.text);
+  assert.equal(chatPurge.json.receipt?.key_shredded, true);
+  assert.equal(chatPurge.json.receipt?.compacted, true);
+
+  const pubMsgsAfter = await apiJson(`/api/v1/chat/channels/${pubChId}/messages`);
+  assert.equal(pubMsgsAfter.res.status, 200, pubMsgsAfter.text);
+  assert.ok(pubMsgsAfter.text.includes("[REDACTED]") && !pubMsgsAfter.text.includes(chatSsn));
+
+  const ssnChatSearch = await apiJson(`/api/v1/chat/search?q=${encodeURIComponent(chatSsn)}`);
+  assert.equal((ssnChatSearch.json.results ?? []).length, 0);
+
+  const chatEstA = await apiJson("/api/admin/erasure/status");
+  assert.equal((chatEstA.json.findings ?? []).length, 0);
+
+  console.log("✓ Live v3 M3.1 Unified Vellum Chat Core, Live SSE, VersityGW Attachments, FERPA Vault Isolation & Modb.Erasure Scrub verified");
+}
 EOF
 
 echo "All Live Vellum E2E checks against mo serve + Dex + VersityGW S3 passed."

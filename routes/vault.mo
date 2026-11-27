@@ -207,12 +207,18 @@ end
 fn create_group(
   req: Api.Request,
   auth: AuthContext,
-  input: CreateGroupInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = CreateGroupInput(
+    name: try VaultOps.req_text(rj, "name"),
+    slug: rj.text_at("slug"),
+    description: rj.text_at("description"),
+    member_principal_ids: VaultOps.json_text_list_raw(rj, "member_principal_ids")
+  )
   try require_vault_admin(auth)
   name = input.name.trim
   if name.empty?
@@ -273,11 +279,16 @@ fn update_group(
   req: Api.Request,
   id: Text,
   auth: AuthContext,
-  input: UpdateGroupInput,
   files: Files,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = UpdateGroupInput(
+    name: rj.text_at("name"),
+    description: rj.text_at("description"),
+    member_principal_ids: VaultOps.json_text_list_opt(rj, "member_principal_ids")
+  )
   try require_vault_admin(auth)
   if not files.read_only.exists?(Db.ledger_db_path)
     return Error(Missing(entity: "group", id: id))
@@ -410,11 +421,18 @@ fn update_collection_security(
   req: Api.Request,
   id: Text,
   auth: AuthContext,
-  input: UpdateCollectionSecurityInput,
   files: Files,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  input = UpdateCollectionSecurityInput(
+    security_tier: try VaultOps.req_text(rj, "security_tier"),
+    allowed_group_ids: VaultOps.json_text_list_raw(rj, "allowed_group_ids"),
+    allowed_principal_ids: VaultOps.json_text_list_raw(rj, "allowed_principal_ids"),
+    allow_local_ai: rj.bool_at("allow_local_ai"),
+    reason: rj.text_at("reason")
+  )
   try require_vault_admin(auth)
   tier = input.security_tier.trim.ascii_lowercase
   if tier != "standard" and tier != "ferpa_restricted"

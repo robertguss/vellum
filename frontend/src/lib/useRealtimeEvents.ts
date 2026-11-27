@@ -7,6 +7,7 @@ export interface RealtimeScope {
   pageId?: string;
   databaseId?: string;
   collectionId?: string;
+  channelId?: string;
 }
 
 export interface UseRealtimeEventsOptions {
@@ -26,11 +27,20 @@ const STREAM_EVENT_NAMES = [
   "db.row_created",
   "db.row_updated",
   "db.row_deleted",
+  "chat.message_created",
+  "chat.message_updated",
+  "chat.message_deleted",
+  "chat.reaction_updated",
+  "chat.inbox_updated",
   "resync_required",
 ] as const;
 
 export function buildEventsUrl(scope?: RealtimeScope): string {
   const params = new URLSearchParams();
+  if (scope?.channelId) {
+    params.set("channel_id", scope.channelId);
+    return `/api/v1/events?${params.toString()}`;
+  }
   if (scope?.pageId) {
     params.set("page_id", scope.pageId);
   } else if (scope?.databaseId) {
@@ -61,6 +71,7 @@ export function useRealtimeEvents({ enabled, scope, onEvent }: UseRealtimeEvents
   const pageId = scope?.pageId ?? "";
   const databaseId = scope?.databaseId ?? "";
   const collectionId = scope?.collectionId ?? "";
+  const channelId = scope?.channelId ?? "";
 
   useEffect(() => {
     if (!enabled || typeof window === "undefined" || typeof EventSource === "undefined") {
@@ -71,6 +82,7 @@ export function useRealtimeEvents({ enabled, scope, onEvent }: UseRealtimeEvents
       pageId: pageId || undefined,
       databaseId: databaseId || undefined,
       collectionId: collectionId || undefined,
+      channelId: channelId || undefined,
     });
     setConnectionState("connecting");
     const es = new EventSource(url, { withCredentials: true });
@@ -149,7 +161,7 @@ export function useRealtimeEvents({ enabled, scope, onEvent }: UseRealtimeEvents
       }
       es.close();
     };
-  }, [enabled, pageId, databaseId, collectionId]);
+  }, [enabled, pageId, databaseId, collectionId, channelId]);
 
   return { connectionState, claims };
 }

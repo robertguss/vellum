@@ -7,6 +7,7 @@ CreateViewInput(..),
 QueryDatabaseInput(..),
 CreateRowInput(..),
 UpdateRowInput(..),
+parse_query_database_input,
 list_databases,
 create_database,
 show_database,
@@ -116,6 +117,117 @@ fn db_read_action(auth: AuthContext) : Text
   else
     "read"
   end
+end
+
+fn decode_view_kind_json(j: Json) : Result(DbViewKind, AppError)
+  entries = case j
+    Json.Object(m) if m.size == 1: m
+    Json.Object(_): return Error(BadInput(reason: "invalid 'kind': expected single-variant object"))
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+      BadInput(reason: "invalid 'kind': expected JSON object")
+    )
+  end
+  case entries.get("table_view")
+    Some(v):
+      case v
+        Json.Object(_): Unit
+        Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+          BadInput(reason: "invalid 'kind.table_view'")
+        )
+      end
+      vis = VaultOps.json_string_list(v, "visible_prop_ids")
+      var widths = {}
+      case v.get("column_widths")
+        None: Unit
+        Some(cw):
+          case cw
+            Json.Object(wm):
+              for (wk, wv) in wm.entries
+                case Json.Object({"w": wv}).int_at("w")
+                  Some(wn): widths = widths.set(wk, wn)
+                  None: return Error(BadInput(reason: "invalid 'column_widths' integer for '#{wk}'"))
+                end
+              end
+            Json.Null: Unit
+            Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+              BadInput(reason: "invalid 'kind.table_view.column_widths'")
+            )
+          end
+      end
+      return Ok(DatabaseModel.TableView(visible_prop_ids: vis, column_widths: widths))
+    None: Unit
+  end
+  case entries.get("board_view")
+    Some(v):
+      grp = try VaultOps.req_text(v, "group_by_prop_id")
+      cards = VaultOps.json_string_list(v, "card_prop_ids")
+      hide_empty = v.bool_at("hide_empty_groups") or false
+      return Ok(
+        DatabaseModel.BoardView(
+          group_by_prop_id: grp,
+          card_prop_ids: cards,
+          hide_empty_groups: hide_empty
+        )
+      )
+    None: Unit
+  end
+  case entries.get("calendar_view")
+    Some(v):
+      dp = try VaultOps.req_text(v, "date_prop_id")
+      cards = VaultOps.json_string_list(v, "card_prop_ids")
+      return Ok(DatabaseModel.CalendarView(date_prop_id: dp, card_prop_ids: cards))
+    None: Unit
+  end
+  case entries.get("gallery_view")
+    Some(v):
+      cover = v.text_at("cover_prop_id")
+      cards = VaultOps.json_string_list(v, "card_prop_ids")
+      sz = v.text_at("card_size") or "medium"
+      return Ok(DatabaseModel.GalleryView(cover_prop_id: cover, card_prop_ids: cards, card_size: sz))
+    None: Unit
+  end
+  case entries.get("timeline_view")
+    Some(v):
+      sp = try VaultOps.req_text(v, "start_date_prop_id")
+      ep = v.text_at("end_date_prop_id")
+      cards = VaultOps.json_string_list(v, "card_prop_ids")
+      return Ok(
+        DatabaseModel.TimelineView(
+          start_date_prop_id: sp,
+          end_date_prop_id: ep,
+          card_prop_ids: cards
+        )
+      )
+    None: Unit
+  end
+  Error(BadInput(reason: "invalid 'kind': unknown view kind"))
+end
+
+## Parses a JSON body string into `QueryDatabaseInput` without generic `Json.decode_strict` overhead.
+fn parse_query_database_input(raw_text: Option(Text)) : Result(QueryDatabaseInput, AppError)
+  rj = try VaultOps.parse_req_json_obj(raw_text)
+  filters = case rj.get("filters")
+    None | Some(Json.Null): []
+    Some(fj): try DatabaseModel.decode_filter_rules_json(fj.to_text.bytes).map_error(fn(e)
+      BadInput(reason: "invalid 'filters': #{e}")
+    end)
+  end
+  sorts = case rj.get("sorts")
+    None | Some(Json.Null): []
+    Some(sj): try DatabaseModel.decode_sort_rules_json(sj.to_text.bytes).map_error(fn(e)
+      BadInput(reason: "invalid 'sorts': #{e}")
+    end)
+  end
+  Ok(
+    QueryDatabaseInput(
+      view_id: rj.text_at("view_id"),
+      filters: filters,
+      filter_match_all: rj.bool_at("filter_match_all"),
+      sorts: sorts,
+      from_date: rj.text_at("from_date"),
+      to_date: rj.text_at("to_date")
+    )
+  )
 end
 
 fn tx_authorize_if_agent(tx: WriteTx, auth: AuthContext, action: Text, now: Time) : Result(
@@ -446,12 +558,27 @@ end
 fn create_database(
   req: Api.Request,
   auth: AuthContext,
-  input: CreateDatabaseInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  col_id_in = try VaultOps.req_text(rj, "collection_id")
+  title_in = try VaultOps.req_text(rj, "title")
+  props_in = case rj.get("properties")
+    None: return Error(BadInput(reason: "missing 'properties' array"))
+    Some(pj): try DatabaseModel.decode_property_defs_json(pj.to_text.bytes).map_error(fn(e)
+      BadInput(reason: "invalid 'properties': #{e}")
+    end)
+  end
+  input = CreateDatabaseInput(
+    collection_id: col_id_in,
+    parent_page_id: rj.text_at("parent_page_id"),
+    title: title_in,
+    description: rj.text_at("description"),
+    properties: props_in
+  )
   try Policy.require_collection_access(auth, "manage_schema", input.collection_id)
 
   now = clock.now
@@ -869,11 +996,25 @@ fn update_database_schema(
   req: Api.Request,
   id: Text,
   auth: AuthContext,
-  input: UpdateDatabaseSchemaInput,
   files: Files,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  props_opt = case rj.get("properties")
+    None | Some(Json.Null): None
+    Some(pj): Some(
+      try DatabaseModel.decode_property_defs_json(pj.to_text.bytes).map_error(fn(e)
+        BadInput(reason: "invalid 'properties': #{e}")
+      end)
+    )
+  end
+  input = UpdateDatabaseSchemaInput(
+    title: rj.text_at("title"),
+    description: rj.text_at("description"),
+    properties: props_opt,
+    expected_version: try VaultOps.req_int(rj, "expected_version")
+  )
   now = clock.now
   meta = Ledger.WriteMeta(
     principal: auth.principal.handle,
@@ -971,12 +1112,36 @@ fn create_view(
   req: Api.Request,
   id: Text,
   auth: AuthContext,
-  input: CreateViewInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  v_name = try VaultOps.req_text(rj, "name")
+  v_kind = case rj.get("kind")
+    None: return Error(BadInput(reason: "missing 'kind'"))
+    Some(kj): try decode_view_kind_json(kj)
+  end
+  v_filters = case rj.get("filters")
+    None | Some(Json.Null): []
+    Some(fj): try DatabaseModel.decode_filter_rules_json(fj.to_text.bytes).map_error(fn(e)
+      BadInput(reason: "invalid 'filters': #{e}")
+    end)
+  end
+  v_sorts = case rj.get("sorts")
+    None | Some(Json.Null): []
+    Some(sj): try DatabaseModel.decode_sort_rules_json(sj.to_text.bytes).map_error(fn(e)
+      BadInput(reason: "invalid 'sorts': #{e}")
+    end)
+  end
+  input = CreateViewInput(
+    name: v_name,
+    kind: v_kind,
+    filters: v_filters,
+    filter_match_all: rj.bool_at("filter_match_all") or true,
+    sorts: v_sorts
+  )
   view_act = if Policy.action_permitted?(auth, "manage_schema")
     "manage_schema"
   else
@@ -1073,11 +1238,7 @@ fn update_view(
   end
   kind_opt = case raw_json.get("kind")
     None | Some(Json.Null): None
-    Some(kjson): Some(
-      try Json.decode_strict[DbViewKind](kjson.to_text.bytes).map_error(fn(e)
-        BadInput(reason: "invalid 'kind': #{e.to_text}")
-      end)
-    )
+    Some(kjson): Some(try decode_view_kind_json(kjson))
   end
   filters_opt = case raw_json.get("filters")
     None | Some(Json.Null): None
@@ -1239,12 +1400,12 @@ fn query_database(
   req: Api.Request,
   id: Text,
   auth: AuthContext,
-  input: QueryDatabaseInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  input = try parse_query_database_input(req.text)
   from_d = case input.from_date
     Some(s) if not s.trim.empty?:
       case Date.parse_iso(s.trim)
@@ -1375,12 +1536,23 @@ fn create_row(
   req: Api.Request,
   id: Text,
   auth: AuthContext,
-  input: CreateRowInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  cells_in = case rj.get("cells")
+    None: return Error(BadInput(reason: "missing 'cells' object"))
+    Some(cj): try DatabaseModel.decode_cell_map_json(cj.to_text.bytes).map_error(fn(e)
+      BadInput(reason: "invalid 'cells': #{e}")
+    end)
+  end
+  input = CreateRowInput(
+    cells: cells_in,
+    markdown: rj.text_at("markdown"),
+    reason: rj.text_at("reason")
+  )
   now = clock.now
   row_id = "row_#{Id.ulid(rng, clock)}"
   page_id = "pg_#{Id.ulid(rng, clock)}"
@@ -1502,12 +1674,23 @@ fn update_row(
   id: Text,
   row_id: Text,
   auth: AuthContext,
-  input: UpdateRowInput,
   files: Files,
   rng: SecureRandom,
   clock: Clock
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
+  rj = try VaultOps.parse_req_json_obj(req.text)
+  cells_in = case rj.get("cells")
+    None: return Error(BadInput(reason: "missing 'cells' object"))
+    Some(cj): try DatabaseModel.decode_cell_map_json(cj.to_text.bytes).map_error(fn(e)
+      BadInput(reason: "invalid 'cells': #{e}")
+    end)
+  end
+  input = UpdateRowInput(
+    cells: cells_in,
+    expected_version: try VaultOps.req_int(rj, "expected_version"),
+    reason: rj.text_at("reason")
+  )
   now = clock.now
   stub_job = Jobs.prepare(rng, clock, "vellum.page.indexed", Json.Null)
   meta = Ledger.WriteMeta(
