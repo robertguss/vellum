@@ -102,7 +102,8 @@ export type BlockKind =
   | "divider"
   | { image: { attachment_id: string; caption: string } }
   | { file_embed: { attachment_id: string; filename: string } }
-  | { page_link: { target_page_id: string } };
+  | { page_link: { target_page_id: string } }
+  | { database_view_embed: { database_id: string; view_id: string | null } };
 
 export interface Block {
   id: string;
@@ -205,7 +206,8 @@ export interface AuditFeedItem {
   action: string;
   reason: string;
   summary: string;
-  created_at: string;
+  at?: string;
+  created_at?: string;
 }
 
 export type SelectOptionColor = "gray" | "blue" | "green" | "amber" | "red" | "purple";
@@ -503,4 +505,51 @@ export interface GardenReport {
   stale_pages: GardenStalePage[];
   broken_links: GardenBrokenLink[];
   scanned_at: string;
+}
+
+export type EditorLens = "studio" | "markdown" | "patchwork" | "xray";
+
+export interface BlueprintDef {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  icon: string | null;
+  fields: PropertyDef[];
+  default_template_markdown: string;
+  version: number;
+}
+
+export interface PageBlueprintMeta {
+  page_id: string;
+  blueprint_id: string;
+  values: Record<string, CellValue>;
+  updated_at: string;
+}
+
+export interface ResolvedMetric {
+  token: string;
+  database_id: string;
+  property_id: string;
+  agg: string;
+  status: "ok" | "forbidden" | "missing_property" | "invalid_agg" | "invalid_token";
+  value: string | null;
+  live_value: string | null;
+  scenario_value: string | null;
+  delta: string | null;
+  format: string;
+  database_title: string | null;
+  property_name: string | null;
+  row_count: number;
+}
+
+export interface BlockContextResponse {
+  block: Block;
+  page: Page;
+  collection: Collection;
+  prev_block: Block | null;
+  next_block: Block | null;
+  page_blueprint: BlueprintDef | null;
+  page_meta: PageBlueprintMeta | null;
+  comments: Comment[];
 }

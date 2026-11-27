@@ -609,6 +609,78 @@ assert.equal(postMergeQ.res.status, 200, postMergeQ.text);
 assert.equal(postMergeQ.json.rows[0].row.cells.cost.number_val, "142.75");
 console.log("✓ Relational Database + Decimal row + Query + What-If Scenario delta & merge verified");
 
+// 6c. Statamic Blueprints + Metadata Attach + Embedded DB Markdown Sync + Live Metric Pill + Block Inspector Context
+const bpRes = await apiJson("/api/blueprints", {
+  method: "POST",
+  body: JSON.stringify({
+    slug: "incident-postmortem",
+    name: "Incident Postmortem",
+    description: "Structured postmortem metadata",
+    icon: "shield-alert",
+    fields: [
+      {
+        id: "tier",
+        name: "Tier",
+        kind: { select: { options: [{ id: "p0", label: "P0", color: "red" }, { id: "p1", label: "P1", color: "amber" }] } },
+        required: true,
+        sort_order: "a",
+      },
+      {
+        id: "est_cost",
+        name: "Estimated Cost",
+        kind: { number: { format: "currency" } },
+        required: false,
+        sort_order: "b",
+      },
+    ],
+    default_template_markdown: "## Summary",
+  }),
+});
+assert.equal(bpRes.res.status, 201, bpRes.text);
+const bpId = bpRes.json.id;
+
+const metaRes = await apiJson(`/api/pages/${pageId}/meta`, {
+  method: "PUT",
+  body: JSON.stringify({
+    blueprint_id: bpId,
+    values: { tier: { select_val: { option_id: "p0" } }, est_cost: { number_val: "142.75" } },
+    apply_template_if_empty: false,
+    reason: "live e2e attach blueprint",
+  }),
+});
+assert.equal(metaRes.res.status, 200, metaRes.text);
+assert.ok(metaRes.json.yaml_frontmatter.includes("incident-postmortem"), "YAML frontmatter should contain blueprint slug");
+const pageVerAfterMeta = metaRes.json.page.version;
+
+const metricTok = `{{metric:${dbId}.cost:sum}}`;
+const syncedMd = `${metaRes.json.anchored_markdown}\n\nTotal incident spend: ${metricTok}\n\n<!-- db_embed:${dbId}|${defaultViewId} -->`;
+const mdSyncRes = await apiJson(`/api/pages/${pageId}/markdown`, {
+  method: "PUT",
+  body: JSON.stringify({
+    markdown: syncedMd,
+    expected_page_version: pageVerAfterMeta,
+    reason: "live e2e embed db + metric pill",
+  }),
+});
+assert.equal(mdSyncRes.res.status, 200, mdSyncRes.text);
+assert.ok(mdSyncRes.json.anchored_markdown.includes(`<!-- db_embed:${dbId}|${defaultViewId} -->`));
+const firstBlkId = mdSyncRes.json.blocks[0].id;
+
+const resolveRes = await apiJson("/api/metrics/resolve", {
+  method: "POST",
+  body: JSON.stringify({ tokens: [metricTok], scenario_id: null }),
+});
+assert.equal(resolveRes.res.status, 200, resolveRes.text);
+const metricEntry = resolveRes.json.metrics[metricTok];
+assert.equal(metricEntry.status, "ok");
+assert.equal(Number(metricEntry.value), 142.75);
+
+const blkCtxRes = await apiJson(`/api/blocks/${firstBlkId}`);
+assert.equal(blkCtxRes.res.status, 200, blkCtxRes.text);
+assert.equal(blkCtxRes.json.block.id, firstBlkId);
+assert.equal(blkCtxRes.json.page.id, pageId);
+console.log("✓ Blueprints + Metadata + Embedded DB Markdown Sync + Live Metric Pill + Block Context verified");
+
 // 7. Mint Agent Token + live /mcp tool workflow + Modb.World Proposal Accept
 const mintRes = await apiJson("/api/admin/agents", {
   method: "POST",

@@ -832,7 +832,10 @@ fn scan_garden_report(store: Store, auth_opt: Option(AuthContext), now: Time) : 
           ) | Quote | Callout(tone: _, icon: _) | CodeBlock(language: _) | Divider | Image(
             attachment_id: _,
             caption: _
-          ) | FileEmbed(attachment_id: _, filename: _): Unit
+          ) | FileEmbed(attachment_id: _, filename: _) | DatabaseViewEmbed(
+            database_id: _,
+            view_id: _
+          ): Unit
         end
       end
     end

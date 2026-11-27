@@ -176,6 +176,7 @@ enum BlockKind
   Image(attachment_id: Text, caption: Text)
   FileEmbed(attachment_id: Text, filename: Text)
   PageLink(target_page_id: Text)
+  DatabaseViewEmbed(database_id: Text, view_id: Option(Text))
 end
 
 ## Ordered, stable-ID content unit belonging to a `Page`.
