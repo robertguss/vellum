@@ -64,6 +64,7 @@ use Domain.DatabaseModel{
 }
 use Domain.Packs{LivingSummary}
 use Domain.Policy
+use Domain.TaintBridge
 use Domain.Types{
   AppError,
   Attachment,
@@ -1353,6 +1354,43 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
         blks,
         6
       )
+      page_prov_opt = try TaintBridge.get_provenance_info(store, "vlm_pages", page.id)
+      var block_taints = {}
+      var untrusted_block_ids = []
+      for blk in blks
+        case try TaintBridge.get_provenance_info(store, "vlm_blocks", blk.id)
+          Some((tr, w, at)):
+            block_taints = block_taints.set(
+              blk.id,
+              Json.Object({
+                "trust": Json.String(tr),
+                "writer": Json.String(w),
+                "updated_at": at.to_json
+              })
+            )
+            if tr == "untrusted"
+              untrusted_block_ids = untrusted_block_ids.append(blk.id)
+            end
+          None: Unit
+        end
+      end
+      page_trust = case page_prov_opt
+        Some((tr, _w, _at)): tr
+        None: if untrusted_block_ids.empty?: "trusted" else: "untrusted"
+      end
+      taint_provenance_json = Json.Object({
+        "trust": Json.String(page_trust),
+        "page": case page_prov_opt
+          Some((tr, w, at)): Json.Object({
+            "trust": Json.String(tr),
+            "writer": Json.String(w),
+            "updated_at": at.to_json
+          })
+          None: Json.Null
+        end,
+        "blocks": Json.Object(block_taints),
+        "untrusted_block_ids": untrusted_block_ids.to_json
+      })
 
       Ok((
         (c_list, d_list, col, page, blks, cmt_rows.map(fn(x) x.1 end), att_rows.map(fn(x) x.1 end)),
@@ -1367,7 +1405,7 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
           explicit_backlinks,
           semantic_backlinks
         ),
-        (principals_json, rel_targets_json, metrics_json)
+        (principals_json, rel_targets_json, metrics_json, taint_provenance_json)
       ))
     end
   )
@@ -1385,7 +1423,7 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
       explicit_backlinks,
       semantic_backlinks
     ),
-    (principals_json, rel_targets_json, resolved_metrics_json)
+    (principals_json, rel_targets_json, resolved_metrics_json, taint_provenance_json)
   ) = page_bundle
   anchored_md = Blocks.to_anchored_markdown(blocks)
   yaml_fm = Blueprints.to_yaml_frontmatter(page, page_bp_opt, page_meta_opt, anchored_md)
@@ -1412,7 +1450,8 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
           "page_audit": page_audit.to_json,
           "citation_drifts": citation_drifts.to_json,
           "explicit_backlinks": explicit_backlinks.to_json,
-          "semantic_backlinks": semantic_backlinks.to_json
+          "semantic_backlinks": semantic_backlinks.to_json,
+          "taint_provenance": taint_provenance_json
         })
       )
     )
@@ -1445,7 +1484,8 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
       "page_audit": page_audit.to_json,
       "citation_drifts": citation_drifts.to_json,
       "explicit_backlinks": explicit_backlinks.to_json,
-      "semantic_backlinks": semantic_backlinks.to_json
+      "semantic_backlinks": semantic_backlinks.to_json,
+      "taint_provenance": taint_provenance_json
     }
   )
 end
@@ -1662,6 +1702,35 @@ fn patch_blocks(
   end
 
   now = clock.now
+  patch_sid = case req.header("X-Taint-Session")
+    Some(s) if not s.trim.empty?: Some(s.trim)
+    Some(_) | None: if auth.principal.kind == Agent: Some("agent:#{auth.grant_id}") else: None
+  end
+  case patch_sid
+    Some(sid):
+      if files.read_only.exists?(Db.ledger_db_path)
+        sess_opt = try Ledger.read_locked(
+          files.read_only,
+          Db.ledger_db_path,
+          Db.vellum_schema(),
+          Db.map_ledger_error,
+          fn(db) TaintBridge.get_taint_session(Ledger.store(db), sid) end
+        )
+        case sess_opt
+          Some(_):
+            _auth_sess = try TaintBridge.authorize_action_locked(
+              files,
+              Db.ledger_db_path,
+              Db.vellum_schema(),
+              sid,
+              "page.write_direct",
+              now
+            )
+          None: Unit
+        end
+      end
+    None: Unit
+  end
   prov = make_provenance(auth, input.reason, now)
   idx_job = Jobs.prepare(
     rng,
@@ -2733,37 +2802,74 @@ fn drain_jobs(_payload: Json, files: Files, clock: Clock, env: Env, net: Network
               e.to_text
             ).map_error(Db.map_table_error)
             Ok(wp):
-              res = Webhooks.deliver(
-                wp.url,
-                wp.secret,
-                wp.delivery_id,
-                wp.event,
-                wp.body_json.to_text.bytes,
-                clock.now,
-                "X-Vellum-Signature-256",
-                net
-              )
-              case res
-                Ok(Webhooks.Delivered(status: _)) | Ok(
-                  Webhooks.PermanentFailure(status: _, reason: _)
-                ): try Jobs.complete(files, Db.ledger_db_path, clock, job.id, job.attempts)
-                  .map_error(Db.map_table_error)
-                Ok(Webhooks.RetryableFailure(status: _, reason: r)): try Jobs.fail_or_retry(
+              taint_check = case wp.taint_session_id
+                Some(sid):
+                  sess_opt = try Ledger.read_locked(
+                    files.read_only,
+                    Db.ledger_db_path,
+                    Db.vellum_schema(),
+                    Db.map_ledger_error,
+                    fn(db) TaintBridge.get_taint_session(Ledger.store(db), sid) end
+                  )
+                  case sess_opt
+                    Some(_):
+                      case TaintBridge.authorize_action_locked(
+                        files,
+                        Db.ledger_db_path,
+                        Db.vellum_schema(),
+                        sid,
+                        "webhook.deliver",
+                        clock.now
+                      )
+                        Ok(_): Ok(Unit)
+                        Error(te): Error(te)
+                      end
+                    None: Ok(Unit)
+                  end
+                None: Ok(Unit)
+              end
+              case taint_check
+                Error(te): try Jobs.fail_or_retry(
                   files,
                   Db.ledger_db_path,
                   clock,
                   job.id,
-                  job.attempts,
-                  r
+                  999,
+                  "blocked by Modb.Taint Lethal Trifecta policy: #{te.to_text}"
                 ).map_error(Db.map_table_error)
-                Error(we): try Jobs.fail_or_retry(
-                  files,
-                  Db.ledger_db_path,
-                  clock,
-                  job.id,
-                  job.attempts,
-                  we.to_text
-                ).map_error(Db.map_table_error)
+                Ok(_):
+                  res = Webhooks.deliver(
+                    wp.url,
+                    wp.secret,
+                    wp.delivery_id,
+                    wp.event,
+                    wp.body_json.to_text.bytes,
+                    clock.now,
+                    "X-Vellum-Signature-256",
+                    net
+                  )
+                  case res
+                    Ok(Webhooks.Delivered(status: _)) | Ok(
+                      Webhooks.PermanentFailure(status: _, reason: _)
+                    ): try Jobs.complete(files, Db.ledger_db_path, clock, job.id, job.attempts)
+                      .map_error(Db.map_table_error)
+                    Ok(Webhooks.RetryableFailure(status: _, reason: r)): try Jobs.fail_or_retry(
+                      files,
+                      Db.ledger_db_path,
+                      clock,
+                      job.id,
+                      job.attempts,
+                      r
+                    ).map_error(Db.map_table_error)
+                    Error(we): try Jobs.fail_or_retry(
+                      files,
+                      Db.ledger_db_path,
+                      clock,
+                      job.id,
+                      job.attempts,
+                      we.to_text
+                    ).map_error(Db.map_table_error)
+                  end
               end
           end
         else

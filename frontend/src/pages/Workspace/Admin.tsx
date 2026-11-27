@@ -10,6 +10,8 @@ import {
   Link2,
   Lock,
   RotateCcw,
+  ShieldAlert,
+  ShieldCheck,
   Upload,
   Webhook,
 } from "lucide-react";
@@ -24,6 +26,7 @@ import type {
   GardenReport,
   ReplayProposalSummary,
   ReplayStatusResponse,
+  TaintStatusResponse,
   WebhookSubPublic,
 } from "../../lib/types";
 
@@ -40,9 +43,9 @@ export default function AdminConsole({
   audit_feed = [],
   webhooks: initialWebhooks = [],
 }: AdminProps) {
-  const [tab, setTab] = useState<"agents" | "garden" | "importer" | "replay" | "webhooks">(
-    "agents"
-  );
+  const [tab, setTab] = useState<
+    "agents" | "garden" | "importer" | "replay" | "taint" | "webhooks"
+  >("agents");
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -83,6 +86,14 @@ export default function AdminConsole({
   const [replayBusy, setReplayBusy] = useState(false);
   const [replaySim, setReplaySim] = useState<ReplayProposalSummary | null>(null);
 
+  // Modb.Taint & Lethal Trifecta Control Plane
+  const [taintStatus, setTaintStatus] = useState<TaintStatusResponse | null>(null);
+  const [taintLoading, setTaintLoading] = useState(false);
+  const [clearingSid, setClearingSid] = useState<string | null>(null);
+  const [clearReason, setClearReason] = useState(
+    "Admin reviewed untrusted provenance and approved taint reset"
+  );
+
   // Webhooks
   const [webhooks, setWebhooks] = useState<WebhookSubPublic[]>(initialWebhooks);
   const [whUrl, setWhUrl] = useState("");
@@ -96,8 +107,40 @@ export default function AdminConsole({
   useEffect(() => {
     if (tab === "replay") {
       void loadReplayStatus();
+    } else if (tab === "taint") {
+      void loadTaintStatus();
     }
   }, [tab]);
+
+  async function loadTaintStatus() {
+    setTaintLoading(true);
+    try {
+      const st = await apiFetch<TaintStatusResponse>("/api/admin/taint/status");
+      setTaintStatus(st);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not load Modb.Taint status");
+    } finally {
+      setTaintLoading(false);
+    }
+  }
+
+  async function handleClearTaint(sessionId: string) {
+    setClearingSid(sessionId);
+    setError(null);
+    setNotice(null);
+    try {
+      await apiFetch(`/api/admin/taint/sessions/${encodeURIComponent(sessionId)}/clear`, {
+        method: "POST",
+        body: JSON.stringify({ reason: clearReason }),
+      });
+      setNotice(`Cleared Modb.Taint session ${sessionId}`);
+      await loadTaintStatus();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to clear taint session");
+    } finally {
+      setClearingSid(null);
+    }
+  }
 
   async function loadReplayStatus() {
     try {
@@ -425,6 +468,7 @@ export default function AdminConsole({
                 ["garden", "Gardening", Leaf],
                 ["importer", "Notion Importer", Upload],
                 ["replay", "Selective Undo", RotateCcw],
+                ["taint", "Taint & Safety", ShieldAlert],
                 ["webhooks", "Webhooks", Webhook],
               ] as const
             ).map(([key, label, Icon]) => (
@@ -1304,6 +1348,205 @@ export default function AdminConsole({
                 <code className="font-mono">Modb.World</code> Change Proposals without ever writing live content.
               </p>
             </div>
+          </div>
+        )}
+
+        {/* TAB 6: MODB.TAINT & LETHAL TRIFECTA CONTROL PLANE */}
+        {tab === "taint" && (
+          <div className="space-y-6">
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-stone-200 bg-white p-5">
+              <div>
+                <div className="flex items-center gap-2 text-sm font-semibold text-stone-900">
+                  <ShieldAlert className="h-4 w-4 text-amber-700" />
+                  Modb.Taint Lethal Trifecta Defense
+                </div>
+                <p className="text-xs text-stone-500 mt-0.5">
+                  Monotonic taint tracking across MCP, RLM child forks, imported Notion docs, and
+                  GitHub PR proposals with two-way write-down &amp; exfiltration blocking.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void loadTaintStatus()}
+                disabled={taintLoading}
+                className="rounded-lg border border-stone-200 px-3 py-1.5 text-xs font-medium text-stone-700 hover:bg-stone-50 disabled:opacity-50"
+              >
+                {taintLoading ? "Refreshing..." : "Refresh Status"}
+              </button>
+            </div>
+
+            {taintStatus && (
+              <>
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                  <div className="rounded-2xl border border-stone-200 bg-white p-4">
+                    <div className="text-[11px] uppercase tracking-wider text-stone-500">
+                      Total Sessions
+                    </div>
+                    <div className="mt-1 text-2xl font-semibold text-stone-950">
+                      {taintStatus.sessions.length}
+                    </div>
+                  </div>
+                  <div className="rounded-2xl border border-amber-200 bg-amber-50/50 p-4">
+                    <div className="text-[11px] uppercase tracking-wider text-amber-800">
+                      Active Tainted
+                    </div>
+                    <div className="mt-1 text-2xl font-semibold text-amber-950">
+                      {taintStatus.sessions.filter((s) => s.untrusted_tainted).length}
+                    </div>
+                  </div>
+                  <div className="rounded-2xl border border-red-200 bg-red-50/40 p-4">
+                    <div className="text-[11px] uppercase tracking-wider text-red-700">
+                      Lethal Trifecta Blocks
+                    </div>
+                    <div className="mt-1 text-2xl font-semibold text-red-900">
+                      {taintStatus.sessions.reduce((acc, s) => acc + s.blocked_attempts, 0)}
+                    </div>
+                  </div>
+                  <div className="rounded-2xl border border-stone-200 bg-white p-4">
+                    <div className="text-[11px] uppercase tracking-wider text-stone-500">
+                      Untrusted Markers
+                    </div>
+                    <div className="mt-1 text-2xl font-semibold text-stone-950">
+                      {taintStatus.untrusted.pages.length +
+                        taintStatus.untrusted.blocks.length +
+                        taintStatus.untrusted.proposals.length}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-stone-200 bg-white p-5 space-y-3 text-xs">
+                  <div className="text-sm font-semibold text-stone-900">Active Policy Rules</div>
+                  <div className="flex flex-wrap gap-2">
+                    <span className="rounded-full border border-stone-200 bg-stone-50 px-2.5 py-1 font-mono">
+                      max_sensitivity_when_tainted={taintStatus.policy.max_sensitivity_when_tainted}
+                    </span>
+                    <span className="rounded-full border border-stone-200 bg-stone-50 px-2.5 py-1 font-mono">
+                      block_write_down={String(taintStatus.policy.block_write_down)}
+                    </span>
+                    {taintStatus.policy.external_actions.map((act) => (
+                      <span
+                        key={act}
+                        className="rounded-full border border-red-200 bg-red-50 px-2.5 py-1 font-mono text-red-800"
+                      >
+                        action:{act}
+                      </span>
+                    ))}
+                    {taintStatus.policy.exfil_sinks.map((sink) => (
+                      <span
+                        key={sink}
+                        className="rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 font-mono text-amber-900"
+                      >
+                        sink:{sink}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-stone-200 bg-white p-5 space-y-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="text-sm font-semibold text-stone-900">
+                      Tracked Sessions &amp; Fork Lineage ({taintStatus.sessions.length})
+                    </div>
+                    <input
+                      value={clearReason}
+                      onChange={(e) => setClearReason(e.target.value)}
+                      placeholder="Audit reason when clearing session taint"
+                      className="w-full sm:w-96 rounded-lg border border-stone-200 px-3 py-1.5 text-xs"
+                    />
+                  </div>
+                  {taintStatus.sessions.length === 0 ? (
+                    <p className="text-xs text-stone-400">
+                      No Modb.Taint sessions recorded yet. Run MCP search/read or Tier 2 RLM
+                      queries to inspect live session state.
+                    </p>
+                  ) : (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left text-xs">
+                        <thead>
+                          <tr className="border-b border-stone-200 text-stone-500">
+                            <th className="py-2 pr-3 font-medium">Session ID</th>
+                            <th className="py-2 pr-3 font-medium">Principal / Parent</th>
+                            <th className="py-2 pr-3 font-medium">Status</th>
+                            <th className="py-2 pr-3 font-medium">Untrusted Sources</th>
+                            <th className="py-2 pr-3 font-medium">Blocks</th>
+                            <th className="py-2 font-medium text-right">Action</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-stone-100">
+                          {taintStatus.sessions.map((s) => (
+                            <tr key={s.id}>
+                              <td className="py-2.5 pr-3 font-mono font-medium text-stone-900">
+                                {s.id}
+                              </td>
+                              <td className="py-2.5 pr-3 text-stone-600">
+                                <div className="font-mono">{s.principal}</div>
+                                {s.parent_session_id && (
+                                  <div className="text-[11px] font-mono text-indigo-700">
+                                    forked from {s.parent_session_id}
+                                  </div>
+                                )}
+                              </td>
+                              <td className="py-2.5 pr-3">
+                                {s.untrusted_tainted ? (
+                                  <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-900">
+                                    <ShieldAlert className="h-3 w-3" />
+                                    Tainted
+                                  </span>
+                                ) : (
+                                  <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-800">
+                                    <ShieldCheck className="h-3 w-3" />
+                                    Clean{s.cleared_by ? ` (${s.cleared_by})` : ""}
+                                  </span>
+                                )}
+                              </td>
+                              <td className="py-2.5 pr-3 font-mono text-[11px] text-stone-600 max-w-xs truncate">
+                                {s.untrusted_sources.length > 0
+                                  ? s.untrusted_sources.join(", ")
+                                  : "—"}
+                              </td>
+                              <td className="py-2.5 pr-3 font-mono">
+                                {s.blocked_attempts > 0 ? (
+                                  <span className="rounded bg-red-100 px-1.5 py-0.5 font-semibold text-red-800">
+                                    {s.blocked_attempts}
+                                  </span>
+                                ) : (
+                                  "0"
+                                )}
+                              </td>
+                              <td className="py-2.5 text-right">
+                                {s.untrusted_tainted ? (
+                                  <button
+                                    type="button"
+                                    disabled={clearingSid === s.id}
+                                    onClick={() => void handleClearTaint(s.id)}
+                                    className="rounded-lg border border-amber-300 bg-amber-50 px-2.5 py-1 font-medium text-amber-900 hover:bg-amber-100 disabled:opacity-50"
+                                  >
+                                    {clearingSid === s.id ? "Clearing..." : "Clear Taint"}
+                                  </button>
+                                ) : (
+                                  <span className="text-[11px] text-stone-400">Cleared</span>
+                                )}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+
+                <div className="rounded-2xl border border-stone-200 bg-white p-5 space-y-2 text-xs">
+                  <div className="text-sm font-semibold text-stone-900">
+                    Untrusted Provenance Inventory
+                  </div>
+                  <div className="text-stone-600 font-mono">
+                    Pages ({taintStatus.untrusted.pages.length}) · Blocks (
+                    {taintStatus.untrusted.blocks.length}) · Proposals (
+                    {taintStatus.untrusted.proposals.length})
+                  </div>
+                </div>
+              </>
+            )}
           </div>
         )}
       </div>

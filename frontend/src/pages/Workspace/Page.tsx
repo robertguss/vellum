@@ -14,6 +14,7 @@ import {
   RefreshCw,
   Save,
   Send,
+  ShieldAlert,
   Sparkles,
   Upload,
 } from "lucide-react";
@@ -39,6 +40,7 @@ import type {
   GardenCitationDrift,
   Page,
   PageBlueprintMeta,
+  PageTaintProvenance,
   PrincipalSummary,
   ProposalMeta,
   RelationTargetOption,
@@ -68,6 +70,7 @@ interface PageProps {
   citation_drifts?: GardenCitationDrift[];
   explicit_backlinks?: ExplicitBacklink[];
   semantic_backlinks?: SemanticBacklink[];
+  taint_provenance?: PageTaintProvenance | null;
 }
 
 async function sha256Hex(file: File): Promise<string> {
@@ -118,6 +121,7 @@ export default function PageView({
   citation_drifts = [],
   explicit_backlinks = [],
   semantic_backlinks = [],
+  taint_provenance = null,
 }: PageProps) {
   const [page, setPage] = useState<Page>(initialPage);
   const [stagingDriftId, setStagingDriftId] = useState<string | null>(null);
@@ -547,6 +551,39 @@ export default function PageView({
           </div>
         </div>
 
+        {/* Modb.Taint Untrusted Provenance Banner */}
+        {taint_provenance &&
+          (taint_provenance.trust === "untrusted" ||
+            taint_provenance.untrusted_block_ids.length > 0) && (
+            <div className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs text-amber-950">
+              <div className="flex items-start gap-2.5">
+                <ShieldAlert className="h-4 w-4 text-amber-700 shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-semibold">
+                    Modb.Taint Untrusted External Provenance
+                  </span>
+                  {taint_provenance.page?.writer ? (
+                    <span> · Source: <code className="font-mono">{taint_provenance.page.writer}</code></span>
+                  ) : null}
+                  {taint_provenance.untrusted_block_ids.length > 0 ? (
+                    <span> · {taint_provenance.untrusted_block_ids.length} untrusted block(s)</span>
+                  ) : null}
+                  <p className="text-[11px] text-amber-800 mt-0.5">
+                    Agent sessions reading this content become tainted monotonically; Lethal
+                    Trifecta policy blocks direct writes and webhook exfiltration until an Admin
+                    clears the session.
+                  </p>
+                </div>
+              </div>
+              <Link
+                href="/admin"
+                className="rounded-lg border border-amber-300 bg-white px-2.5 py-1 font-medium text-amber-900 hover:bg-amber-100 shrink-0"
+              >
+                Inspect in Taint &amp; Safety →
+              </Link>
+            </div>
+          )}
+
         {/* Scenario Comparison Strip */}
         {openScenarios.length > 0 && (
           <div className="rounded-xl border border-indigo-200 bg-indigo-50/60 px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
@@ -723,6 +760,7 @@ export default function PageView({
             yamlFrontmatter={yamlFm}
             pageAudit={page_audit}
             citationDrifts={citation_drifts}
+            taintProvenance={taint_provenance}
             stagingDriftId={stagingDriftId}
             onStageDriftProposal={async (d) => {
               const driftKey = `${d.dependent_block_id}->${d.cited_block_id}`;

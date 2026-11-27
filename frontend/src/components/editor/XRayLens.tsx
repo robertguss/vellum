@@ -8,6 +8,8 @@ import {
   History,
   Layers,
   Shield,
+  ShieldAlert,
+  ShieldCheck,
   User,
 } from "lucide-react";
 import { useEffect, useState } from "react";
@@ -18,6 +20,7 @@ import type {
   GardenCitationDrift,
   Page,
   PageHistoryResponse,
+  PageTaintProvenance,
   PageTimeTravelResponse,
   ResolvedMetric,
 } from "../../lib/types";
@@ -30,6 +33,7 @@ interface XRayLensProps {
   yamlFrontmatter: string;
   pageAudit: AuditFeedItem[];
   citationDrifts?: GardenCitationDrift[];
+  taintProvenance?: PageTaintProvenance | null;
   stagingDriftId?: string | null;
   onStageDriftProposal?: (drift: GardenCitationDrift) => void;
   onInspectBlock: (blockId: string) => void;
@@ -42,6 +46,7 @@ export default function XRayLens({
   yamlFrontmatter,
   pageAudit,
   citationDrifts = [],
+  taintProvenance = null,
   stagingDriftId = null,
   onStageDriftProposal,
   onInspectBlock,
@@ -302,13 +307,30 @@ export default function XRayLens({
 
       {/* Block Provenance Matrix */}
       <section className="rounded-2xl border border-stone-200 bg-white p-5 space-y-3">
-        <div className="flex items-center gap-2 text-sm font-semibold text-stone-900">
-          <Shield className="h-4 w-4 text-blue-700" />
-          Canonical Block Provenance Tree ({blocks.length} blocks)
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2 text-sm font-semibold text-stone-900">
+            <Shield className="h-4 w-4 text-blue-700" />
+            Canonical Block Provenance Tree ({blocks.length} blocks)
+          </div>
+          {taintProvenance &&
+          (taintProvenance.trust === "untrusted" ||
+            taintProvenance.untrusted_block_ids.length > 0) ? (
+            <span className="inline-flex items-center gap-1 rounded-full border border-amber-300 bg-amber-50 px-2.5 py-0.5 text-[11px] font-medium text-amber-900">
+              <ShieldAlert className="h-3 w-3 text-amber-700" />
+              Untrusted Provenance
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-0.5 text-[11px] font-medium text-emerald-800">
+              <ShieldCheck className="h-3 w-3 text-emerald-600" />
+              Trusted Provenance
+            </span>
+          )}
         </div>
         <div className="divide-y divide-stone-100">
           {blocks.map((b) => {
             const isHuman = b.provenance.author_kind === "human_author";
+            const blockTaint = taintProvenance?.blocks?.[b.id];
+            const isUntrusted = blockTaint?.trust === "untrusted";
             return (
               <div key={b.id} className="py-3 flex flex-wrap items-start justify-between gap-3">
                 <div className="space-y-1 min-w-0 flex-1">
@@ -334,6 +356,12 @@ export default function XRayLens({
                       {isHuman ? <User className="h-2.5 w-2.5" /> : <Bot className="h-2.5 w-2.5" />}
                       {b.provenance.author_id}
                     </span>
+                    {isUntrusted && (
+                      <span className="inline-flex items-center gap-1 rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 font-mono text-[10px] text-amber-900">
+                        <ShieldAlert className="h-2.5 w-2.5 text-amber-700" />
+                        Untrusted · {blockTaint.writer}
+                      </span>
+                    )}
                     {b.provenance.proposal_id && (
                       <span className="rounded-full bg-indigo-50 border border-indigo-200 px-2 py-0.5 font-mono text-[10px] text-indigo-800">
                         {b.provenance.proposal_id}

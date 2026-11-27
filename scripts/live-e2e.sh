@@ -2417,6 +2417,203 @@ assert.equal(mcpTier2Res.result?.isError, false, JSON.stringify(mcpTier2Res));
 assert.equal(mcpTier2Res.result?.structuredContent?.tier, "tier2_micro_repl");
 assert.ok(!JSON.stringify(mcpTier2Res).includes("zxqvault"), "MCP Tier 2 RLM never leaks restricted collection");
 console.log("✓ Live Phase 3.4 RLM Tier 2 Mo Micro-REPL VM (/api/ai/deep-research + /mcp vellum.rlm_query) verified");
+
+// 16. Live Phase 4.1 Modb.Taint Lethal Trifecta Provenance, Fork Inheritance & Admin Clear
+const taintColRes = await apiJson("/api/collections", {
+  method: "POST",
+  body: JSON.stringify({
+    slug: "live-taint-lab",
+    name: "Live Taint Lab",
+    write_policy: "direct_with_audit",
+    freshness_ttl_days: 30,
+  }),
+});
+assert.equal(taintColRes.res.status, 201, taintColRes.text);
+const taintColId = taintColRes.json.id;
+
+const cleanPgRes = await apiJson("/api/pages", {
+  method: "POST",
+  body: JSON.stringify({
+    collection_id: taintColId,
+    title: "Live Clean Target",
+    markdown: "Trusted live specification baseline.",
+    reason: "seed live phase 4.1 clean page",
+  }),
+});
+assert.equal(cleanPgRes.res.status, 201, cleanPgRes.text);
+const cleanPgId = cleanPgRes.json.page.id;
+const cleanBlkId = cleanPgRes.json.blocks[0].id;
+
+const taintAgentMint = await apiJson("/api/admin/agents", {
+  method: "POST",
+  body: JSON.stringify({
+    handle: "live-taint-agent",
+    display_name: "Live Taint Agent",
+    model_id: "claude-sonnet-4-6",
+    label: "live-taint-e2e",
+    allowed_actions: ["read", "comment", "propose", "write_direct"],
+    allowed_collections: [taintColId],
+    max_calls: 100,
+    ttl_days: 7,
+  }),
+});
+assert.equal(taintAgentMint.res.status, 201, taintAgentMint.text);
+const taintTok = taintAgentMint.json.raw_token;
+
+async function mcpTaintCall(id, name, argsObj) {
+  const r = await fetch(`${BASE}/mcp`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${taintTok}`,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: { name, arguments: argsObj },
+    }),
+  });
+  assert.equal(r.status, 200);
+  return r.json();
+}
+
+const impTaintRes = await apiJson("/api/import/notion", {
+  method: "POST",
+  body: JSON.stringify({
+    collection_id: taintColId,
+    pages: [
+      {
+        path: "export/External%20Brief%209a1b2c3d4e5f67890123456789abcdef.md",
+        title: null,
+        markdown: "Untrusted Notion brief livezebra991 for taint tracking.",
+      },
+    ],
+    databases: [],
+  }),
+});
+assert.equal(impTaintRes.res.status, 201, impTaintRes.text);
+assert.equal(impTaintRes.json.trust_tier, "untrusted");
+const impTaintPgId = impTaintRes.json.imported_pages[0].id;
+
+const impShowRes = await apiJson(`/api/pages/${impTaintPgId}`);
+assert.equal(impShowRes.res.status, 200, impShowRes.text);
+assert.equal(impShowRes.json.taint_provenance?.trust, "untrusted");
+assert.ok((impShowRes.json.taint_provenance?.untrusted_block_ids ?? []).length >= 1);
+
+const mcpTaintSearch = await mcpTaintCall(1601, "vellum.search", {
+  q: "livezebra991",
+  session_id: "live-p41-parent",
+});
+assert.equal(mcpTaintSearch.result?.isError, false, JSON.stringify(mcpTaintSearch));
+assert.equal(
+  mcpTaintSearch.result?.structuredContent?.taint_session?.untrusted_tainted,
+  true
+);
+
+const mcpChildRead = await mcpTaintCall(1602, "vellum.read_page", {
+  page_id: cleanPgId,
+  session_id: "live-p41-child",
+  parent_session_id: "live-p41-parent",
+});
+assert.equal(mcpChildRead.result?.isError, false, JSON.stringify(mcpChildRead));
+assert.equal(mcpChildRead.result?.structuredContent?.taint_session?.untrusted_tainted, true);
+assert.equal(
+  mcpChildRead.result?.structuredContent?.taint_session?.parent_session_id,
+  "live-p41-parent"
+);
+
+const mcpTaintedPatch = await mcpTaintCall(1603, "vellum.patch_blocks", {
+  page_id: cleanPgId,
+  reason: "should be blocked by Modb.Taint",
+  session_id: "live-p41-child",
+  ops: [
+    {
+      replace_block: {
+        block_id: cleanBlkId,
+        expected_version: 1,
+        kind: null,
+        markdown: "Live overwrite attempt",
+      },
+    },
+  ],
+  expected_versions: { [cleanBlkId]: 1 },
+});
+assert.equal(mcpTaintedPatch.result?.isError, true, "Tainted child blocked from vellum.patch_blocks");
+
+const taintedWhRes = await apiJson("/api/webhooks", {
+  method: "POST",
+  headers: { "X-Taint-Session": "live-p41-parent" },
+  body: JSON.stringify({
+    collection_id: taintColId,
+    url: "https://exfil.example.com/hook",
+    events: ["page.updated"],
+  }),
+});
+assert.equal(taintedWhRes.res.status, 403, taintedWhRes.text);
+
+const mcpTaintedProp = await mcpTaintCall(1604, "vellum.proposal_open", {
+  page_id: cleanPgId,
+  title: "Live safe proposal while tainted",
+  reason: "proposals stay permitted while direct writes are blocked",
+});
+assert.equal(mcpTaintedProp.result?.isError, false, JSON.stringify(mcpTaintedProp));
+
+const taintStRes = await apiJson("/api/admin/taint/status");
+assert.equal(taintStRes.res.status, 200, taintStRes.text);
+assert.ok(
+  (taintStRes.json.sessions ?? []).some(
+    (s) => s.id === "live-p41-parent" && s.untrusted_tainted
+  )
+);
+assert.ok(
+  (taintStRes.json.sessions ?? []).some(
+    (s) => s.id === "live-p41-child" && s.untrusted_tainted && s.blocked_attempts >= 1
+  )
+);
+
+const clrParentRes = await apiJson("/api/admin/taint/sessions/live-p41-parent/clear", {
+  method: "POST",
+  body: JSON.stringify({ reason: "Live E2E admin verified" }),
+});
+assert.equal(clrParentRes.res.status, 200, clrParentRes.text);
+assert.equal(clrParentRes.json.session?.untrusted_tainted, false);
+
+const unblockedWhRes = await apiJson("/api/webhooks", {
+  method: "POST",
+  headers: { "X-Taint-Session": "live-p41-parent" },
+  body: JSON.stringify({
+    collection_id: taintColId,
+    url: "https://safe.example.com/hook",
+    events: ["page.updated"],
+  }),
+});
+assert.equal(unblockedWhRes.res.status, 201, unblockedWhRes.text);
+
+const clrChildRes = await apiJson("/api/admin/taint/sessions/live-p41-child/clear", {
+  method: "POST",
+  body: JSON.stringify({ reason: "Live E2E admin verified child" }),
+});
+assert.equal(clrChildRes.res.status, 200, clrChildRes.text);
+
+const unblockedPatchRes = await mcpTaintCall(1605, "vellum.patch_blocks", {
+  page_id: cleanPgId,
+  reason: "allowed after admin taint clear",
+  session_id: "live-p41-child",
+  ops: [
+    {
+      replace_block: {
+        block_id: cleanBlkId,
+        expected_version: 1,
+        kind: null,
+        markdown: "Verified live post-clear update.",
+      },
+    },
+  ],
+  expected_versions: { [cleanBlkId]: 1 },
+});
+assert.equal(unblockedPatchRes.result?.isError, false, JSON.stringify(unblockedPatchRes));
+console.log("✓ Live Phase 4.1 Modb.Taint Lethal Trifecta Provenance, Fork Inheritance & Admin Clear verified");
 EOF
 
 echo "All Live Vellum E2E checks against mo serve + Dex + VersityGW S3 passed."

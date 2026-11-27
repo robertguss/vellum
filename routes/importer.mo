@@ -10,6 +10,7 @@ use Domain.Blocks
 use Domain.DatabaseModel{DatabaseDef, DbRow, DbViewDef, DbViewKind}
 use Domain.NotionImport{NotionCsvImport, NotionPageImport}
 use Domain.Policy
+use Domain.TaintBridge
 use Domain.Types{AppError, AuthContext, AuthorKind, Page, PageKind, PrincipalKind, Provenance}
 use Json
 use Modb.Grants
@@ -268,10 +269,36 @@ fn import_notion(
 
       for (pg, blks) in prepared_pages
         cur = try Db.tx_save_page_and_blocks(cur, pg, blks)
+        cur = try TaintBridge.tx_mark_provenance(
+          cur,
+          "vlm_pages",
+          pg.id,
+          "import:notion:#{auth.principal.handle}",
+          "untrusted",
+          now
+        )
+        for blk in blks
+          cur = try TaintBridge.tx_mark_provenance(
+            cur,
+            "vlm_blocks",
+            blk.id,
+            "import:notion:#{auth.principal.handle}",
+            "untrusted",
+            now
+          )
+        end
       end
       for (def, host_pg, view_def, rows_and_pages) in prepared_dbs
         cur = try Table.put(cur, Db.pages_table(), host_pg.id, host_pg).map_error(
           Db.map_table_error
+        )
+        cur = try TaintBridge.tx_mark_provenance(
+          cur,
+          "vlm_pages",
+          host_pg.id,
+          "import:notion-csv:#{auth.principal.handle}",
+          "untrusted",
+          now
         )
         cur = try Table.put(cur, Db.databases_table(), def.id, def).map_error(Db.map_table_error)
         cur = try Table.put(cur, Db.db_views_table(), view_def.id, view_def).map_error(
@@ -279,6 +306,22 @@ fn import_notion(
         )
         for (r, rp) in rows_and_pages
           cur = try Db.tx_put_db_row(cur, def, r, rp, [])
+          cur = try TaintBridge.tx_mark_provenance(
+            cur,
+            "vlm_db_rows",
+            r.id,
+            "import:notion-csv:#{auth.principal.handle}",
+            "untrusted",
+            now
+          )
+          cur = try TaintBridge.tx_mark_provenance(
+            cur,
+            "vlm_pages",
+            rp.id,
+            "import:notion-csv:#{auth.principal.handle}",
+            "untrusted",
+            now
+          )
         end
       end
       for job_rec in idx_jobs
@@ -297,7 +340,8 @@ fn import_notion(
         "imported_databases": Json.Array(prepared_dbs.map(fn(x) x.0.to_json end)),
         "page_count": Json.int(prepared_pages.size),
         "database_count": Json.int(prepared_dbs.size),
-        "row_count": Json.int(total_rows)
+        "row_count": Json.int(total_rows),
+        "trust_tier": Json.String("untrusted")
       })
     )
   )

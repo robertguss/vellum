@@ -55,6 +55,9 @@ mo check routes/packs.mo
 mo check routes/sync.mo
 mo check sync.mo
 mo check main.mo
+mo check tests/phase2.mo
+mo check tests/phase3.mo
+mo check tests/phase4.mo
 
 mo test domain/blocks.mo
 mo test domain/policy.mo
@@ -70,5 +73,8 @@ mo test domain/notion-import.mo
 mo test sync.mo
 mo test db.mo
 mo test main.mo
+mo test tests/phase2.mo
+mo test tests/phase3.mo
+mo test tests/phase4.mo
 
 echo "All Vellum Stage 1-5 checks, frontend build checks, and tests passed."
