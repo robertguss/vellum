@@ -1007,3 +1007,53 @@ export interface PurgeSecretResponse {
   comments_redacted: number;
   affected_page_ids: string[];
 }
+
+export interface GrantTreeNode {
+  id: string;
+  parent_id: string | null;
+  principal_id: string;
+  principal_handle: string | null;
+  principal_name: string | null;
+  principal_kind: PrincipalKind | null;
+  model_id: string | null;
+  role: WorkspaceRole | null;
+  allowed_actions: string[];
+  allowed_collections: string[] | null;
+  max_calls: number;
+  used_calls: number;
+  utilization_pct: number;
+  expires_at: string;
+  revoked: boolean;
+  revoked_directly: boolean;
+  revoked_via: string | null;
+  status: "active" | "revoked" | "expired" | "exhausted" | string;
+  depth: number;
+  descendant_count: number;
+  chain: string[];
+  token_prefix: string | null;
+  token_label: string | null;
+  last_used_at: string | null;
+}
+
+export interface GrantTreeSummary {
+  total_grants: number;
+  active_grants: number;
+  active_agent_grants: number;
+  delegated_grants: number;
+  revoked_grants: number;
+  expired_grants: number;
+  exhausted_grants: number;
+  total_calls_used: number;
+  total_call_budget: number;
+}
+
+export interface GrantTreeResponse {
+  summary: GrantTreeSummary;
+  grants: GrantTreeNode[];
+}
+
+export interface KillAllGrantsResponse {
+  revoked_count: number;
+  revoked_grant_ids: string[];
+  reason: string;
+}

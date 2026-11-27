@@ -835,3 +835,361 @@ test "Phase 4.2: One-click Modb.Erasure secret detection, crypto-shredding, comp
   end
   assert not raw_disk2.to_hex.contains?(leaked_stripe.bytes.to_hex)
 end
+
+test "Phase 4.3: Sub-Delegation Control Plane (Modb.Grants tree, budget gauges, live SSE, cascade revoke & kill-all)"
+  manifest_json = """
+    {
+      "src/main.tsx": {
+        "file": "assets/main-p43test.js",
+        "css": ["assets/main-p43test.css"],
+        "isEntry": true
+      }
+    }
+    """
+  files = Files.in_memory({
+    "public/manifest.json": manifest_json,
+    "public/assets/main-p43test.js": "console.log('p43');",
+    "public/assets/main-p43test.css": "body{margin:0}"
+  })
+  rng = SecureRandom.seeded(20261129)
+  t0 = Time.parse("2026-11-27T14:00:00Z") or stop "t0"
+  clock = Clock.fixed(t0)
+  env = Env.of({"VELLUM_MODE": "solo", "VELLUM_INSECURE_COOKIES": "1"})
+  empty_net = Network.fake({})
+
+  # 1. Solo Owner + Collection + Target Page
+  guest = WebTest.new().with_header("Host", "127.0.0.1:8080")
+  solo_cb = ApiTest.send(
+    Main,
+    WebTest.prepare(guest, Api.get("/auth/solo/login?return_to=/").with_header("Host", "127.0.0.1:8080")),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert solo_cb.status == 303
+  owner = WebTest.absorb(guest, solo_cb)
+
+  col_res = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/collections").with_json(
+        Workspace.CreateCollectionInput(
+          slug: "deleg-lab",
+          name: "Delegation Lab",
+          description: None,
+          icon: None,
+          write_policy: ProposalsRequiredForAgents,
+          freshness_ttl_days: Some(30)
+        )
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert col_res.status == 201
+  col_id = must_json(col_res.text).text_at("id") or stop "col_id"
+
+  pg_res = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/pages").with_json(
+        Workspace.CreatePageInput(
+          collection_id: col_id,
+          parent_page_id: None,
+          title: "Control Plane Runbook",
+          markdown: "Baseline hierarchy check page.",
+          icon: None,
+          freshness_ttl_days: None,
+          reason: Some("seed page for delegation test")
+        )
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert pg_res.status == 201
+  pg_id = must_json(pg_res.text).text_at("page.id") or stop "pg_id"
+
+  # 2. Mint Root Agent A (max_calls: 20) -> publishes grant.minted on "grants"
+  mint_a = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/admin/agents").with_json(
+        Workspace.MintAgentTokenInput(
+          handle: "root-planner",
+          display_name: "Root Planner Agent",
+          model_id: Some("claude-sonnet-4-6"),
+          label: "root-planner",
+          allowed_actions: ["read", "propose", "delegate"],
+          allowed_collections: Some([col_id]),
+          max_calls: 20,
+          ttl_days: 7
+        )
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert mint_a.status == 201
+  assert mint_a.sse_published_events.any?(fn(e)
+    e.topic == "grants" and e.event == Some("grant.minted")
+  end)
+  aj = must_json(mint_a.text)
+  tok_a = aj.text_at("raw_token") or stop "tok_a"
+  gr_a = aj.text_at("grant.id") or stop "gr_a"
+
+  # 3. Agent A delegates Child B (max_calls: 8) -> publishes grant.delegated on "grants"
+  del_b = ApiTest.send(
+    Main,
+    Api.post("/api/grants/delegate").with_header("Authorization", "Bearer #{tok_a}").with_json(
+      Collab.DelegateGrantInput(
+        handle: "child-researcher",
+        display_name: "Child Researcher",
+        model_id: Some("claude-haiku-4-5"),
+        label: "child-researcher",
+        allowed_actions: ["read", "propose", "delegate"],
+        allowed_collections: Some([col_id]),
+        max_calls: 8,
+        ttl_days: 3
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert del_b.status == 201
+  assert del_b.sse_published_events.any?(fn(e)
+    e.topic == "grants" and e.event == Some("grant.delegated")
+  end)
+  bj = must_json(del_b.text)
+  tok_b = bj.text_at("raw_token") or stop "tok_b"
+  gr_b = bj.text_at("grant.id") or stop "gr_b"
+
+  # 4. Child B delegates Grandchild C (max_calls: 3)
+  del_c = ApiTest.send(
+    Main,
+    Api.post("/api/grants/delegate").with_header("Authorization", "Bearer #{tok_b}").with_json(
+      Collab.DelegateGrantInput(
+        handle: "leaf-writer",
+        display_name: "Leaf Writer",
+        model_id: Some("claude-haiku-4-5"),
+        label: "leaf-writer",
+        allowed_actions: ["read", "propose"],
+        allowed_collections: Some([col_id]),
+        max_calls: 3,
+        ttl_days: 1
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert del_c.status == 201
+  cj = must_json(del_c.text)
+  tok_c = cj.text_at("raw_token") or stop "tok_c"
+  gr_c = cj.text_at("grant.id") or stop "gr_c"
+
+  # 5. Grandchild C opens a proposal via /mcp -> used_calls increments across C, B, and A
+  prop_c = ApiTest.send(
+    Main,
+    Api.post("/mcp").with_header("Authorization", "Bearer #{tok_c}").with_json(
+      Json.Object({
+        "jsonrpc": Json.String("2.0"),
+        "id": Json.int(1),
+        "method": Json.String("tools/call"),
+        "params": Json.Object({
+          "name": Json.String("vellum.proposal_open"),
+          "arguments": Json.Object({
+            "page_id": Json.String(pg_id),
+            "title": Json.String("Leaf grant budget debit"),
+            "reason": Json.String("verify ancestor call budget propagation")
+          })
+        })
+      })
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert prop_c.status == 200
+  assert must_json(prop_c.text).bool_at("result.isError") == Some(false)
+
+  # 6. Inspect GET /api/admin/grants/tree and GET /api/events?scope=grants
+  assert ApiTest.send(
+    Main,
+    Api.get("/api/admin/grants/tree").with_header("Authorization", "Bearer #{tok_a}"),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  ).status ==
+    403
+  assert ApiTest.send(
+    Main,
+    Api.get("/api/events?scope=grants").with_header("Authorization", "Bearer #{tok_a}"),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  ).status ==
+    403
+
+  tree_res = ApiTest.send(
+    Main,
+    WebTest.prepare(owner, Api.get("/api/admin/grants/tree")),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert tree_res.status == 200
+  tj = must_json(tree_res.text)
+  assert (tj.int_at("summary.delegated_grants") or 0) >= 2
+  assert (tj.int_at("summary.active_agent_grants") or 0) >= 3
+  glist = tj.list_at("grants") or []
+  node_a = glist.find(fn(g) g.text_at("id") == Some(gr_a) end) or stop "node_a"
+  node_b = glist.find(fn(g) g.text_at("id") == Some(gr_b) end) or stop "node_b"
+  node_c = glist.find(fn(g) g.text_at("id") == Some(gr_c) end) or stop "node_c"
+  assert node_a.int_at("descendant_count") == Some(2)
+  assert node_b.text_at("parent_id") == Some(gr_a)
+  assert node_b.int_at("descendant_count") == Some(1)
+  assert node_c.text_at("parent_id") == Some(gr_b)
+  assert (node_a.int_at("used_calls") or 0) >= 2
+  assert (node_b.int_at("used_calls") or 0) >= 2
+  assert (node_c.int_at("used_calls") or 0) >= 1
+
+  sse_grants = ApiTest.send(
+    Main,
+    WebTest.prepare(owner, Api.get("/api/events?scope=grants")),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert sse_grants.status == 200
+  assert sse_grants.sse_subscribe_topics == ["claims", "grants"]
+  assert sse_grants.text.contains?("event: grants.snapshot")
+
+  # 7. Cascading revoke on B disables both B & C while keeping A active
+  rev_b = ApiTest.send(
+    Main,
+    WebTest.prepare(owner, Api.post("/api/admin/grants/#{gr_b}/revoke").with_json(Json.Object({}))),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert rev_b.status == 200
+  assert must_json(rev_b.text).int_at("cascaded_count") == Some(2)
+  assert rev_b.sse_published_events.any?(fn(e)
+    e.topic == "grants" and e.event == Some("grant.revoked")
+  end)
+
+  tree_after_rev = ApiTest.send(
+    Main,
+    WebTest.prepare(owner, Api.get("/api/admin/grants/tree")),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert tree_after_rev.status == 200
+  glist2 = must_json(tree_after_rev.text).list_at("grants") or []
+  assert (glist2.find(fn(g) g.text_at("id") == Some(gr_c) end) or Json.Null).text_at("status") ==
+    Some("revoked")
+  assert (glist2.find(fn(g) g.text_at("id") == Some(gr_c) end) or Json.Null).text_at("revoked_via") ==
+    Some(gr_b)
+  assert (glist2.find(fn(g) g.text_at("id") == Some(gr_a) end) or Json.Null).text_at("status") ==
+    Some("active")
+
+  c_denied = ApiTest.send(
+    Main,
+    Api.get("/api/pages/#{pg_id}").with_header("Authorization", "Bearer #{tok_c}"),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert c_denied.status == 401 or c_denied.status == 403
+  assert ApiTest.send(
+    Main,
+    Api.get("/api/pages/#{pg_id}").with_header("Authorization", "Bearer #{tok_a}"),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  ).status ==
+    200
+
+  # 8. Emergency Kill Switch revokes all remaining agents while Owner stays authenticated
+  kill_res = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/admin/grants/kill-all").with_json(
+        Json.Object({"reason": Json.String("Phase 4.3 emergency stop")})
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert kill_res.status == 200
+  assert (must_json(kill_res.text).int_at("revoked_count") or 0) >= 1
+  assert kill_res.sse_published_events.any?(fn(e)
+    e.topic == "grants" and e.event == Some("grants.kill_all")
+  end)
+
+  a_denied = ApiTest.send(
+    Main,
+    Api.get("/api/pages/#{pg_id}").with_header("Authorization", "Bearer #{tok_a}"),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert a_denied.status == 401 or a_denied.status == 403
+
+  final_tree = ApiTest.send(
+    Main,
+    WebTest.prepare(owner, Api.get("/api/admin/grants/tree")),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert final_tree.status == 200
+  assert must_json(final_tree.text).int_at("summary.active_agent_grants") == Some(0)
+end
