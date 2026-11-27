@@ -754,6 +754,8 @@ export default function WorkspaceLayout({
                       [
                         ["paragraph", "Paragraph"],
                         ["heading", "Heading"],
+                        ["table", "Table"],
+                        ["toggle", "Toggle"],
                         ["code_block", "Code Block"],
                         ["task_item", "Checklist"],
                         ["callout", "Callout"],

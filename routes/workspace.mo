@@ -2045,8 +2045,8 @@ fn presign_attachment(
   env: Env
 ) : Result(Api.Response, AppError)
   try Auth.require_session_csrf(req, auth)
-  if input.size_bytes < 1 or input.size_bytes > 52428800
-    return Error(BadInput(reason: "size_bytes must be between 1 and 52428800 (50 MiB)"))
+  if input.size_bytes < 1 or input.size_bytes > 524288000
+    return Error(BadInput(reason: "size_bytes must be between 1 and 524288000 (500 MiB)"))
   end
   ct = input.content_type.trim
   if ct.empty?
@@ -2217,30 +2217,108 @@ fn upload_local_attachment(
   if not Auth.verify_local_attachment_sig(key, att.id, exp_sec, att.size_bytes, att.sha256_hex, sig)
     return Error(Forbidden(reason: "invalid local attachment upload signature"))
   end
-  if req.body.size != att.size_bytes or req.body.size > 52428800
-    return Error(
-      BadInput(reason: "expected #{att.size_bytes} bytes, received #{req.body.size} bytes")
-    )
-  end
-  if not att.sha256_hex.empty?
-    actual_sha = Crypto.sha256(req.body).to_hex.bytes
-    if not Crypto.constant_time_eq?(actual_sha, att.sha256_hex.ascii_lowercase.bytes)
-      return Error(BadInput(reason: "uploaded attachment SHA-256 digest mismatch"))
-    end
-  end
 
   try files.make_folder("attachments/#{att.id}").map_error(map_file_error)
-  try files.write_bytes(att.s3_key, req.body).map_error(map_file_error)
-  Ok(
-    json_ok(
-      200,
-      Json.Object({
-        "ok": Json.Boolean(true),
-        "attachment_id": Json.String(att.id),
-        "size_bytes": Json.int(req.body.size)
-      })
-    )
-  )
+  case req.query_param("offset")
+    Some(raw_off):
+      off = case raw_off.trim.to_int
+        Some(n) if n >= 0: n
+        Some(_) | None: return Error(BadInput(reason: "offset must be a non-negative integer"))
+      end
+      if req.body.size <= 0 or req.body.size > 16777216
+        return Error(BadInput(reason: "chunk size must be between 1 and 16777216 (16 MiB)"))
+      end
+      if off + req.body.size > att.size_bytes
+        return Error(
+          BadInput(reason: "chunk offset + size (#{off + req.body.size}) exceeds #{att.size_bytes}")
+        )
+      end
+      fh = try files.open(att.s3_key).map_error(map_file_error)
+      try fh.write_at(off, req.body).map_error(map_file_error)
+      try fh.sync.map_error(map_file_error)
+      cur_sz = try fh.size.map_error(map_file_error)
+      return Ok(
+        json_ok(
+          200,
+          Json.Object({
+            "ok": Json.Boolean(true),
+            "attachment_id": Json.String(att.id),
+            "offset": Json.int(off),
+            "chunk_bytes": Json.int(req.body.size),
+            "file_size": Json.int(cur_sz)
+          })
+        )
+      )
+    None:
+      if req.body.size != att.size_bytes or req.body.size > 524288000
+        return Error(
+          BadInput(reason: "expected #{att.size_bytes} bytes, received #{req.body.size} bytes")
+        )
+      end
+      if not att.sha256_hex.empty?
+        actual_sha = Crypto.sha256(req.body).to_hex.bytes
+        if not Crypto.constant_time_eq?(actual_sha, att.sha256_hex.ascii_lowercase.bytes)
+          return Error(BadInput(reason: "uploaded attachment SHA-256 digest mismatch"))
+        end
+      end
+      try files.write_bytes(att.s3_key, req.body).map_error(map_file_error)
+      return Ok(
+        json_ok(
+          200,
+          Json.Object({
+            "ok": Json.Boolean(true),
+            "attachment_id": Json.String(att.id),
+            "size_bytes": Json.int(req.body.size)
+          })
+        )
+      )
+  end
+end
+
+fn parse_http_range(range_hdr: Text, total_len: Int) : Result((Int, Int), AppError)
+  if total_len <= 0
+    return Error(BadInput(reason: "cannot serve byte range for empty file"))
+  end
+  raw = range_hdr.trim.ascii_lowercase
+  spec = case raw.drop_prefix("bytes=")
+    Some(s): s.trim
+    None: return Error(BadInput(reason: "unsupported Range unit (expected bytes=...)"))
+  end
+  if spec.empty? or spec.contains?(",")
+    return Error(BadInput(reason: "single contiguous bytes=start-end range required"))
+  end
+  parts = spec.split("-")
+  if parts.size != 2
+    return Error(BadInput(reason: "invalid Range header syntax"))
+  end
+  start_str = (parts.first or "").trim
+  end_str = (parts.get(1) or "").trim
+  (start_off, req_end) = if start_str.empty?
+    suffix_len = case end_str.to_int
+      Some(n) if n > 0: n
+      Some(_) | None: return Error(BadInput(reason: "invalid suffix Range length"))
+    end
+    st = if total_len > suffix_len: total_len - suffix_len else: 0
+    (st, total_len - 1)
+  else
+    st = case start_str.to_int
+      Some(n) if n >= 0 and n < total_len: n
+      Some(_) | None: return Error(BadInput(reason: "Range start out of bounds"))
+    end
+    en = if end_str.empty?
+      total_len - 1
+    else
+      case end_str.to_int
+        Some(n) if n >= st:
+          if n >= total_len: total_len - 1 else: n
+        Some(_) | None: return Error(BadInput(reason: "invalid Range end offset"))
+      end
+    end
+    (st, en)
+  end
+  max_end = start_off + 8388607
+  clamped_end = if req_end > max_end: max_end else: req_end
+  Ok((start_off, clamped_end))
 end
 
 ## `POST /api/attachments/:id/commit` — Marks an uploaded S3 or local-disk attachment `"ready"`.
@@ -2269,8 +2347,26 @@ fn commit_attachment(req: Api.Request, id: Text, auth: AuthContext, files: Files
       end
     end
   )
-  if pre_att.s3_bucket == "local" and not files.read_only.exists?(pre_att.s3_key)
-    return Error(BadInput(reason: "local attachment payload has not been uploaded yet"))
+  if pre_att.s3_bucket == "local"
+    if not files.read_only.exists?(pre_att.s3_key)
+      return Error(BadInput(reason: "local attachment payload has not been uploaded yet"))
+    end
+    lf = try files.read_only.open(pre_att.s3_key).map_error(map_file_error)
+    actual_sz = try lf.size.map_error(map_file_error)
+    if actual_sz != pre_att.size_bytes
+      return Error(
+        BadInput(
+          reason: "local attachment incomplete: expected #{pre_att.size_bytes} bytes, got #{actual_sz} bytes"
+        )
+      )
+    end
+    if not pre_att.sha256_hex.empty? and pre_att.size_bytes <= 67108864
+      full_bytes = try files.read_only.read_bytes(pre_att.s3_key).map_error(map_file_error)
+      actual_sha = Crypto.sha256(full_bytes).to_hex.bytes
+      if not Crypto.constant_time_eq?(actual_sha, pre_att.sha256_hex.ascii_lowercase.bytes)
+        return Error(BadInput(reason: "uploaded attachment SHA-256 digest mismatch"))
+      end
+    end
   end
 
   now = clock.now
@@ -2323,11 +2419,15 @@ fn commit_attachment(req: Api.Request, id: Text, auth: AuthContext, files: Files
   )
 end
 
-## `GET /api/attachments/:id/download` — Enforces collection grant & redirects (`302`) to S3 or serves local file safely.
-fn download_attachment(id: Text, auth: AuthContext, rf: ReadFiles, clock: Clock, env: Env) : Result(
-  Api.Response,
-  AppError
-)
+## `GET /api/attachments/:id/download` — Enforces collection grant & redirects (`302`) to S3 or serves local file (with HTTP `Range` support).
+fn download_attachment(
+  req: Api.Request,
+  id: Text,
+  auth: AuthContext,
+  rf: ReadFiles,
+  clock: Clock,
+  env: Env
+) : Result(Api.Response, AppError)
   if not rf.exists?(Db.ledger_db_path)
     return Error(Missing(entity: "attachment", id: id))
   end
@@ -2355,14 +2455,44 @@ fn download_attachment(id: Text, auth: AuthContext, rf: ReadFiles, clock: Clock,
   end
 
   if att.s3_bucket == "local"
-    payload = try rf.read_bytes(att.s3_key).map_error(map_file_error)
     disp = if dangerous_inline_mime?(att.content_type): "attachment" else: "inline"
     safe_name = sanitize_filename_segment(att.filename)
+    case req.header("Range")
+      Some(range_hdr) if not range_hdr.trim.empty?:
+        fh = try rf.open(att.s3_key).map_error(map_file_error)
+        total_sz = try fh.size.map_error(map_file_error)
+        (start_off, end_off) = try parse_http_range(range_hdr, total_sz)
+        want_len = end_off - start_off + 1
+        slice_bytes = try fh.read_at(start_off, want_len).map_error(map_file_error)
+        actual_end = if slice_bytes.empty?
+          start_off
+        else
+          start_off + slice_bytes.size - 1
+        end
+        return Ok(
+          Api.response(
+            206,
+            [
+              ("Content-Type", att.content_type),
+              ("Content-Range", "bytes #{start_off}-#{actual_end}/#{total_sz}"),
+              ("Content-Length", "#{slice_bytes.size}"),
+              ("Accept-Ranges", "bytes"),
+              ("Content-Disposition", "#{disp}; filename=\"#{safe_name}\""),
+              ("Cache-Control", "private, no-store"),
+              ("X-Content-Type-Options", "nosniff")
+            ],
+            slice_bytes
+          )
+        )
+      Some(_) | None: Unit
+    end
+    payload = try rf.read_bytes(att.s3_key).map_error(map_file_error)
     return Ok(
       Api.response(
         200,
         [
           ("Content-Type", att.content_type),
+          ("Accept-Ranges", "bytes"),
           ("Content-Disposition", "#{disp}; filename=\"#{safe_name}\""),
           ("Cache-Control", "private, no-store"),
           ("X-Content-Type-Options", "nosniff")

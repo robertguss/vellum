@@ -160,8 +160,8 @@ fn render_block_body(blk: Block) : Text
     Heading(level: lvl):
       clamped = if lvl < 1
         1
-      else if lvl > 3
-        3
+      else if lvl > 6
+        6
       else
         lvl
       end
@@ -192,6 +192,16 @@ fn render_block_body(blk: Block) : Text
       end
     CodeBlock(language: lang): "```#{lang}\n#{blk.markdown}\n```"
     Divider: "---"
+    TableBlock(has_header: _): blk.markdown
+    Toggle(summary: sum_txt, open: open?):
+      clean_s = sum_txt.replace("\n", " ").trim
+      head = if open?: ":::toggle [open] #{clean_s}" else: ":::toggle #{clean_s}"
+      if blk.markdown.empty?
+        "#{head}\n:::"
+      else
+        "#{head}\n#{blk.markdown}\n:::"
+      end
+    TableOfContents: "<!-- toc -->"
     Image(attachment_id: aid, caption: cap): "![#{cap}](vellum://attachment/#{aid})"
     FileEmbed(attachment_id: aid, filename: fname): "[#{fname}](vellum://attachment/#{aid})"
     PageLink(target_page_id: tid): "[[#{tid}|#{blk.markdown}]]"
@@ -377,6 +387,18 @@ fn parse_single_line_block(line: Text) : Option((BlockKind, Text))
   if line == "---"
     return Some((Divider, ""))
   end
+  if line.trim == "<!-- toc -->"
+    return Some((TableOfContents, ""))
+  end
+  if line.starts_with?("###### ")
+    return Some((Heading(level: 6), line.drop_prefix("###### ") or ""))
+  end
+  if line.starts_with?("##### ")
+    return Some((Heading(level: 5), line.drop_prefix("##### ") or ""))
+  end
+  if line.starts_with?("#### ")
+    return Some((Heading(level: 4), line.drop_prefix("#### ") or ""))
+  end
   if line.starts_with?("### ")
     return Some((Heading(level: 3), line.drop_prefix("### ") or ""))
   end
@@ -417,6 +439,34 @@ fn parse_single_line_block(line: Text) : Option((BlockKind, Text))
     None: Unit
   end
   None
+end
+
+fn is_gfm_table_separator?(line: Text) : Bool
+  t = line.trim
+  return false if t.empty? or not t.contains?("|") or not t.contains?("-")
+  t.chars.all?(fn(c) c == '|' or c == '-' or c == ':' or c == ' ' or c == '\t' end)
+end
+
+fn parse_toggle_header(line: Text) : Option((Text, Bool))
+  rest_opt = line.drop_prefix(":::toggle")
+  rest = (try rest_opt).trim
+  return None if rest.empty?
+  if rest.starts_with?("[open]")
+    sum = (rest.drop_prefix("[open]") or "").trim
+    return None if sum.empty?
+    return Some((sum, true))
+  end
+  Some((rest, false))
+end
+
+fn parse_details_summary_text(line: Text) : Option(Text)
+  open_parts = line.split("<summary>")
+  return None if open_parts.size < 2
+  rest = open_parts.drop(1).join("<summary>")
+  close_parts = rest.split("</summary>")
+  return None if close_parts.size < 2
+  clean = (close_parts.first or "").trim
+  if clean.empty?: Some("Toggle") else: Some(clean)
 end
 
 fn strip_quote_prefix(line: Text) : Text
@@ -526,6 +576,102 @@ fn parse_markdown_blocks(page_id: Text, markdown: Text, prov: Provenance, id_pre
       end
     end
 
+    if trimmed.starts_with?(":::toggle")
+      case parse_toggle_header(trimmed)
+        Some((summary, open?)):
+          var t_lines = []
+          i += 1
+          while i < n
+            tl = lines.get(i) or ""
+            if tl.trim == ":::"
+              i += 1
+              break
+            end
+            t_lines = t_lines.append(tl)
+            i += 1
+          end
+          blocks = blocks.append(
+            Block(
+              id: blk_id,
+              page_id: page_id,
+              parent_block_id: None,
+              rank: rank,
+              kind: Toggle(summary: summary, open: open?),
+              markdown: t_lines.join("\n"),
+              provenance: prov,
+              version: 1
+            )
+          )
+          continue
+        None: Unit
+      end
+    end
+
+    if trimmed.starts_with?("<details")
+      open? = trimmed.contains?("open")
+      var summary = parse_details_summary_text(trimmed) or ""
+      var t_lines = []
+      i += 1
+      while i < n
+        dl = lines.get(i) or ""
+        dt = dl.trim
+        if dt == "</details>" or dt.starts_with?("</details>")
+          i += 1
+          break
+        end
+        if summary.empty?
+          case parse_details_summary_text(dt)
+            Some(s):
+              summary = s
+              i += 1
+              continue
+            None: Unit
+          end
+        end
+        t_lines = t_lines.append(dl)
+        i += 1
+      end
+      final_sum = if summary.trim.empty?: "Toggle" else: summary.trim
+      blocks = blocks.append(
+        Block(
+          id: blk_id,
+          page_id: page_id,
+          parent_block_id: None,
+          rank: rank,
+          kind: Toggle(summary: final_sum, open: open?),
+          markdown: t_lines.join("\n").trim,
+          provenance: prov,
+          version: 1
+        )
+      )
+      continue
+    end
+
+    if trimmed.starts_with?("|") and trimmed.contains?("|") and
+      is_gfm_table_separator?(lines.get(i + 1) or "")
+      var tbl_lines = [line]
+      i += 1
+      while i < n
+        tl = lines.get(i) or ""
+        break if not tl.trim.starts_with?("|")
+        tbl_lines = tbl_lines.append(tl)
+        i += 1
+      end
+      blocks = blocks.append(
+        Block(
+          id: blk_id,
+          page_id: page_id,
+          parent_block_id: None,
+          rank: rank,
+          kind: TableBlock(has_header: true),
+          markdown: tbl_lines.join("\n"),
+          provenance: prov,
+          version: 1
+        )
+      )
+      continue
+    end
+
     if line.starts_with?("```")
       lang = (line.drop_prefix("```") or "").trim
       var code_lines = []
@@ -631,6 +777,11 @@ fn parse_markdown_blocks(page_id: Text, markdown: Text, prov: Provenance, id_pre
       break if nt.empty?
       break if parse_anchor_comment(nt) != None
       break if nl.starts_with?("```") or nl.starts_with?(">")
+      break if nt.starts_with?(":::ai-brief") or nt.starts_with?(":::toggle") or nt.starts_with?(
+        "<details"
+      )
+      break if nt.starts_with?("|") and nt.contains?("|") and
+        is_gfm_table_separator?(lines.get(i + 1) or "")
       break if parse_single_line_block(nl) != None
       p_lines = p_lines.append(nl)
       i += 1
@@ -664,7 +815,14 @@ fn blocks_plain_text(blocks: List(Block)) : Text
         database_id: _,
         view_id: _
       ) | AiBrief(prompt: _, source_scope: _, refreshed_at: _): b.markdown
-      Divider: ""
+      Divider | TableOfContents: ""
+      TableBlock(has_header: _):
+        b.markdown.lines.filter(fn(l) not is_gfm_table_separator?(l) end)
+          .map(fn(l) l.replace("|", " ").trim end)
+          .filter(fn(l) not l.empty? end)
+          .join(" ")
+      Toggle(summary: sum_txt, open: _):
+        if b.markdown.trim.empty?: sum_txt else: "#{sum_txt}\n#{b.markdown}"
       Image(attachment_id: _, caption: cap): cap
       FileEmbed(attachment_id: _, filename: fname): fname
     end
@@ -1332,4 +1490,56 @@ test "diff_blocks_to_ops round-trips edits, inserts, deletes, reorders, and no-o
     Error(_): stop "apply_block_ops"
   end
   assert applied.map(fn(b) (b.id, b.markdown) end) == incoming.map(fn(b) (b.id, b.markdown) end)
+end
+
+test "v3 Slice 1.1: Heading(4..6), GFM Table, Toggle (:::toggle & <details>), and TableOfContents round-trip"
+  t0 = Time.parse("2026-12-06T09:00:00Z") or stop "t0"
+  prov = Provenance(
+    author_id: "usr_ada",
+    author_kind: HumanAuthor,
+    grant_id: None,
+    proposal_id: None,
+    reason: Some("m1.1 block parity"),
+    citations: [],
+    updated_at: t0
+  )
+  src_md = """
+    <!-- blk:blk_toc -->
+    <!-- toc -->
+
+    <!-- blk:blk_h4 -->
+    #### Sub-section Rubric
+
+    <!-- blk:blk_tbl -->
+    | Service | Status | Owners |
+    | --- | --- | --- |
+    | Roster Sync | Active | Ops |
+
+    <!-- blk:blk_tog -->
+    :::toggle [open] Advanced Migration Notes
+    Ensure all relations pass validation.
+    :::
+
+    <details>
+    <summary>Legacy Export Toggle</summary>
+    Imported details body line.
+    </details>
+    """
+  parsed = parse_markdown_blocks("pg_m1", src_md, prov, "m1")
+  assert parsed.size == 5
+  assert (parsed.get(0) or stop "toc").kind == TableOfContents
+  assert (parsed.get(1) or stop "h4").kind == Heading(level: 4)
+  assert (parsed.get(2) or stop "tbl").kind == TableBlock(has_header: true)
+  assert (parsed.get(3) or stop "tog1").kind == Toggle(summary: "Advanced Migration Notes", open: true)
+  assert (parsed.get(4) or stop "tog2").kind == Toggle(summary: "Legacy Export Toggle", open: false)
+
+  rendered = to_anchored_markdown(parsed)
+  reparsed = parse_markdown_blocks("pg_m1", rendered, prov, "m2")
+  assert reparsed.map(fn(b) (b.id, b.kind, b.markdown) end) ==
+    parsed.map(fn(b) (b.id, b.kind, b.markdown) end)
+
+  plain = blocks_plain_text(parsed)
+  assert plain.contains?("Roster Sync")
+  assert plain.contains?("Advanced Migration Notes")
+  assert plain.contains?("Legacy Export Toggle")
 end

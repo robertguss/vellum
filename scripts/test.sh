@@ -57,13 +57,21 @@ mo check routes/packs.mo
 mo check routes/sync.mo
 mo check sync.mo
 mo check main.mo
-mo check tests/stages13.mo
-mo check tests/stages45.mo
-mo check tests/phase1.mo
-mo check tests/phase2.mo
+mo check tests/stage1.mo
+mo check tests/stage2.mo
+mo check tests/stage3.mo
+mo check tests/stage4.mo
+mo check tests/stage5.mo
+mo check tests/phase1a.mo
+mo check tests/phase1b.mo
+mo check tests/phase1c.mo
+mo check tests/phase2a.mo
+mo check tests/phase2b.mo
+mo check tests/phase2c.mo
 mo check tests/phase3a.mo
 mo check tests/phase3b.mo
 mo check tests/phase4.mo
+mo check tests/v3m1.mo
 
 mo test domain/blocks.mo
 mo test domain/policy.mo
@@ -79,12 +87,20 @@ mo test domain/secrets.mo
 mo test domain/notion-import.mo
 mo test sync.mo
 mo test db.mo
-mo test tests/stages13.mo
-mo test tests/stages45.mo
-mo test tests/phase1.mo
-mo test tests/phase2.mo
+mo test tests/stage1.mo
+mo test tests/stage2.mo
+mo test tests/stage3.mo
+mo test tests/stage4.mo
+mo test tests/stage5.mo
+mo test tests/phase1a.mo
+mo test tests/phase1b.mo
+mo test tests/phase1c.mo
+mo test tests/phase2a.mo
+mo test tests/phase2b.mo
+mo test tests/phase2c.mo
 mo test tests/phase3a.mo
 mo test tests/phase3b.mo
 mo test tests/phase4.mo
+mo test tests/v3m1.mo
 
 echo "All Vellum Stage 1-5 checks, frontend build checks, and tests passed."
