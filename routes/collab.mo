@@ -8,6 +8,9 @@ ReleaseClaimInput(..),
 OpenProposalInput(..),
 StageProposalOpsInput(..),
 ProposalDecisionInput(..),
+CreateProposalCommentInput(..),
+ResolveProposalCommentInput(..),
+RejectProposalHunkInput(..),
 SimulateReplayInput(..),
 DelegateGrantInput(..),
 CreateWebhookInput(..),
@@ -24,6 +27,10 @@ query_db_scenario,
 diff_proposal,
 accept_proposal,
 reject_proposal,
+list_proposal_comments,
+create_proposal_comment,
+resolve_proposal_comment,
+reject_proposal_hunk,
 pin_replay_baseline,
 simulate_replay,
 accept_replay,
@@ -41,6 +48,7 @@ use Date
 use Db
 use Domain.Blocks
 use Domain.Collab{
+  ProposalComment,
   ProposalMeta,
   WebhookJobPayload,
   WebhookSub,
@@ -145,6 +153,29 @@ struct CreateWebhookInput
   collection_id: Option(Text)
   url: Text
   events: List(Text)
+end
+
+## JSON payload for `POST /api/proposals/:id/comments`.
+struct CreateProposalCommentInput
+  target_kind: Option(Text)
+  target_ref: Option(Text)
+  parent_comment_id: Option(Text)
+  body_markdown: Text
+  steer_requested: Option(Bool)
+end
+
+## JSON payload for `POST /api/proposals/:id/comments/:comment_id/resolve`.
+struct ResolveProposalCommentInput
+  resolved: Option(Bool)
+end
+
+## JSON payload for `POST /api/proposals/:id/hunks/reject`.
+struct RejectProposalHunkInput
+  target_kind: Text
+  target_id: Text
+  page_id: Option(Text)
+  database_id: Option(Text)
+  reason: Option(Text)
 end
 
 fn json_ok(status: Int, body: Json) : Api.Response
@@ -1639,6 +1670,13 @@ fn diff_proposal(id: Text, auth: AuthContext, rf: ReadFiles) : Result(Api.Respon
         Some(w): w.steps.size
         None: 0
       end
+      cmt_pairs = try Table.lookup(
+        store,
+        Db.proposal_comments_table(),
+        Db.proposal_comments_by_proposal(),
+        found.id
+      ).map_error(Db.map_table_error)
+      comments = cmt_pairs.map(fn(p) p.1 end).sort_by(fn(c) c.id end)
 
       if found.status != "open"
         return Ok(
@@ -1651,6 +1689,7 @@ fn diff_proposal(id: Text, auth: AuthContext, rf: ReadFiles) : Result(Api.Respon
             "db_row_diffs": Json.Array([]),
             "db_schema_diffs": Json.Array([]),
             "rollup_deltas": Json.Array([]),
+            "comments": comments.to_json,
             "step_count": Json.int(step_count)
           })
         )
@@ -1746,6 +1785,7 @@ fn diff_proposal(id: Text, auth: AuthContext, rf: ReadFiles) : Result(Api.Respon
           "db_row_diffs": Json.Array(db_row_diffs),
           "db_schema_diffs": Json.Array(db_schema_diffs),
           "rollup_deltas": rollup_deltas.to_json,
+          "comments": comments.to_json,
           "step_count": Json.int(step_count)
         })
       )
@@ -2593,4 +2633,425 @@ fn events_stream(req: Api.Request, auth: AuthContext, rf: ReadFiles, clock: Cloc
     end
   end
   Ok(Sse.response(sse_events).with_sse_subscribe(topics, last_id))
+end
+
+## `GET /api/proposals/:id/comments` — Lists anchored review/steer comments for a proposal (`ReadFiles`-only).
+fn list_proposal_comments(id: Text, auth: AuthContext, rf: ReadFiles) : Result(
+  Api.Response,
+  AppError
+)
+  if not rf.exists?(Db.ledger_db_path)
+    return Error(Missing(entity: "proposal", id: id))
+  end
+  comments = try Ledger.read_locked(
+    rf,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      pm = case try Table.get(store, Db.proposals_table(), id).map_error(Db.map_table_error)
+        Some(p): p
+        None: return Error(Missing(entity: "proposal", id: id))
+      end
+      try Policy.require_collection_access(auth, "read", pm.collection_id)
+      pairs = try Table.lookup(
+        store,
+        Db.proposal_comments_table(),
+        Db.proposal_comments_by_proposal(),
+        id
+      ).map_error(Db.map_table_error)
+      Ok(pairs.map(fn(p) p.1 end).sort_by(fn(c) c.id end))
+    end
+  )
+  Ok(json_ok(200, Json.Object({"proposal_id": Json.String(id), "comments": comments.to_json})))
+end
+
+## `POST /api/proposals/:id/comments` — Creates an anchored Patchwork review or steer comment on a proposal.
+fn create_proposal_comment(
+  req: Api.Request,
+  id: Text,
+  auth: AuthContext,
+  input: CreateProposalCommentInput,
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  clean_body = input.body_markdown.trim
+  if clean_body.empty?
+    return Error(BadInput(reason: "comment body_markdown must not be empty"))
+  end
+  tk = (input.target_kind or "proposal").trim
+  if tk != "proposal" and tk != "block" and tk != "db_row" and tk != "db_schema"
+    return Error(BadInput(reason: "target_kind must be proposal, block, db_row, or db_schema"))
+  end
+  tref = case input.target_ref
+    Some(r) if not r.trim.empty?: Some(r.trim)
+    Some(_) | None: None
+  end
+  if (tk == "block" or tk == "db_row" or tk == "db_schema") and tref == None
+    return Error(BadInput(reason: "target_ref is required when target_kind is '#{tk}'"))
+  end
+  if not files.read_only.exists?(Db.ledger_db_path)
+    return Error(Missing(entity: "proposal", id: id))
+  end
+
+  act = if Policy.action_permitted?(auth, "comment")
+    "comment"
+  else
+    "propose"
+  end
+  now = clock.now
+  cid = "pcmt_#{Id.ulid(rng, clock)}"
+  akind = case auth.principal.kind
+    Human: HumanAuthor
+    Agent: AgentAuthor(model: auth.principal.model_id)
+  end
+  parent_opt = case input.parent_comment_id
+    Some(s) if not s.trim.empty?: Some(s.trim)
+    Some(_) | None: None
+  end
+  cmt = ProposalComment(
+    id: cid,
+    proposal_id: id,
+    target_kind: tk,
+    target_ref: tref,
+    parent_comment_id: parent_opt,
+    author_id: auth.principal.id,
+    author_handle: auth.principal.handle,
+    author_kind: akind,
+    body_markdown: clean_body,
+    steer_requested: input.steer_requested or false,
+    resolved_at: None,
+    created_at: now
+  )
+  meta = Ledger.WriteMeta(
+    principal: auth.principal.handle,
+    action: "proposal.comment.create",
+    reason: "comment on proposal '#{id}'",
+    at: now
+  )
+  audit_payload = Json.Object({
+    "comment_id": Json.String(cmt.id),
+    "proposal_id": Json.String(id),
+    "target_kind": Json.String(tk)
+  })
+  (saved_pm, saved_cmt) = try Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    meta,
+    "commented on proposal #{id}",
+    audit_payload,
+    Db.map_ledger_error,
+    fn(tx)
+      t1 = try tx_authorize_if_agent(tx, auth, act, now)
+      pm = case try Table.tx_get(t1, Db.proposals_table(), id).map_error(Db.map_table_error)
+        Some(p): p
+        None: return Error(Missing(entity: "proposal", id: id))
+      end
+      try Policy.require_collection_access(auth, act, pm.collection_id)
+      t2 = try Table.put(t1, Db.proposal_comments_table(), cmt.id, cmt).map_error(Db.map_table_error)
+      Ok((t2, (pm, cmt)))
+    end
+  )
+  ev = Json.Object({
+    "proposal_id": Json.String(saved_pm.id),
+    "comment_id": Json.String(saved_cmt.id),
+    "page_id": Json.String(saved_pm.target_page_id),
+    "actor": Json.String(auth.principal.handle)
+  })
+  var resp = json_ok(201, Json.Object({"comment": saved_cmt.to_json})).with_sse_publish_json(
+    "collection:#{saved_pm.collection_id}",
+    "proposal.commented",
+    ev
+  )
+  if not saved_pm.target_page_id.trim.empty?
+    resp = resp.with_sse_publish_json("page:#{saved_pm.target_page_id}", "proposal.commented", ev)
+  end
+  case saved_pm.target_database_id
+    Some(did) if not did.trim.empty?:
+      resp = resp.with_sse_publish_json("database:#{did}", "proposal.commented", ev)
+    Some(_) | None: Unit
+  end
+  Ok(resp)
+end
+
+## `POST /api/proposals/:id/comments/:comment_id/resolve` — Marks a proposal comment thread resolved or reopened.
+fn resolve_proposal_comment(
+  req: Api.Request,
+  id: Text,
+  comment_id: Text,
+  auth: AuthContext,
+  input: ResolveProposalCommentInput,
+  files: Files,
+  clock: Clock
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  if not files.read_only.exists?(Db.ledger_db_path)
+    return Error(Missing(entity: "proposal", id: id))
+  end
+  act = if Policy.action_permitted?(auth, "propose")
+    "propose"
+  else
+    "comment"
+  end
+  now = clock.now
+  resolve? = input.resolved or true
+  meta = Ledger.WriteMeta(
+    principal: auth.principal.handle,
+    action: "proposal.comment.resolve",
+    reason: if resolve?: "resolve comment '#{comment_id}'" else: "reopen comment '#{comment_id}'",
+    at: now
+  )
+  audit_payload = Json.Object({
+    "comment_id": Json.String(comment_id),
+    "proposal_id": Json.String(id),
+    "resolved": Json.Boolean(resolve?)
+  })
+  (saved_pm, saved_cmt) = try Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    meta,
+    "updated comment resolution on #{comment_id}",
+    audit_payload,
+    Db.map_ledger_error,
+    fn(tx)
+      t1 = try tx_authorize_if_agent(tx, auth, act, now)
+      pm = case try Table.tx_get(t1, Db.proposals_table(), id).map_error(Db.map_table_error)
+        Some(p): p
+        None: return Error(Missing(entity: "proposal", id: id))
+      end
+      try Policy.require_collection_access(auth, act, pm.collection_id)
+      old_c = case try Table.tx_get(t1, Db.proposal_comments_table(), comment_id).map_error(
+        Db.map_table_error
+      )
+        Some(c) if c.proposal_id == id: c
+        Some(_) | None: return Error(Missing(entity: "proposal_comment", id: comment_id))
+      end
+      next_c = ProposalComment(
+        id: old_c.id,
+        proposal_id: old_c.proposal_id,
+        target_kind: old_c.target_kind,
+        target_ref: old_c.target_ref,
+        parent_comment_id: old_c.parent_comment_id,
+        author_id: old_c.author_id,
+        author_handle: old_c.author_handle,
+        author_kind: old_c.author_kind,
+        body_markdown: old_c.body_markdown,
+        steer_requested: old_c.steer_requested,
+        resolved_at: if resolve?: Some(now) else: None,
+        created_at: old_c.created_at
+      )
+      t2 = try Table.put(t1, Db.proposal_comments_table(), next_c.id, next_c).map_error(
+        Db.map_table_error
+      )
+      Ok((t2, (pm, next_c)))
+    end
+  )
+  ev = Json.Object({
+    "proposal_id": Json.String(saved_pm.id),
+    "comment_id": Json.String(saved_cmt.id),
+    "page_id": Json.String(saved_pm.target_page_id),
+    "actor": Json.String(auth.principal.handle)
+  })
+  var resp = json_ok(200, Json.Object({"comment": saved_cmt.to_json})).with_sse_publish_json(
+    "collection:#{saved_pm.collection_id}",
+    "proposal.commented",
+    ev
+  )
+  if not saved_pm.target_page_id.trim.empty?
+    resp = resp.with_sse_publish_json("page:#{saved_pm.target_page_id}", "proposal.commented", ev)
+  end
+  case saved_pm.target_database_id
+    Some(did) if not did.trim.empty?:
+      resp = resp.with_sse_publish_json("database:#{did}", "proposal.commented", ev)
+    Some(_) | None: Unit
+  end
+  Ok(resp)
+end
+
+## `POST /api/proposals/:id/hunks/reject` — Reverts a single block or DB row hunk inside an open `Modb.World` branch without closing the proposal.
+fn reject_proposal_hunk(
+  req: Api.Request,
+  id: Text,
+  auth: AuthContext,
+  input: RejectProposalHunkInput,
+  files: Files,
+  clock: Clock
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  tk = input.target_kind.trim
+  tid = input.target_id.trim
+  if tid.empty?
+    return Error(BadInput(reason: "target_id must not be empty"))
+  end
+  if tk != "block" and tk != "db_row"
+    return Error(BadInput(reason: "target_kind must be 'block' or 'db_row'"))
+  end
+  if not files.read_only.exists?(Db.ledger_db_path)
+    return Error(Missing(entity: "proposal", id: id))
+  end
+
+  now = clock.now
+  clean_reason = case input.reason
+    Some(r) if not r.trim.empty?: r.trim
+    Some(_) | None: "Rejected hunk #{tk}:#{tid} in Patchwork Review"
+  end
+  prov = make_provenance(auth, Some(clean_reason), now)
+
+  (pm, comp_mut, sse_page_opt, sse_db_opt) = try Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      found = case try Table.get(store, Db.proposals_table(), id).map_error(Db.map_table_error)
+        Some(p): p
+        None: return Error(Missing(entity: "proposal", id: id))
+      end
+      if found.status != "open"
+        return Error(Conflict(reason: "proposal '#{id}' is '#{found.status}', not 'open'"))
+      end
+      try Policy.require_collection_access(auth, "propose", found.collection_id)
+      world = case try World.get_world(store, found.world_id).map_error(Db.map_world_error)
+        Some(w): w
+        None: return Error(Missing(entity: "world", id: found.world_id))
+      end
+      (base_tx, spec_tx) = try Db.materialize_world_tx(store, world)
+
+      if tk == "block"
+        pid = case input.page_id
+          Some(p) if not p.trim.empty?: p.trim
+          Some(_) | None: found.target_page_id
+        end
+        base_blk = try Table.tx_get(base_tx, Db.blocks_table(), tid).map_error(Db.map_table_error)
+        spec_blk = try Table.tx_get(spec_tx, Db.blocks_table(), tid).map_error(Db.map_table_error)
+        (ops, new_ids) = case (base_blk, spec_blk)
+          (Some(bb), Some(sb)): (
+            [
+              ReplaceBlock(
+                block_id: sb.id,
+                expected_version: sb.version,
+                kind: Some(bb.kind),
+                markdown: bb.markdown
+              )
+            ],
+            []
+          )
+          (None, Some(sb)): ([DeleteBlock(block_id: sb.id, expected_version: sb.version)], [])
+          (Some(bb), None):
+            b_rows = try Table.tx_lookup(base_tx, Db.blocks_table(), Db.blocks_by_page(), pid)
+              .map_error(Db.map_table_error)
+            s_rows = try Table.tx_lookup(spec_tx, Db.blocks_table(), Db.blocks_by_page(), pid)
+              .map_error(Db.map_table_error)
+            var spec_ids = {}
+            for sx in s_rows
+              spec_ids = spec_ids.set(sx.1.id, true)
+            end
+            var prev_surviving_id = ""
+            for bx in Blocks.sort_blocks(b_rows.map(fn(p) p.1 end))
+              break if bx.id == bb.id
+              if spec_ids.get(bx.id) == Some(true)
+                prev_surviving_id = bx.id
+              end
+            end
+            prev_surviving = if prev_surviving_id.empty?
+              None
+            else
+              Some(prev_surviving_id)
+            end
+            (
+              [
+                InsertBlockAfter(
+                  after_block_id: prev_surviving,
+                  parent_block_id: bb.parent_block_id,
+                  kind: bb.kind,
+                  markdown: bb.markdown
+                )
+              ],
+              [bb.id]
+            )
+          (None, None): return Error(Missing(entity: "block", id: tid))
+        end
+        cmut = PatchPageBlocks(
+          page_id: pid,
+          ops: ops,
+          new_ids: new_ids,
+          provenance: prov,
+          expected_versions: {}
+        )
+        Ok((found, cmut, Some(pid), found.target_database_id))
+      else
+        did = case input.database_id
+          Some(d) if not d.trim.empty?: d.trim
+          Some(_) | None:
+            case found.target_database_id
+              Some(d) if not d.trim.empty?: d.trim
+              Some(_) | None: return Error(BadInput(reason: "database_id required for db_row hunk"))
+            end
+        end
+        base_row = try Table.tx_get(base_tx, Db.db_rows_table(), tid).map_error(Db.map_table_error)
+        spec_row = try Table.tx_get(spec_tx, Db.db_rows_table(), tid).map_error(Db.map_table_error)
+        cmut = case (base_row, spec_row)
+          (Some(br), Some(sr)):
+            var reset_cells = br.cells
+            for (k, _v) in sr.cells.entries
+              if br.cells.get(k) == None
+                reset_cells = reset_cells.set(k, Empty)
+              end
+            end
+            UpdateDbRow(
+              database_id: did,
+              row_id: sr.id,
+              cells: reset_cells,
+              expected_version: Some(sr.version),
+              provenance: prov
+            )
+          (None, Some(sr)): DeleteDbRow(database_id: did, row_id: sr.id)
+          (Some(_), None) | (None, None): return Error(
+            BadInput(reason: "cannot reject deleted database row hunk individually")
+          )
+        end
+        Ok((found, cmut, None, Some(did)))
+      end
+    end
+  )
+
+  bargs = WorldBranchArgs(mutation: comp_mut, updated_at: now)
+  step_reply = try World.world_call_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.world_catalog(),
+    pm.world_id,
+    "propose",
+    bargs.to_json,
+    clean_reason,
+    now
+  ).map_error(Db.map_world_error)
+
+  upd_ev = Json.Object({
+    "proposal_id": Json.String(pm.id),
+    "kind": Json.String("reject_hunk"),
+    "target_kind": Json.String(tk),
+    "target_id": Json.String(tid),
+    "actor": Json.String(auth.principal.handle)
+  })
+  var resp = json_ok(200, Json.Object({"proposal": pm.to_json, "step_reply": step_reply}))
+    .with_sse_publish_json("collection:#{pm.collection_id}", "proposal.updated", upd_ev)
+  case sse_page_opt
+    Some(pid) if not pid.trim.empty?:
+      resp = resp.with_sse_publish_json("page:#{pid}", "proposal.updated", upd_ev)
+    Some(_) | None: Unit
+  end
+  case sse_db_opt
+    Some(did) if not did.trim.empty?:
+      resp = resp.with_sse_publish_json("database:#{did}", "proposal.updated", upd_ev)
+    Some(_) | None: Unit
+  end
+  Ok(resp)
 end

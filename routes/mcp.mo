@@ -5,12 +5,23 @@ expose handle_mcp
 use Api
 use Arvo.Id
 use Arvo.Mcp
+use Arvo.Modb.Jobs
 use Db
 use Domain.Blocks
-use Domain.Collab{ProposalMeta, WorldPatchArgs}
-use Domain.DatabaseModel{DbFilterRule, DbSortRule, ViewQueryResult}
+use Domain.Collab{ProposalMeta, WorldBranchArgs, WorldMutation, WorldPatchArgs}
+use Domain.DatabaseModel{CellValue, DbFilterRule, DbRow, DbSortRule, PropertyDef, ViewQueryResult}
 use Domain.Policy
-use Domain.Types{AppError, AuthContext, AuthorKind, BlockOp, PrincipalKind, Provenance}
+use Domain.Types{
+  AppError,
+  AuthContext,
+  AuthorKind,
+  BlockOp,
+  Page,
+  PageKind,
+  PrincipalKind,
+  Provenance,
+  WorkspaceRole
+}
 use Json
 use Modb{WriteTx}
 use Modb.Claims
@@ -149,6 +160,63 @@ fn vellum_tools() : List(Mcp.ToolDef)
       read_only?: true
     ),
     Mcp.ToolDef(
+      name: "vellum.db_schema",
+      description: "Inspect relational database schema properties, saved views, and row count.",
+      input_schema: Mcp.object_schema({"database_id": str_prop("Target database ID")}, ["database_id"]),
+      read_only?: true
+    ),
+    Mcp.ToolDef(
+      name: "vellum.db_create_row",
+      description: "Directly create a typed row on a DirectWithAudit database with mandatory reason.",
+      input_schema: Mcp.object_schema(
+        {
+          "database_id": str_prop("Target database ID"),
+          "cells": Json.Object({"type": Json.String("object")}),
+          "markdown": str_prop("Optional backing page Markdown"),
+          "reason": str_prop("Audit reason for row creation")
+        },
+        ["database_id", "cells", "reason"]
+      ),
+      read_only?: false
+    ),
+    Mcp.ToolDef(
+      name: "vellum.db_update_row",
+      description: "Directly update typed cells on a DirectWithAudit database row with optimistic concurrency check.",
+      input_schema: Mcp.object_schema(
+        {
+          "database_id": str_prop("Target database ID"),
+          "row_id": str_prop("Target row ID"),
+          "cells": Json.Object({"type": Json.String("object")}),
+          "expected_version": Json.Object({"type": Json.String("integer")}),
+          "reason": str_prop("Audit reason for row update")
+        },
+        ["database_id", "row_id", "cells", "expected_version", "reason"]
+      ),
+      read_only?: false
+    ),
+    Mcp.ToolDef(
+      name: "vellum.db_propose_changes",
+      description: "Open or extend an isolated Modb.World Change Proposal with typed DB row/schema mutations or block patches.",
+      input_schema: Mcp.object_schema(
+        {
+          "database_id": str_prop("Target database ID"),
+          "proposal_id": str_prop("Optional existing open proposal ID to append mutations to"),
+          "title": str_prop("Proposal title (required when opening a new branch)"),
+          "branch_kind": str_prop("'proposal' (default) or 'scenario'"),
+          "reason": str_prop("Audit reason"),
+          "mutations": Json.Object({"type": Json.String("array")})
+        },
+        ["database_id", "reason", "mutations"]
+      ),
+      read_only?: false
+    ),
+    Mcp.ToolDef(
+      name: "vellum.proposal_comments",
+      description: "Read anchored Patchwork review & steer comments attached to a Change Proposal.",
+      input_schema: Mcp.object_schema({"proposal_id": str_prop("Proposal ID")}, ["proposal_id"]),
+      read_only?: true
+    ),
+    Mcp.ToolDef(
       name: "vellum.list_summaries",
       description: "List compact grant-filtered Living Summaries (~50 tokens each) for accessible pages and databases.",
       input_schema: Mcp.object_schema(
@@ -284,6 +352,757 @@ fn decode_ops_and_versions(args: Json) : Result((List(BlockOp), Map(Text, Int)),
     )
   end
   Ok((ops, exp_vers))
+end
+
+fn handle_mcp_db_schema(
+  id: Mcp.RpcId,
+  args: Json,
+  auth: AuthContext,
+  files: Files
+) : Result(Api.Response, AppError)
+  db_id = case args.text_at("database_id")
+    Some(s) if not s.trim.empty?: s.trim
+    Some(_) | None: return Ok(Mcp.tool_error(id, "missing 'database_id'"))
+  end
+  read_act = if Policy.action_permitted?(auth, "query_db"): "query_db" else: "read"
+  sres = Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      def = case try Table.get(store, Db.databases_table(), db_id).map_error(Db.map_table_error)
+        Some(d): d
+        None: return Error(Missing(entity: "database", id: db_id))
+      end
+      try Policy.require_collection_access(auth, read_act, def.collection_id)
+      vpairs = try Table.lookup(store, Db.db_views_table(), Db.db_views_by_database(), def.id)
+        .map_error(Db.map_table_error)
+      views = vpairs.map(fn(p) p.1 end).sort_by(fn(v) v.sort_order end)
+      rpairs = try Table.lookup(store, Db.db_rows_table(), Db.db_rows_by_database(), def.id)
+        .map_error(Db.map_table_error)
+      row_count = rpairs.filter(fn(p) p.1.archived_at == None end).size
+      Ok(
+        Json.Object({
+          "database": def.to_json,
+          "properties": def.properties.to_json,
+          "views": views.to_json,
+          "row_count": Json.int(row_count)
+        })
+      )
+    end
+  )
+  case sres
+    Ok(payload): Ok(Mcp.tool_ok(id, "Loaded schema for database #{db_id}.", Some(payload)))
+    Error(e): Ok(Mcp.tool_error(id, e.to_text))
+  end
+end
+
+fn handle_mcp_db_create_row(
+  id: Mcp.RpcId,
+  args: Json,
+  auth: AuthContext,
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock,
+  now: Time
+) : Result(Api.Response, AppError)
+  db_id = case args.text_at("database_id")
+    Some(s) if not s.trim.empty?: s.trim
+    Some(_) | None: return Ok(Mcp.tool_error(id, "missing 'database_id'"))
+  end
+  reason = case args.text_at("reason")
+    Some(r) if not r.trim.empty?: r.trim
+    Some(_) | None: return Ok(Mcp.tool_error(id, "non-empty 'reason' is required"))
+  end
+  cells_json = case args.get("cells")
+    Some(cj): cj
+    None: return Ok(Mcp.tool_error(id, "missing 'cells' object"))
+  end
+  cells = case Json.decode_strict[Map(Text, CellValue)](cells_json.to_text.bytes)
+    Ok(m): m
+    Error(e): return Ok(Mcp.tool_error(id, "invalid cells: #{e.to_text}"))
+  end
+  md_opt = args.text_at("markdown")
+  row_id = "row_#{Id.ulid(rng, clock)}"
+  page_id = "pg_#{Id.ulid(rng, clock)}"
+  block_prefix = "blk_#{Id.ulid(rng, clock)}"
+  prov = make_provenance(auth, reason, now)
+  blocks = case md_opt
+    Some(md) if not md.trim.empty?: Blocks.parse_markdown_blocks(page_id, md, prov, block_prefix)
+    Some(_) | None: []
+  end
+  idx_job = Jobs.prepare(
+    rng,
+    clock,
+    "vellum.page.indexed",
+    Json.Object({"page_id": Json.String(page_id)})
+  )
+  meta = Ledger.WriteMeta(
+    principal: auth.principal.handle,
+    action: "mcp.db_create_row",
+    reason: reason,
+    at: now
+  )
+  res = Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    meta,
+    "mcp created row #{row_id} in #{db_id}",
+    Json.Object({"database_id": Json.String(db_id), "row_id": Json.String(row_id)}),
+    Db.map_ledger_error,
+    fn(tx)
+      t1 = try tx_authorize_if_agent(tx, auth, "write_db", now)
+      def = case try Table.tx_get(t1, Db.databases_table(), db_id).map_error(Db.map_table_error)
+        Some(d): d
+        None: return Error(Missing(entity: "database", id: db_id))
+      end
+      try Policy.require_collection_access(auth, "write_db", def.collection_id)
+      col = case try Table.tx_get(t1, Db.collections_table(), def.collection_id).map_error(
+        Db.map_table_error
+      )
+        Some(c): c
+        None: return Error(Missing(entity: "collection", id: def.collection_id))
+      end
+      if not Policy.can_write_db_direct?(auth, col)
+        return Error(
+          Forbidden(
+            reason: "collection '#{col.slug}' requires Change Proposals; use vellum.db_propose_changes"
+          )
+        )
+      end
+      row = DbRow(
+        id: row_id,
+        database_id: def.id,
+        page_id: page_id,
+        cells: cells,
+        created_by: auth.principal.id,
+        created_at: now,
+        updated_at: now,
+        archived_at: None,
+        version: 1
+      )
+      case DatabaseModel.validate_row_cells(def, row)
+        Some(msg): return Error(BadInput(reason: msg))
+        None: Unit
+      end
+      row_title = DatabaseModel.extract_row_title(def, cells)
+      page = Page(
+        id: page_id,
+        collection_id: def.collection_id,
+        parent_page_id: Some(def.page_id),
+        title: row_title,
+        icon: None,
+        cover_attachment_id: None,
+        kind: DatabaseRow(database_id: def.id, row_id: row_id),
+        sort_order: row_id,
+        database_id: Some(def.id),
+        freshness_ttl_days: None,
+        verified_at: None,
+        verified_by: None,
+        created_by: auth.principal.id,
+        created_at: now,
+        updated_at: now,
+        archived_at: None,
+        version: 1
+      )
+      t2 = try Db.tx_put_db_row(t1, def, row, page, blocks)
+      (t3, _jid) = try Jobs.tx_put(t2, idx_job).map_error(Db.map_table_error)
+      Ok((t3, (row, page)))
+    end
+  )
+  case res
+    Ok((saved_row, saved_page)):
+      row_ev = Json.Object({
+        "database_id": Json.String(saved_row.database_id),
+        "row_id": Json.String(saved_row.id),
+        "page_id": Json.String(saved_page.id),
+        "collection_id": Json.String(saved_page.collection_id),
+        "actor": Json.String(auth.principal.handle)
+      })
+      payload = Json.Object({"row": saved_row.to_json, "page": saved_page.to_json})
+      Ok(
+        Mcp.tool_ok(id, "Created row #{saved_row.id} in database #{db_id}.", Some(payload))
+          .with_sse_publish_json("database:#{saved_row.database_id}", "db.row_created", row_ev)
+          .with_sse_publish_json("collection:#{saved_page.collection_id}", "db.row_created", row_ev)
+      )
+    Error(e): Ok(Mcp.tool_error(id, e.to_text))
+  end
+end
+
+fn handle_mcp_db_update_row(
+  id: Mcp.RpcId,
+  args: Json,
+  auth: AuthContext,
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock,
+  now: Time
+) : Result(Api.Response, AppError)
+  db_id = case args.text_at("database_id")
+    Some(s) if not s.trim.empty?: s.trim
+    Some(_) | None: return Ok(Mcp.tool_error(id, "missing 'database_id'"))
+  end
+  row_id = case args.text_at("row_id")
+    Some(s) if not s.trim.empty?: s.trim
+    Some(_) | None: return Ok(Mcp.tool_error(id, "missing 'row_id'"))
+  end
+  reason = case args.text_at("reason")
+    Some(r) if not r.trim.empty?: r.trim
+    Some(_) | None: return Ok(Mcp.tool_error(id, "non-empty 'reason' is required"))
+  end
+  exp_ver = case args.int_at("expected_version")
+    Some(v): v
+    None: return Ok(Mcp.tool_error(id, "missing integer 'expected_version'"))
+  end
+  cells_json = case args.get("cells")
+    Some(cj): cj
+    None: return Ok(Mcp.tool_error(id, "missing 'cells' object"))
+  end
+  cell_updates = case Json.decode_strict[Map(Text, CellValue)](cells_json.to_text.bytes)
+    Ok(m): m
+    Error(e): return Ok(Mcp.tool_error(id, "invalid cells: #{e.to_text}"))
+  end
+  idx_job = Jobs.prepare(rng, clock, "vellum.page.indexed", Json.Null)
+  meta = Ledger.WriteMeta(
+    principal: auth.principal.handle,
+    action: "mcp.db_update_row",
+    reason: reason,
+    at: now
+  )
+  res = Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    meta,
+    "mcp updated row #{row_id} in #{db_id}",
+    Json.Object({"database_id": Json.String(db_id), "row_id": Json.String(row_id)}),
+    Db.map_ledger_error,
+    fn(tx)
+      t1 = try tx_authorize_if_agent(tx, auth, "write_db", now)
+      def = case try Table.tx_get(t1, Db.databases_table(), db_id).map_error(Db.map_table_error)
+        Some(d): d
+        None: return Error(Missing(entity: "database", id: db_id))
+      end
+      try Policy.require_collection_access(auth, "write_db", def.collection_id)
+      col = case try Table.tx_get(t1, Db.collections_table(), def.collection_id).map_error(
+        Db.map_table_error
+      )
+        Some(c): c
+        None: return Error(Missing(entity: "collection", id: def.collection_id))
+      end
+      if not Policy.can_write_db_direct?(auth, col)
+        return Error(
+          Forbidden(
+            reason: "collection '#{col.slug}' requires Change Proposals; use vellum.db_propose_changes"
+          )
+        )
+      end
+      old_row = case try Table.tx_get(t1, Db.db_rows_table(), row_id).map_error(Db.map_table_error)
+        Some(r) if r.database_id == def.id and r.archived_at == None: r
+        Some(_) | None: return Error(Missing(entity: "db_row", id: row_id))
+      end
+      if old_row.version != exp_ver
+        return Error(
+          Conflict(
+            reason: "db_row '#{row_id}' version mismatch: expected #{exp_ver}, found #{old_row
+              .version}"
+          )
+        )
+      end
+      var merged_cells = old_row.cells
+      for (k, v) in cell_updates.entries
+        merged_cells = merged_cells.set(k, v)
+      end
+      bumped_row = DbRow(
+        id: old_row.id,
+        database_id: old_row.database_id,
+        page_id: old_row.page_id,
+        cells: merged_cells,
+        created_by: old_row.created_by,
+        created_at: old_row.created_at,
+        updated_at: now,
+        archived_at: old_row.archived_at,
+        version: old_row.version + 1
+      )
+      case DatabaseModel.validate_row_cells(def, bumped_row)
+        Some(msg): return Error(BadInput(reason: msg))
+        None: Unit
+      end
+      old_page = case try Table.tx_get(t1, Db.pages_table(), old_row.page_id).map_error(
+        Db.map_table_error
+      )
+        Some(p): p
+        None: return Error(Missing(entity: "page", id: old_row.page_id))
+      end
+      block_rows = try Table.tx_lookup(t1, Db.blocks_table(), Db.blocks_by_page(), old_page.id)
+        .map_error(Db.map_table_error)
+      existing_blocks = Blocks.sort_blocks(block_rows.map(fn(x) x.1 end))
+      bumped_page = Page(
+        id: old_page.id,
+        collection_id: old_page.collection_id,
+        parent_page_id: old_page.parent_page_id,
+        title: DatabaseModel.extract_row_title(def, merged_cells),
+        icon: old_page.icon,
+        cover_attachment_id: old_page.cover_attachment_id,
+        kind: old_page.kind,
+        sort_order: old_page.sort_order,
+        database_id: old_page.database_id,
+        freshness_ttl_days: old_page.freshness_ttl_days,
+        verified_at: old_page.verified_at,
+        verified_by: old_page.verified_by,
+        created_by: old_page.created_by,
+        created_at: old_page.created_at,
+        updated_at: now,
+        archived_at: old_page.archived_at,
+        version: old_page.version + 1
+      )
+      t2 = try Db.tx_put_db_row(t1, def, bumped_row, bumped_page, existing_blocks)
+      final_idx_job = Jobs.JobRecord(
+        id: idx_job.id,
+        queue: idx_job.queue,
+        job_name: idx_job.job_name,
+        payload_json: Json.Object({"page_id": Json.String(bumped_page.id)}).to_text,
+        state: idx_job.state,
+        attempts: idx_job.attempts,
+        max_attempts: idx_job.max_attempts,
+        run_at: idx_job.run_at,
+        locked_at: idx_job.locked_at,
+        last_error: idx_job.last_error,
+        created_at: idx_job.created_at,
+        updated_at: idx_job.updated_at
+      )
+      (t3, _jid) = try Jobs.tx_put(t2, final_idx_job).map_error(Db.map_table_error)
+      Ok((t3, (bumped_row, bumped_page)))
+    end
+  )
+  case res
+    Ok((next_row, next_page)):
+      row_ev = Json.Object({
+        "database_id": Json.String(next_row.database_id),
+        "row_id": Json.String(next_row.id),
+        "page_id": Json.String(next_page.id),
+        "collection_id": Json.String(next_page.collection_id),
+        "version": Json.int(next_row.version),
+        "actor": Json.String(auth.principal.handle)
+      })
+      payload = Json.Object({"row": next_row.to_json, "page": next_page.to_json})
+      Ok(
+        Mcp.tool_ok(id, "Updated row #{next_row.id} (v#{next_row.version}).", Some(payload))
+          .with_sse_publish_json("database:#{next_row.database_id}", "db.row_updated", row_ev)
+          .with_sse_publish_json("collection:#{next_page.collection_id}", "db.row_updated", row_ev)
+      )
+    Error(e): Ok(Mcp.tool_error(id, e.to_text))
+  end
+end
+
+fn decode_mcp_world_mutation(
+  item: Json,
+  def_id: Text,
+  def_page_id: Text,
+  prov: Provenance,
+  auth: AuthContext,
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock
+) : Result(WorldMutation, Text)
+  mkind = (item.text_at("kind") or "").trim
+  if mkind == "page_patch"
+    pid = case item.text_at("page_id")
+      Some(s) if not s.trim.empty?: s.trim
+      Some(_) | None: def_page_id
+    end
+    ops_j = case item.get("ops")
+      Some(j): j
+      None: return Error("ops required for page_patch")
+    end
+    ops = case Json.decode_strict[List(BlockOp)](ops_j.to_text.bytes)
+      Ok(o) if not o.empty?: o
+      Ok(_): return Error("ops must not be empty")
+      Error(e): return Error("invalid ops: #{e.to_text}")
+    end
+    exp_vers = case item.get("expected_versions")
+      None | Some(Json.Null): {}
+      Some(evj):
+        case Json.decode_strict[Map(Text, Int)](evj.to_text.bytes)
+          Ok(m): m
+          Error(e): return Error("invalid expected_versions: #{e.to_text}")
+        end
+    end
+    pg = try Ledger.read_locked(
+      files.read_only,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      Db.map_ledger_error,
+      fn(db)
+        found_pg = case try Table.get(Ledger.store(db), Db.pages_table(), pid).map_error(
+          Db.map_table_error
+        )
+          Some(p) if p.archived_at == None: p
+          Some(_) | None: return Error(Missing(entity: "page", id: pid))
+        end
+        try Policy.require_collection_access(auth, "propose", found_pg.collection_id)
+        Ok(found_pg)
+      end
+    ).map_error(fn(e) e.to_text end)
+    return Ok(
+      PatchPageBlocks(
+        page_id: pg.id,
+        ops: ops,
+        new_ids: generate_insert_ids(ops, rng, clock),
+        provenance: prov,
+        expected_versions: exp_vers
+      )
+    )
+  end
+
+  mut_db_id = case item.text_at("database_id")
+    Some(s) if not s.trim.empty?: s.trim
+    Some(_) | None: def_id
+  end
+  if mut_db_id != def_id
+    _d = try Ledger.read_locked(
+      files.read_only,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      Db.map_ledger_error,
+      fn(db)
+        fd = case try Table.get(Ledger.store(db), Db.databases_table(), mut_db_id).map_error(
+          Db.map_table_error
+        )
+          Some(d): d
+          None: return Error(Missing(entity: "database", id: mut_db_id))
+        end
+        try Policy.require_collection_access(auth, "propose", fd.collection_id)
+        Ok(fd)
+      end
+    ).map_error(fn(e) e.to_text end)
+  end
+
+  if mkind == "db_row_create"
+    cj = case item.get("cells")
+      Some(j): j
+      None: return Error("cells required for db_row_create")
+    end
+    cs = case Json.decode_strict[Map(Text, CellValue)](cj.to_text.bytes)
+      Ok(m): m
+      Error(e): return Error("invalid cells: #{e.to_text}")
+    end
+    Ok(
+      CreateDbRow(
+        database_id: mut_db_id,
+        row_id: "row_#{Id.ulid(rng, clock)}",
+        page_id: "pg_#{Id.ulid(rng, clock)}",
+        cells: cs,
+        markdown: item.text_at("markdown"),
+        block_prefix: "blk_#{Id.ulid(rng, clock)}",
+        provenance: prov
+      )
+    )
+  else if mkind == "db_row_update"
+    rid = (item.text_at("row_id") or "").trim
+    if rid.empty?
+      return Error("row_id required for db_row_update")
+    end
+    cj = case item.get("cells")
+      Some(j): j
+      None: return Error("cells required for db_row_update")
+    end
+    cs = case Json.decode_strict[Map(Text, CellValue)](cj.to_text.bytes)
+      Ok(m): m
+      Error(e): return Error("invalid cells: #{e.to_text}")
+    end
+    Ok(
+      UpdateDbRow(
+        database_id: mut_db_id,
+        row_id: rid,
+        cells: cs,
+        expected_version: item.int_at("expected_version"),
+        provenance: prov
+      )
+    )
+  else if mkind == "db_row_delete"
+    rid = (item.text_at("row_id") or "").trim
+    if rid.empty?
+      return Error("row_id required for db_row_delete")
+    end
+    Ok(DeleteDbRow(database_id: mut_db_id, row_id: rid))
+  else if mkind == "db_schema_update"
+    t_opt = case item.get("title")
+      None | Some(Json.Null): None
+      Some(Json.String(s)): Some(s)
+      Some(_): return Error("invalid schema title")
+    end
+    d_opt = case item.get("description")
+      None | Some(Json.Null): None
+      Some(Json.String(s)): Some(s)
+      Some(_): return Error("invalid schema description")
+    end
+    p_opt = case item.get("properties")
+      None | Some(Json.Null): None
+      Some(pj):
+        case Json.decode_strict[List(PropertyDef)](pj.to_text.bytes)
+          Ok(ps): Some(ps)
+          Error(e): return Error("invalid schema properties: #{e.to_text}")
+        end
+    end
+    Ok(
+      UpdateDbSchema(
+        database_id: mut_db_id,
+        title: t_opt,
+        description: d_opt,
+        properties: p_opt,
+        expected_version: item.int_at("expected_version")
+      )
+    )
+  else
+    Error("unsupported mutation kind '#{mkind}'")
+  end
+end
+
+fn handle_mcp_db_propose_changes(
+  id: Mcp.RpcId,
+  args: Json,
+  auth: AuthContext,
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock,
+  now: Time
+) : Result(Api.Response, AppError)
+  db_id = case args.text_at("database_id")
+    Some(s) if not s.trim.empty?: s.trim
+    Some(_) | None: return Ok(Mcp.tool_error(id, "missing 'database_id'"))
+  end
+  reason = case args.text_at("reason")
+    Some(r) if not r.trim.empty?: r.trim
+    Some(_) | None: return Ok(Mcp.tool_error(id, "non-empty 'reason' is required"))
+  end
+  muts_raw = case args.list_at("mutations")
+    Some(xs) if not xs.empty?: xs
+    Some(_) | None: return Ok(Mcp.tool_error(id, "non-empty 'mutations' array is required"))
+  end
+  existing_pid_opt = case args.text_at("proposal_id")
+    Some(s) if not s.trim.empty?: Some(s.trim)
+    Some(_) | None: None
+  end
+  bkind = case args.text_at("branch_kind")
+    Some(k) if not k.trim.empty?:
+      tk = k.trim
+      if tk != "proposal" and tk != "scenario"
+        return Ok(Mcp.tool_error(id, "branch_kind must be 'proposal' or 'scenario'"))
+      end
+      tk
+    Some(_) | None: "proposal"
+  end
+
+  target_def_res = Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      found_def = case try Table.get(store, Db.databases_table(), db_id).map_error(
+        Db.map_table_error
+      )
+        Some(d): d
+        None: return Error(Missing(entity: "database", id: db_id))
+      end
+      try Policy.require_collection_access(auth, "propose", found_def.collection_id)
+      Ok(found_def)
+    end
+  )
+  def = case target_def_res
+    Ok(d): d
+    Error(e): return Ok(Mcp.tool_error(id, e.to_text))
+  end
+
+  prov = make_provenance(auth, reason, now)
+  var decoded_muts = []
+  for item in muts_raw
+    case decode_mcp_world_mutation(item, def.id, def.page_id, prov, auth, files, rng, clock)
+      Ok(mut): decoded_muts = decoded_muts.append(mut)
+      Error(msg): return Ok(Mcp.tool_error(id, msg))
+    end
+  end
+
+  (pm, opened_new?) = case existing_pid_opt
+    Some(pid):
+      pm_res = Ledger.read_locked(
+        files.read_only,
+        Db.ledger_db_path,
+        Db.vellum_schema(),
+        Db.map_ledger_error,
+        fn(db)
+          found = case try Table.get(Ledger.store(db), Db.proposals_table(), pid).map_error(
+            Db.map_table_error
+          )
+            Some(p): p
+            None: return Error(Missing(entity: "proposal", id: pid))
+          end
+          try Policy.require_collection_access(auth, "propose", found.collection_id)
+          Ok(found)
+        end
+      )
+      found = case pm_res
+        Ok(p): p
+        Error(e): return Ok(Mcp.tool_error(id, e.to_text))
+      end
+      is_admin? = auth.principal.role == Owner or auth.principal.role == Admin
+      if found.status != "open" or (found.author_id != auth.principal.id and not is_admin?)
+        return Ok(
+          Mcp.tool_error(id, "proposal '#{pid}' must be open and authored by caller or admin")
+        )
+      end
+      (found, false)
+    None:
+      title = case args.text_at("title")
+        Some(s) if not s.trim.empty?: s.trim
+        Some(_) | None: return Ok(Mcp.tool_error(id, "missing 'title' when opening proposal"))
+      end
+      prop_id = "prop_#{Id.ulid(rng, clock)}"
+      world_id = "w_#{Id.ulid(rng, clock)}"
+      case World.open_world_locked(
+        files,
+        Db.ledger_db_path,
+        Db.vellum_schema(),
+        world_id,
+        auth.grant_id,
+        now,
+        now + 7.days
+      ).map_error(Db.map_world_error)
+        Error(e): return Ok(Mcp.tool_error(id, e.to_text))
+        Ok(_): Unit
+      end
+      pm_new = ProposalMeta(
+        id: prop_id,
+        world_id: world_id,
+        collection_id: def.collection_id,
+        target_page_id: def.page_id,
+        target_database_id: Some(def.id),
+        branch_kind: bkind,
+        title: title,
+        reason: reason,
+        author_id: auth.principal.id,
+        author_handle: auth.principal.handle,
+        grant_id: auth.grant_id,
+        status: "open",
+        created_at: now,
+        updated_at: now,
+        decided_by: None,
+        decided_at: None
+      )
+      meta = Ledger.WriteMeta(
+        principal: auth.principal.handle,
+        action: "mcp.db_propose_changes",
+        reason: reason,
+        at: now
+      )
+      saved_pm = try Ledger.transact_locked(
+        files,
+        Db.ledger_db_path,
+        Db.vellum_schema(),
+        meta,
+        "mcp opened db proposal #{prop_id} on #{def.id}",
+        Json.Object({"proposal_id": Json.String(prop_id), "database_id": Json.String(def.id)}),
+        Db.map_ledger_error,
+        fn(tx)
+          t1 = try tx_authorize_if_agent(tx, auth, "propose", now)
+          t2 = try Table.put(t1, Db.proposals_table(), pm_new.id, pm_new).map_error(
+            Db.map_table_error
+          )
+          Ok((t2, pm_new))
+        end
+      )
+      (saved_pm, true)
+  end
+
+  var step_replies = []
+  for mut in decoded_muts
+    bargs = WorldBranchArgs(mutation: mut, updated_at: now)
+    case World.world_call_locked(
+      files,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      Db.world_catalog(),
+      pm.world_id,
+      "propose",
+      bargs.to_json,
+      reason,
+      now
+    ).map_error(Db.map_world_error)
+      Ok(rep): step_replies = step_replies.append(rep)
+      Error(e): return Ok(Mcp.tool_error(id, e.to_text))
+    end
+  end
+
+  ev_name = if opened_new?: "proposal.opened" else: "proposal.updated"
+  ev_payload = Json.Object({
+    "proposal_id": Json.String(pm.id),
+    "database_id": Json.String(def.id),
+    "page_id": Json.String(pm.target_page_id),
+    "collection_id": Json.String(pm.collection_id),
+    "title": Json.String(pm.title),
+    "actor": Json.String(auth.principal.handle)
+  })
+  out_json = Json.Object({
+    "proposal": pm.to_json,
+    "staged_count": Json.int(step_replies.size),
+    "step_replies": Json.Array(step_replies)
+  })
+  Ok(
+    Mcp.tool_ok(
+      id,
+      "Staged #{step_replies.size} database mutation(s) in proposal #{pm.id}.",
+      Some(out_json)
+    ).with_sse_publish_json("collection:#{pm.collection_id}", ev_name, ev_payload)
+      .with_sse_publish_json("database:#{def.id}", ev_name, ev_payload)
+  )
+end
+
+fn handle_mcp_proposal_comments(
+  id: Mcp.RpcId,
+  args: Json,
+  auth: AuthContext,
+  files: Files
+) : Result(Api.Response, AppError)
+  pid = case args.text_at("proposal_id")
+    Some(s) if not s.trim.empty?: s.trim
+    Some(_) | None: return Ok(Mcp.tool_error(id, "missing 'proposal_id'"))
+  end
+  cres = Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      pm = case try Table.get(store, Db.proposals_table(), pid).map_error(Db.map_table_error)
+        Some(p): p
+        None: return Error(Missing(entity: "proposal", id: pid))
+      end
+      try Policy.require_collection_access(auth, "read", pm.collection_id)
+      pairs = try Table.lookup(
+        store,
+        Db.proposal_comments_table(),
+        Db.proposal_comments_by_proposal(),
+        pid
+      ).map_error(Db.map_table_error)
+      Ok(pairs.map(fn(p) p.1 end).sort_by(fn(c) c.id end))
+    end
+  )
+  case cres
+    Ok(cmts): Ok(
+      Mcp.tool_ok(
+        id,
+        "Returned #{cmts.size} comments for proposal #{pid}.",
+        Some(Json.Object({"proposal_id": Json.String(pid), "comments": cmts.to_json}))
+      )
+    )
+    Error(e): Ok(Mcp.tool_error(id, e.to_text))
+  end
 end
 
 fn handle_tool_call(
@@ -868,6 +1687,26 @@ fn handle_tool_call(
       Ok(vq): Ok(Mcp.tool_ok(id, "Returned #{vq.total_count} rows.", Some(vq.to_json)))
       Error(e): Ok(Mcp.tool_error(id, e.to_text))
     end
+  end
+
+  if name == "vellum.db_schema"
+    return handle_mcp_db_schema(id, args, auth, files)
+  end
+
+  if name == "vellum.db_create_row"
+    return handle_mcp_db_create_row(id, args, auth, files, rng, clock, now)
+  end
+
+  if name == "vellum.db_update_row"
+    return handle_mcp_db_update_row(id, args, auth, files, rng, clock, now)
+  end
+
+  if name == "vellum.db_propose_changes"
+    return handle_mcp_db_propose_changes(id, args, auth, files, rng, clock, now)
+  end
+
+  if name == "vellum.proposal_comments"
+    return handle_mcp_proposal_comments(id, args, auth, files)
   end
 
   if name == "vellum.list_summaries"
