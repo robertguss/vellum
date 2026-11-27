@@ -11,6 +11,8 @@ DraftBlockInput(..),
 RefreshAiBriefInput(..),
 RunAiColumnInput(..),
 SteerProposalInput(..),
+DeepResearchInput(..),
+DeepResearchOutcome(..),
 GardenStalePage(..),
 GardenBrokenLink(..),
 GardenReport(..),
@@ -28,6 +30,11 @@ refresh_ai_brief,
 steer_proposal,
 build_ai_column_prompts,
 build_steer_prompts,
+build_rlm_subcall_prompts,
+build_rlm_synthesis_prompts,
+deep_research_outcome_to_json,
+execute_rlm_tier1,
+deep_research,
 run_ai_column,
 ai_columns_status,
 sync_ai_column_feed,
@@ -50,6 +57,8 @@ use Domain.DatabaseModel{
   PropertyKind
 }
 use Domain.Policy
+use Domain.Rlm{RlmBlockSlice, RlmDbSlice, RlmTraceStep}
+use Domain.TaintBridge
 use Domain.Types{
   AppError,
   AuthContext,
@@ -72,6 +81,7 @@ use Modb.Grants
 use Modb.Ledger
 use Modb.Table
 use Modb.Vec
+use Modb.Views
 use Modb.World
 use Routes.Auth
 use Routes.Packs
@@ -2461,4 +2471,645 @@ fn steer_proposal(
       .with_sse_publish_json("page:#{target_pid}", "proposal.commented", steer_ev)
   end
   Ok(resp)
+end
+
+## JSON payload for `POST /api/ai/deep-research` and MCP `vellum.rlm_query` (RLM Tier 1).
+struct DeepResearchInput
+  question: Text
+  collection_id: Option(Text)
+  block_kinds: Option(List(Text))
+  heading_contains: Option(Text)
+  include_databases: Option(Bool)
+  max_pages: Option(Int)
+  max_blocks_per_page: Option(Int)
+  max_subcalls: Option(Int)
+  max_rows_scanned: Option(Int)
+  session_id: Option(Text)
+end
+
+## Structured Tier 1 RLM Deep Research result with inspectable `Modb.Views` trace & `Modb.Taint` state.
+struct DeepResearchOutcome
+  tier: Text
+  answer: Text
+  model: Text
+  session_id: Text
+  untrusted_tainted: Bool
+  max_sensitivity_read: Text
+  untrusted_sources: List(Text)
+  rows_scanned: Int
+  ops_used: Int
+  subcalls_used: Int
+  max_subcalls: Int
+  citations: List(Json)
+  db_slices: List(RlmDbSlice)
+  trace: List(RlmTraceStep)
+end
+
+fn rlm_clamp(opt: Option(Int), def_v: Int, lo: Int, hi: Int) : Int
+  case opt
+    Some(v):
+      if v < lo: lo else if v > hi: hi else: v
+    None: def_v
+  end
+end
+
+fn rlm_auth_mode(auth: AuthContext) : (Option(Text), Bool)
+  case auth.allowed_collections
+    Some(_): (Some(auth.grant_id), false)
+    None: (None, true)
+  end
+end
+
+fn rlm_target_collections(
+  rf: ReadFiles,
+  auth: AuthContext,
+  col_filter: Option(Text)
+) : Result((List(Text), List(Text)), AppError)
+  filter_opt = case col_filter
+    Some(raw) if not raw.trim.empty?: Some(raw.trim)
+    Some(_) | None: None
+  end
+  if not rf.exists?(Db.ledger_db_path)
+    return case filter_opt
+      Some(cid): Error(Missing(entity: "collection", id: cid))
+      None: Ok(([], []))
+    end
+  end
+  cols = try Ledger.read_locked(
+    rf,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      pairs = try Table.scan(Ledger.store(db), Db.collections_table(), None, None, 200).map_error(
+        Db.map_table_error
+      )
+      Ok(pairs.filter(fn(p) p.1.archived_at == None end).map(fn(p) p.1 end).sort_by(fn(c) c.id end))
+    end
+  )
+  case filter_opt
+    Some(cid):
+      if not cols.any?(fn(c) c.id == cid end)
+        return Error(Missing(entity: "collection", id: cid))
+      end
+      if auth.allowed_collections is None
+        try Policy.require_collection_access(auth, "read", cid)
+      end
+      Ok(([cid], [cid]))
+    None:
+      cids = cols.filter(fn(c) Policy.collection_permitted?(auth, c.id) end).map(fn(c) c.id end)
+      Ok((cids, cids))
+  end
+end
+
+## Formats the sub-agent map step prompts for a bounded chunk of RLM block slices.
+fn build_rlm_subcall_prompts(
+  question: Text,
+  chunk_idx: Int,
+  total_chunks: Int,
+  slices: List(RlmBlockSlice)
+) : (Text, Text)
+  sys = "You are Vellum RLM Deep Research sub-agent #{chunk_idx}/#{total_chunks}. Extract exact facts strictly from the provided sliced workspace blocks and preserve every [PageTitle §block_id] citation."
+  var parts = ["Question: #{question}", "", "Sliced Workspace Blocks (Chunk #{chunk_idx}/#{total_chunks}):"]
+  for s in slices
+    hp = case s.heading_path
+      Some(h): ", section=#{h}"
+      None: ""
+    end
+    parts = parts.append("[#{s.page_title} §#{s.block_id}] (#{s.kind_tag}#{hp})\n#{s.markdown}")
+  end
+  (sys, parts.join("\n"))
+end
+
+## Formats the final Tier 1 RLM synthesizer prompts over sub-agent notes, block slices, and DB slices.
+fn build_rlm_synthesis_prompts(
+  question: Text,
+  subcall_notes: List(Text),
+  slices: List(RlmBlockSlice),
+  db_slices: List(RlmDbSlice)
+) : (Text, Text)
+  sys = "You are Vellum RLM Deep Research synthesizer. Synthesize a concise, verified answer strictly from the inspected block slices, database slices, and sub-agent findings. Cite [Title §block_id] and [DB: DatabaseTitle #row_id]."
+  var parts = ["Question: #{question}"]
+  if not subcall_notes.empty?
+    parts = parts.append("")
+    parts = parts.append("Sub-Agent Map Findings:")
+    for note in subcall_notes
+      parts = parts.append(note)
+    end
+  end
+  if not slices.empty?
+    parts = parts.append("")
+    parts = parts.append("Inspected Block Slices (#{slices.size}):")
+    for s in slices
+      hp = case s.heading_path
+        Some(h): ", section=#{h}"
+        None: ""
+      end
+      parts = parts.append("[#{s.page_title} §#{s.block_id}] (#{s.kind_tag}#{hp})\n#{s.markdown}")
+    end
+  end
+  if not db_slices.empty?
+    parts = parts.append("")
+    parts = parts.append("Inspected Database Slices (#{db_slices.size}):")
+    for d in db_slices
+      parts = parts.append(
+        "[DB: #{d.database_title} ##{d.row_id}] #{d.title} — #{d.cells_summary}"
+      )
+    end
+  end
+  if slices.empty? and db_slices.empty?
+    parts = parts.append("")
+    parts = parts.append("(No matching permitted block or database slices found.)")
+  end
+  (sys, parts.join("\n"))
+end
+
+struct RlmDbState
+  rows_scanned: Int
+  ops_used: Int
+  trace: List(RlmTraceStep)
+  untrusted_tainted: Bool
+  max_sens: Text
+  untrusted_sources: List(Text)
+end
+
+fn rlm_append_db_slices(
+  files: Files,
+  cat: Views.ViewCatalog,
+  sess_id: Text,
+  is_admin: Bool,
+  limits: Views.ReadLimits,
+  db_cands: List((Int, Text, Text)),
+  now: Time,
+  st0: RlmDbState
+) : Result((RlmDbState, List(RlmDbSlice)), AppError)
+  ranked_dbs = db_cands.sort_by(fn(p) -p.0 end)
+  pos_dbs = ranked_dbs.filter(fn(p) p.0 > 0 end).take(4)
+  chosen_dbs = if not pos_dbs.empty?: pos_dbs else: ranked_dbs.take(2)
+  if chosen_dbs.empty?
+    return Ok((st0, []))
+  end
+
+  var col_order = []
+  var by_col = {}
+  for (_sc, cid, did) in chosen_dbs
+    case by_col.get(cid)
+      Some(xs): by_col = by_col.set(cid, xs.append(did))
+      None:
+        col_order = col_order.append(cid)
+        by_col = by_col.set(cid, [did])
+    end
+  end
+
+  var st = st0
+  var out_dbs = []
+  for cid in col_order
+    dids = by_col.get(cid) or []
+    if not dids.empty?
+      prog = Views.ReadProgram(
+        view: "rlm_db_rows:#{cid}",
+        where_clause: Some(
+          Views.InList(field: "database_id", values: dids.map(fn(x) Json.String(x) end))
+        ),
+        select: None,
+        group_by: None,
+        aggregates: None,
+        order_by: None,
+        limit: Some(40)
+      )
+      tr = try TaintBridge.run_tainted_read_program_locked(
+        files,
+        Db.ledger_db_path,
+        Db.vellum_schema(),
+        cat,
+        sess_id,
+        prog,
+        is_admin,
+        limits,
+        now
+      )
+      res = tr.governed.result
+      st.rows_scanned += res.rows_scanned
+      st.ops_used += res.ops_used
+      st.untrusted_tainted = tr.session.untrusted_tainted
+      st.max_sens = TaintBridge.sensitivity_label(tr.session.max_sensitivity_read)
+      st.untrusted_sources = tr.session.untrusted_sources
+      st.trace = st.trace.append(
+        RlmTraceStep(
+          step: st.trace.size + 1,
+          op: "read_program",
+          target: prog.view,
+          detail: "Sliced #{res.result_count} database rows from #{dids.size} databases",
+          rows_scanned: res.rows_scanned,
+          ops_used: res.ops_used,
+          result_count: res.result_count,
+          answer_hash: Some(res.answer_hash)
+        )
+      )
+      for r in res.rows
+        out_dbs = out_dbs.append(
+          RlmDbSlice(
+            database_id: r.text_at("database_id") or "",
+            database_title: r.text_at("database_title") or "",
+            collection_id: r.text_at("collection_id") or cid,
+            row_id: r.text_at("row_id") or "",
+            page_id: r.text_at("page_id") or "",
+            title: r.text_at("title") or "",
+            cells_summary: r.text_at("cells_summary") or ""
+          )
+        )
+      end
+    end
+  end
+  Ok((st, out_dbs))
+end
+
+fn rlm_inspect_storage(
+  files: Files,
+  cat: Views.ViewCatalog,
+  query_cids: List(Text),
+  sess_id: Text,
+  is_admin: Bool,
+  limits: Views.ReadLimits,
+  keywords: List(Text),
+  heading_contains: Option(Text),
+  allowed_kinds: List(Text),
+  include_dbs?: Bool,
+  max_pages: Int,
+  max_blocks_per_page: Int,
+  now: Time
+) : Result((RlmDbState, List(RlmBlockSlice), List(RlmDbSlice)), AppError)
+  var st = RlmDbState(
+    rows_scanned: 0,
+    ops_used: 0,
+    trace: [],
+    untrusted_tainted: false,
+    max_sens: "public",
+    untrusted_sources: []
+  )
+  var page_cands = []
+  var db_cands = []
+
+  for cid in query_cids
+    prog = Views.ReadProgram(
+      view: "rlm_summaries:#{cid}",
+      where_clause: None,
+      select: None,
+      group_by: None,
+      aggregates: None,
+      order_by: None,
+      limit: Some(200)
+    )
+    tr = try TaintBridge.run_tainted_read_program_locked(
+      files,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      cat,
+      sess_id,
+      prog,
+      is_admin,
+      limits,
+      now
+    )
+    res = tr.governed.result
+    st.rows_scanned += res.rows_scanned
+    st.ops_used += res.ops_used
+    st.untrusted_tainted = tr.session.untrusted_tainted
+    st.max_sens = TaintBridge.sensitivity_label(tr.session.max_sensitivity_read)
+    st.untrusted_sources = tr.session.untrusted_sources
+    st.trace = st.trace.append(
+      RlmTraceStep(
+        step: st.trace.size + 1,
+        op: "read_program",
+        target: prog.view,
+        detail: "Scanned #{res.result_count} Living Summaries in #{cid}",
+        rows_scanned: res.rows_scanned,
+        ops_used: res.ops_used,
+        result_count: res.result_count,
+        answer_hash: Some(res.answer_hash)
+      )
+    )
+    for row in res.rows
+      ek = row.text_at("entity_kind") or ""
+      eid = row.text_at("entity_id") or ""
+      sc = Rlm.score_summary_row(row, keywords)
+      if ek == "page" and not eid.empty?
+        page_cands = page_cands.append((sc, cid, eid))
+      else if ek == "database" and not eid.empty?
+        db_cands = db_cands.append((sc, cid, eid))
+      end
+    end
+  end
+
+  ranked_pages = page_cands.sort_by(fn(p) -p.0 end)
+  pos_pages = ranked_pages.filter(fn(p) p.0 > 0 end).take(max_pages)
+  chosen_pages = if not pos_pages.empty?: pos_pages else: ranked_pages.take(max_pages)
+
+  var col_order = []
+  var pids_by_col = {}
+  for (_sc, cid, pid) in chosen_pages
+    case pids_by_col.get(cid)
+      Some(xs): pids_by_col = pids_by_col.set(cid, xs.append(pid))
+      None:
+        col_order = col_order.append(cid)
+        pids_by_col = pids_by_col.set(cid, [pid])
+    end
+  end
+
+  has_heading_f? = case heading_contains
+    Some(h) if not h.trim.empty?: true
+    Some(_) | None: false
+  end
+  var raw_block_rows = []
+  for cid in col_order
+    pids = pids_by_col.get(cid) or []
+    if not pids.empty?
+      pid_pred = Views.InList(field: "page_id", values: pids.map(fn(x) Json.String(x) end))
+      where_pred = if (not has_heading_f?) and (not allowed_kinds.empty?)
+        Views.And(
+          preds: [
+            pid_pred,
+            Views.InList(field: "kind_tag", values: allowed_kinds.map(fn(k) Json.String(k) end))
+          ]
+        )
+      else
+        pid_pred
+      end
+      bprog = Views.ReadProgram(
+        view: "rlm_blocks:#{cid}",
+        where_clause: Some(where_pred),
+        select: None,
+        group_by: None,
+        aggregates: None,
+        order_by: None,
+        limit: Some(200)
+      )
+      btr = try TaintBridge.run_tainted_read_program_locked(
+        files,
+        Db.ledger_db_path,
+        Db.vellum_schema(),
+        cat,
+        sess_id,
+        bprog,
+        is_admin,
+        limits,
+        now
+      )
+      bres = btr.governed.result
+      st.rows_scanned += bres.rows_scanned
+      st.ops_used += bres.ops_used
+      st.untrusted_tainted = btr.session.untrusted_tainted
+      st.max_sens = TaintBridge.sensitivity_label(btr.session.max_sensitivity_read)
+      st.untrusted_sources = btr.session.untrusted_sources
+      st.trace = st.trace.append(
+        RlmTraceStep(
+          step: st.trace.size + 1,
+          op: "read_program",
+          target: bprog.view,
+          detail: "Sliced #{bres.result_count} candidate blocks across #{pids.size} pages",
+          rows_scanned: bres.rows_scanned,
+          ops_used: bres.ops_used,
+          result_count: bres.result_count,
+          answer_hash: Some(bres.answer_hash)
+        )
+      )
+      for brow in bres.rows
+        raw_block_rows = raw_block_rows.append(brow)
+      end
+    end
+  end
+
+  slices = Rlm.slice_block_rows(
+    raw_block_rows,
+    keywords,
+    heading_contains,
+    allowed_kinds,
+    max_blocks_per_page
+  )
+
+  (final_st, db_slices) = if include_dbs?
+    try rlm_append_db_slices(files, cat, sess_id, is_admin, limits, db_cands, now, st)
+  else
+    (st, [])
+  end
+  Ok((final_st, slices, db_slices))
+end
+
+fn rlm_build_citations(slices: List(RlmBlockSlice)) : List(Json)
+  var seen = Set.empty
+  var out = []
+  for s in slices
+    k = "#{s.page_id}:#{s.block_id}"
+    if not seen.has?(k)
+      seen = seen.add(k)
+      hp_json = case s.heading_path
+        Some(h): Json.String(h)
+        None: Json.Null
+      end
+      out = out.append(
+        Json.Object({
+          "page_id": Json.String(s.page_id),
+          "collection_id": Json.String(s.collection_id),
+          "block_id": Json.String(s.block_id),
+          "title": Json.String(s.page_title),
+          "excerpt": Json.String(Rlm.format_slice_excerpt(s)),
+          "kind_tag": Json.String(s.kind_tag),
+          "heading_path": hp_json
+        })
+      )
+    end
+  end
+  out
+end
+
+## Executes Tier 1 RLM Deep Research (`Modb.Views` `ReadProgram` + block-slice DSL + bounded LLM map/reduce)
+## strictly under `Modb.Grants`, `Modb.Views.ReadLimits`, and `Modb.Taint.TaintSession`, calling LLM HTTP APIs
+## strictly outside all storage locks.
+fn execute_rlm_tier1(
+  auth: AuthContext,
+  input: DeepResearchInput,
+  files: Files,
+  clock: Clock,
+  env: Env,
+  net: Network
+) : Result(DeepResearchOutcome, AppError)
+  if not Policy.action_permitted?(auth, "read")
+    return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'read'"))
+  end
+  q = input.question.trim
+  if q.empty?
+    return Error(BadInput(reason: "question must not be empty"))
+  end
+  cfg = try ai_config(env)
+
+  max_pages = rlm_clamp(input.max_pages, 6, 1, 12)
+  max_b_per_p = rlm_clamp(input.max_blocks_per_page, 6, 1, 15)
+  max_subcalls = rlm_clamp(input.max_subcalls, 3, 0, 6)
+  max_rows = rlm_clamp(input.max_rows_scanned, 500, 1, 2000)
+  raw_ops = max_rows * 40
+  max_ops = if raw_ops < 100: 100 else if raw_ops > 20000: 20000 else: raw_ops
+  limits = Views.ReadLimits(max_rows_scanned: max_rows, max_ops: max_ops, max_result_rows: 200)
+  allowed_kinds = Rlm.normalize_block_kinds(input.block_kinds)
+  include_dbs? = input.include_databases != Some(false)
+  keywords = Rlm.extract_query_keywords(q)
+  now = clock.now
+
+  (grant_opt, is_admin) = rlm_auth_mode(auth)
+  (catalog_cids, query_cids) = try rlm_target_collections(
+    files.read_only,
+    auth,
+    input.collection_id
+  )
+
+  sess_id = case input.session_id
+    Some(raw) if not raw.trim.empty?: "rlm:#{auth.grant_id}:#{raw.trim}"
+    Some(_) | None: "rlm:#{auth.grant_id}"
+  end
+  sess = if files.read_only.exists?(Db.ledger_db_path)
+    try TaintBridge.ensure_taint_session_locked(
+      files,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      sess_id,
+      auth.principal.id,
+      grant_opt,
+      now
+    )
+  else
+    return Error(Missing(entity: "collection", id: "none"))
+  end
+
+  cat = Db.rlm_view_catalog(catalog_cids)
+  (st0, slices, db_slices) = try rlm_inspect_storage(
+    files,
+    cat,
+    query_cids,
+    sess.id,
+    is_admin,
+    limits,
+    keywords,
+    input.heading_contains,
+    allowed_kinds,
+    include_dbs?,
+    max_pages,
+    max_b_per_p,
+    now
+  )
+
+  # Run bounded map-reduce LLM calls strictly outside MoDB locks.
+  var trace = st0.trace
+  var subcall_notes = []
+  var subcalls_used = 0
+  if slices.size > 1 and max_subcalls > 0
+    chunks = Rlm.chunk_block_slices(slices, max_subcalls)
+    if chunks.size >= 2 or slices.size > 4
+      total_ch = chunks.size
+      for (i, ch) in chunks.enumerate
+        cidx = i + 1
+        (sub_sys, sub_usr) = build_rlm_subcall_prompts(q, cidx, total_ch, ch)
+        sub_res = try Http.send(build_llm_request(cfg, sub_sys, sub_usr), net).map_error(fn(e)
+          ServerFailed(reason: "RLM sub-agent LLM request failed: #{e.to_text}")
+        end)
+        if sub_res.status < 200 or sub_res.status >= 300
+          return Error(
+            ServerFailed(reason: "RLM sub-agent LLM returned HTTP #{sub_res.status}")
+          )
+        end
+        note = try extract_llm_text(cfg, sub_res.body)
+        subcalls_used += 1
+        subcall_notes = subcall_notes.append("Chunk #{cidx}/#{total_ch}:\n#{note}")
+        trace = trace.append(
+          RlmTraceStep(
+            step: trace.size + 1,
+            op: "sub_llm",
+            target: "subcall_#{cidx}",
+            detail: "Analyzed #{ch.size} sliced blocks in map chunk #{cidx}/#{total_ch}",
+            rows_scanned: 0,
+            ops_used: 0,
+            result_count: ch.size,
+            answer_hash: None
+          )
+        )
+      end
+    end
+  end
+
+  (syn_sys, syn_usr) = build_rlm_synthesis_prompts(q, subcall_notes, slices, db_slices)
+  syn_res = try Http.send(build_llm_request(cfg, syn_sys, syn_usr), net).map_error(fn(e)
+    ServerFailed(reason: "RLM synthesizer LLM request failed: #{e.to_text}")
+  end)
+  if syn_res.status < 200 or syn_res.status >= 300
+    return Error(ServerFailed(reason: "RLM synthesizer LLM returned HTTP #{syn_res.status}"))
+  end
+  answer = try extract_llm_text(cfg, syn_res.body)
+  trace = trace.append(
+    RlmTraceStep(
+      step: trace.size + 1,
+      op: "synthesize",
+      target: cfg.model,
+      detail: "Synthesized answer from #{slices.size} block slices and #{db_slices.size} DB slices",
+      rows_scanned: 0,
+      ops_used: 0,
+      result_count: slices.size + db_slices.size,
+      answer_hash: None
+    )
+  )
+
+  Ok(
+    DeepResearchOutcome(
+      tier: "tier1_read_program",
+      answer: answer,
+      model: cfg.model,
+      session_id: sess.id,
+      untrusted_tainted: st0.untrusted_tainted,
+      max_sensitivity_read: st0.max_sens,
+      untrusted_sources: st0.untrusted_sources,
+      rows_scanned: st0.rows_scanned,
+      ops_used: st0.ops_used,
+      subcalls_used: subcalls_used,
+      max_subcalls: max_subcalls,
+      citations: rlm_build_citations(slices),
+      db_slices: db_slices,
+      trace: trace
+    )
+  )
+end
+
+## Serializes `DeepResearchOutcome` into the canonical JSON API & MCP structuredContent shape.
+fn deep_research_outcome_to_json(out: DeepResearchOutcome) : Json
+  Json.Object({
+    "tier": Json.String(out.tier),
+    "answer": Json.String(out.answer),
+    "model": Json.String(out.model),
+    "session_id": Json.String(out.session_id),
+    "rows_scanned": Json.int(out.rows_scanned),
+    "ops_used": Json.int(out.ops_used),
+    "subcalls_used": Json.int(out.subcalls_used),
+    "max_subcalls": Json.int(out.max_subcalls),
+    "citations": Json.Array(out.citations),
+    "db_slices": out.db_slices.to_json,
+    "trace": out.trace.to_json,
+    "taint": Json.Object({
+      "session_id": Json.String(out.session_id),
+      "untrusted_tainted": Json.Boolean(out.untrusted_tainted),
+      "max_sensitivity_read": Json.String(out.max_sensitivity_read),
+      "untrusted_sources": out.untrusted_sources.to_json
+    })
+  })
+end
+
+## `POST /api/ai/deep-research` — Executes Tier 1 RLM Deep Research via sandboxed `Modb.Views.ReadProgram`
+## and returns synthesized findings, block/DB citations, inspectable trace, and `Modb.Taint` state.
+fn deep_research(
+  req: Api.Request,
+  auth: AuthContext,
+  input: DeepResearchInput,
+  files: Files,
+  clock: Clock,
+  env: Env,
+  net: Network
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  out = try execute_rlm_tier1(auth, input, files, clock, env, net)
+  Ok(json_ok(200, deep_research_outcome_to_json(out)))
 end

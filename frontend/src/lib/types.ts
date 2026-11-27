@@ -578,6 +578,51 @@ export interface AiCitation {
   block_id: string;
   title: string;
   excerpt: string;
+  kind_tag?: string;
+  heading_path?: string | null;
+}
+
+export interface RlmTraceStep {
+  step: number;
+  op: "read_program" | "sub_llm" | "synthesize" | string;
+  target: string;
+  detail: string;
+  rows_scanned: number;
+  ops_used: number;
+  result_count: number;
+  answer_hash: string | null;
+}
+
+export interface RlmDbSlice {
+  database_id: string;
+  database_title: string;
+  collection_id: string;
+  row_id: string;
+  page_id: string;
+  title: string;
+  cells_summary: string;
+}
+
+export interface RlmTaintSummary {
+  session_id: string;
+  untrusted_tainted: boolean;
+  max_sensitivity_read: string;
+  untrusted_sources: string[];
+}
+
+export interface DeepResearchResponse {
+  tier: string;
+  answer: string;
+  model: string;
+  session_id: string;
+  rows_scanned: number;
+  ops_used: number;
+  subcalls_used: number;
+  max_subcalls: number;
+  citations: AiCitation[];
+  db_slices: RlmDbSlice[];
+  trace: RlmTraceStep[];
+  taint: RlmTaintSummary;
 }
 
 export interface GardenStalePage {
