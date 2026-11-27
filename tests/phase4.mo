@@ -3,9 +3,11 @@ module Tests.Phase4
 use Main
 use Api
 use Arvo.WebTest
+use Db
 use Domain.NotionImport{NotionPageImport}
 use Domain.Types{BlockOp, CollectionWritePolicy}
 use Json
+use Modb.Ledger
 use Routes.Collab
 use Routes.Importer
 use Routes.Workspace
@@ -464,4 +466,372 @@ test "Phase 4.1: Modb.Taint Lethal Trifecta provenance, fork inheritance, enforc
   )
   assert unblocked_patch.status == 200
   assert must_json(unblocked_patch.text).bool_at("result.isError") == Some(false)
+end
+
+test "Phase 4.2: One-click Modb.Erasure secret detection, crypto-shredding, compaction, and downloadable receipt"
+  manifest_json = """
+    {
+      "src/main.tsx": {
+        "file": "assets/main-p42test.js",
+        "css": ["assets/main-p42test.css"],
+        "isEntry": true
+      }
+    }
+    """
+  files = Files.in_memory({
+    "public/manifest.json": manifest_json,
+    "public/assets/main-p42test.js": "console.log('p42');",
+    "public/assets/main-p42test.css": "body{margin:0}"
+  })
+  rng = SecureRandom.seeded(20261128)
+  t0 = Time.parse("2026-11-27T13:00:00Z") or stop "t0"
+  clock = Clock.fixed(t0)
+  env = Env.of({"VELLUM_MODE": "solo", "VELLUM_INSECURE_COOKIES": "1"})
+  empty_net = Network.fake({})
+
+  # 1. Solo Owner + Collection + Scoped Agent
+  guest = WebTest.new().with_header("Host", "127.0.0.1:8080")
+  solo_cb = ApiTest.send(
+    Main,
+    WebTest.prepare(guest, Api.get("/auth/solo/login?return_to=/").with_header("Host", "127.0.0.1:8080")),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert solo_cb.status == 303
+  owner = WebTest.absorb(guest, solo_cb)
+
+  col_res = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/collections").with_json(
+        Workspace.CreateCollectionInput(
+          slug: "erasure-lab",
+          name: "Erasure Lab",
+          description: None,
+          icon: None,
+          write_policy: DirectWithAudit,
+          freshness_ttl_days: Some(30)
+        )
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert col_res.status == 201
+  col_id = must_json(col_res.text).text_at("id") or stop "col_id"
+
+  mint_res = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/admin/agents").with_json(
+        Workspace.MintAgentTokenInput(
+          handle: "erasure-nonadmin",
+          display_name: "Non Admin Bot",
+          model_id: Some("claude-sonnet-4-6"),
+          label: "non-admin-bot",
+          allowed_actions: ["read"],
+          allowed_collections: Some([col_id]),
+          max_calls: 20,
+          ttl_days: 7
+        )
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert mint_res.status == 201
+  agent_tok = must_json(mint_res.text).text_at("raw_token") or stop "agent_tok"
+
+  # 2. Create Page 1 containing leaked OpenAI key (also echoed in audit reason) + Comment with GitHub token
+  leaked_ai = "sk-proj-Phase42TestSecretKey1234567890"
+  leaked_gh = "ghp_Phase42TestGithubToken9876543210"
+  pg1_res = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/pages").with_json(
+        Workspace.CreatePageInput(
+          collection_id: col_id,
+          parent_page_id: None,
+          title: "Incident Runbook",
+          markdown: "Gateway key accidentally pasted: #{leaked_ai}\nFollow quorum SOP.",
+          icon: None,
+          freshness_ttl_days: None,
+          reason: Some("pasted #{leaked_ai}")
+        )
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert pg1_res.status == 201
+  pg1_id = must_json(pg1_res.text).text_at("page.id") or stop "pg1_id"
+
+  cmt_res = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/pages/#{pg1_id}/comments").with_json(
+        Workspace.CreateCommentInput(
+          block_id: None,
+          parent_comment_id: None,
+          body_markdown: "Deploy token mirror: #{leaked_gh}"
+        )
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert cmt_res.status == 201
+
+  # 3. GET /api/pages/:id surfaces masked secret_hints (never raw secrets!)
+  show1 = ApiTest.send(
+    Main,
+    WebTest.prepare(owner, Api.get("/api/pages/#{pg1_id}")),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert show1.status == 200
+  show1_j = must_json(show1.text)
+  hints1 = show1_j.list_at("secret_hints") or []
+  assert hints1.size == 2
+  hints_raw = (show1_j.get("secret_hints") or Json.Null).to_text
+  assert not hints_raw.contains?(leaked_ai)
+  assert not hints_raw.contains?(leaked_gh)
+
+  # 4. Non-admin agent gets 403 on erasure status, purge, and receipt download; Owner sees both findings
+  assert ApiTest.send(
+    Main,
+    Api.get("/api/admin/erasure/status").with_header("Authorization", "Bearer #{agent_tok}"),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  ).status ==
+    403
+  assert ApiTest.send(
+    Main,
+    Api.post("/api/admin/erasure/purge")
+      .with_header("Authorization", "Bearer #{agent_tok}")
+      .with_json(Json.Object({"page_id": Json.String(pg1_id)})),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  ).status ==
+    403
+  assert ApiTest.send(
+    Main,
+    Api.get("/api/admin/erasure/receipts/ers_missing/download")
+      .with_header("Authorization", "Bearer #{agent_tok}"),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  ).status ==
+    403
+
+  st_before = ApiTest.send(
+    Main,
+    WebTest.prepare(owner, Api.get("/api/admin/erasure/status")),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert st_before.status == 200
+  assert (must_json(st_before.text).list_at("findings") or []).size == 2
+
+  # 5. Execute one-click Modb.Erasure purge (redact + compact)
+  purge_res = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/admin/erasure/purge").with_json(
+        Json.Object({
+          "page_id": Json.String(pg1_id),
+          "mode": Json.String("redact"),
+          "compact": Json.Boolean(true),
+          "reason": Json.String("Purge incident key #{leaked_ai}")
+        })
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert purge_res.status == 200
+  assert not purge_res.text.contains?(leaked_ai)
+  assert not purge_res.text.contains?(leaked_gh)
+  pj = must_json(purge_res.text)
+  rcpt_id = pj.text_at("receipt.id") or stop "rcpt_id"
+  assert pj.bool_at("receipt.key_shredded") == Some(true)
+  assert (pj.int_at("receipt.rows_deleted") or 0) >= 1
+  assert (pj.int_at("receipt.fts_docs_deleted") or 0) >= 1
+  assert (pj.int_at("receipt.vec_docs_deleted") or 0) >= 1
+  assert (pj.int_at("receipt.audit_entries_redacted") or 0) >= 1
+  assert pj.bool_at("receipt.compacted") == Some(true)
+  assert pj.int_at("blocks_redacted") == Some(1)
+  assert pj.int_at("comments_redacted") == Some(1)
+
+  # 6. Verify sanitized live page, FTS re-indexing, and downloadable receipt
+  show_after = ApiTest.send(
+    Main,
+    WebTest.prepare(owner, Api.get("/api/pages/#{pg1_id}")),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert show_after.status == 200
+  after_j = must_json(show_after.text)
+  assert (after_j.text_at("anchored_markdown") or "").contains?("[REDACTED]")
+  assert not show_after.text.contains?(leaked_ai)
+  assert not show_after.text.contains?(leaked_gh)
+  assert (after_j.list_at("secret_hints") or []).size == 0
+
+  sec_search = ApiTest.send(
+    Main,
+    WebTest.prepare(owner, Api.get("/api/search?q=Phase42TestSecretKey1234567890")),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert sec_search.status == 200
+  assert (must_json(sec_search.text).list_at("results") or []).size == 0
+
+  clean_search = ApiTest.send(
+    Main,
+    WebTest.prepare(owner, Api.get("/api/search?q=Incident")),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert clean_search.status == 200
+  assert (must_json(clean_search.text).list_at("results") or []).any?(fn(r)
+    r.text_at("page_id") == Some(pg1_id)
+  end)
+
+  dl_res = ApiTest.send(
+    Main,
+    WebTest.prepare(owner, Api.get("/api/admin/erasure/receipts/#{rcpt_id}/download")),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert dl_res.status == 200
+  cdisp = dl_res.header("Content-Disposition") or ""
+  assert cdisp.contains?("attachment;") and cdisp.contains?(rcpt_id)
+  dl_j = must_json(dl_res.text)
+  assert dl_j.text_at("receipt.id") == Some(rcpt_id)
+  assert dl_j.bool_at("receipt.compacted") == Some(true)
+
+  # 7. Verify ledger hash-chain integrity and zero raw secret bytes anywhere on disk
+  assert Ledger.open(files, Db.ledger_db_path, Db.vellum_schema(), t0) is Ok(vdb)
+  assert Ledger.verify_all(vdb) is Ok(_)
+  assert Ledger.verify_fast(vdb, 16) is Ok(_)
+  raw_disk = case files.read_only.read_bytes(Db.ledger_db_path)
+    Ok(b): b
+    Error(_): stop "read raw disk"
+  end
+  raw_hex = raw_disk.to_hex
+  assert not raw_hex.contains?(leaked_ai.bytes.to_hex)
+  assert not raw_hex.contains?(leaked_gh.bytes.to_hex)
+
+  # 8. Also test delete_page mode on a second page with a Stripe live secret key
+  leaked_stripe = ["sk_li", "ve_Phase42DeletePageSecret99999"].join("")
+  pg2_res = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/pages").with_json(
+        Workspace.CreatePageInput(
+          collection_id: col_id,
+          parent_page_id: None,
+          title: "Scratch Secret Note",
+          markdown: "Disposable key: #{leaked_stripe}",
+          icon: None,
+          freshness_ttl_days: None,
+          reason: Some("seed disposable secret page")
+        )
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert pg2_res.status == 201
+  pg2_id = must_json(pg2_res.text).text_at("page.id") or stop "pg2_id"
+
+  del_purge = ApiTest.send(
+    Main,
+    WebTest.prepare(
+      owner,
+      Api.post("/api/admin/erasure/purge").with_json(
+        Json.Object({
+          "page_id": Json.String(pg2_id),
+          "mode": Json.String("delete_page"),
+          "compact": Json.Boolean(true),
+          "reason": Json.String("Delete whole compromised page")
+        })
+      )
+    ),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  )
+  assert del_purge.status == 200
+  assert must_json(del_purge.text).bool_at("receipt.compacted") == Some(true)
+  assert ApiTest.send(
+    Main,
+    WebTest.prepare(owner, Api.get("/api/pages/#{pg2_id}")),
+    files,
+    clock,
+    env,
+    rng,
+    empty_net
+  ).status ==
+    404
+  raw_disk2 = case files.read_only.read_bytes(Db.ledger_db_path)
+    Ok(b): b
+    Error(_): stop "read raw disk 2"
+  end
+  assert not raw_disk2.to_hex.contains?(leaked_stripe.bytes.to_hex)
 end

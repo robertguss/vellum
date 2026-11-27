@@ -39,7 +39,10 @@ sync_page_markdown,
 resolve_metrics,
 show_block_context,
 validate_meta_relations_tx,
-drain_jobs
+drain_jobs,
+erasure_status,
+purge_secret,
+download_erasure_receipt
 use Api
 use Arvo.Flash
 use Arvo.Id
@@ -50,6 +53,7 @@ use Arvo.S3
 use Arvo.Webhooks
 use Crypto
 use Db
+use ErasureOps
 use Domain.Blocks
 use Domain.Blueprints{BlueprintDef, PageBlueprintMeta}
 use Domain.Collab{WebhookJobPayload}
@@ -1391,9 +1395,11 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
         "blocks": Json.Object(block_taints),
         "untrusted_block_ids": untrusted_block_ids.to_json
       })
+      cmt_list = cmt_rows.map(fn(x) x.1 end)
+      secret_hints = ErasureOps.scan_page_secret_hints(store, page, blks, cmt_list)
 
       Ok((
-        (c_list, d_list, col, page, blks, cmt_rows.map(fn(x) x.1 end), att_rows.map(fn(x) x.1 end)),
+        (c_list, d_list, col, page, blks, cmt_list, att_rows.map(fn(x) x.1 end)),
         (
           bps,
           page_bp_opt,
@@ -1405,7 +1411,7 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
           explicit_backlinks,
           semantic_backlinks
         ),
-        (principals_json, rel_targets_json, metrics_json, taint_provenance_json)
+        (principals_json, rel_targets_json, metrics_json, taint_provenance_json, secret_hints)
       ))
     end
   )
@@ -1423,7 +1429,7 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
       explicit_backlinks,
       semantic_backlinks
     ),
-    (principals_json, rel_targets_json, resolved_metrics_json, taint_provenance_json)
+    (principals_json, rel_targets_json, resolved_metrics_json, taint_provenance_json, secret_hints)
   ) = page_bundle
   anchored_md = Blocks.to_anchored_markdown(blocks)
   yaml_fm = Blueprints.to_yaml_frontmatter(page, page_bp_opt, page_meta_opt, anchored_md)
@@ -1451,7 +1457,8 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
           "citation_drifts": citation_drifts.to_json,
           "explicit_backlinks": explicit_backlinks.to_json,
           "semantic_backlinks": semantic_backlinks.to_json,
-          "taint_provenance": taint_provenance_json
+          "taint_provenance": taint_provenance_json,
+          "secret_hints": Json.Array(secret_hints)
         })
       )
     )
@@ -1485,7 +1492,8 @@ fn show_page(req: Api.Request, id: Text, auth: Option(AuthContext), rf: ReadFile
       "citation_drifts": citation_drifts.to_json,
       "explicit_backlinks": explicit_backlinks.to_json,
       "semantic_backlinks": semantic_backlinks.to_json,
-      "taint_provenance": taint_provenance_json
+      "taint_provenance": taint_provenance_json,
+      "secret_hints": Json.Array(secret_hints)
     }
   )
 end
@@ -3603,4 +3611,180 @@ fn show_block_context(_req: Api.Request, block_id: Text, auth: AuthContext, rf: 
     end
   )
   Ok(json_ok(200, payload))
+end
+
+## `GET /api/admin/erasure/status` — Lists scanned secret exposure hints and verifiable `Modb.Erasure` receipts.
+fn erasure_status(auth: AuthContext, rf: ReadFiles) : Result(Api.Response, AppError)
+  role_ok = auth.principal.role == Owner or auth.principal.role == Admin
+  if not role_ok
+    return Error(Forbidden(reason: "only Owner/Admin may inspect Modb.Erasure status"))
+  end
+  if not rf.exists?(Db.ledger_db_path)
+    return Ok(json_ok(200, Json.Object({"findings": Json.Array([]), "receipts": Json.Array([])})))
+  end
+  payload = try Ledger.read_locked(
+    rf,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      findings = try ErasureOps.scan_workspace_secrets(store)
+      receipts = try ErasureOps.list_erasure_receipts_json(store)
+      Ok(Json.Object({"findings": Json.Array(findings), "receipts": Json.Array(receipts)}))
+    end
+  )
+  Ok(json_ok(200, payload))
+end
+
+fn opt_trimmed_text(j: Json, key: Text) : Option(Text)
+  case j.text_at(key)
+    Some(s) if not s.trim.empty?: Some(s.trim)
+    Some(_) | None: None
+  end
+end
+
+## `POST /api/admin/erasure/purge` — One-click Owner/Admin `Modb.Erasure` crypto-shredding,
+## live sanitization/deletion, audit/replay scrubbing, FTS/Vec purge, and optional compaction.
+fn purge_secret(
+  req: Api.Request,
+  auth: AuthContext,
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  role_ok = auth.principal.role == Owner or auth.principal.role == Admin
+  if not role_ok or not Policy.action_permitted?(auth, "manage_grants")
+    return Error(Forbidden(reason: "only Owner/Admin may execute Modb.Erasure secret purges"))
+  end
+
+  raw_json = if req.body.empty?
+    Json.Object({})
+  else
+    case Json.parse(req.text or "")
+      Ok(j): j
+      Error(_): return Error(BadInput(reason: "invalid JSON body"))
+    end
+  end
+  case raw_json
+    Json.Object(_): Unit
+    Json.Null | Json.Boolean(_) | Json.Number(_) | Json.String(_) | Json.Array(_): return Error(
+      BadInput(reason: "expected JSON object")
+    )
+  end
+
+  target_page_id = opt_trimmed_text(raw_json, "page_id")
+  target_block_id = opt_trimmed_text(raw_json, "block_id")
+  target_comment_id = opt_trimmed_text(raw_json, "comment_id")
+  mode = raw_json.text_at("mode") or "redact"
+  compact? = raw_json.bool_at("compact") or true
+  reason = raw_json.text_at("reason") or ""
+
+  var extra_tokens = []
+  case raw_json.list_at("match_tokens")
+    Some(xs):
+      for item in xs
+        case item
+          Json.String(s) if not s.trim.empty?: extra_tokens = extra_tokens.append(s.trim)
+          Json.String(_) | Json.Null | Json.Boolean(_) | Json.Number(_) | Json.Array(_) | Json
+            .Object(_): Unit
+        end
+      end
+    None: Unit
+  end
+
+  now = clock.now
+  receipt_id = "ers_#{Id.ulid(rng, clock)}"
+  subject_id = case opt_trimmed_text(raw_json, "subject_id")
+    Some(s): s
+    None:
+      case target_page_id
+        Some(pid): "secret:#{pid}:#{receipt_id}"
+        None: "secret:#{receipt_id}"
+      end
+  end
+
+  (receipt, blocks_redacted, comments_redacted, affected_page_ids) = try ErasureOps.execute_secret_purge_locked(
+    files,
+    rng,
+    receipt_id,
+    subject_id,
+    target_page_id,
+    target_block_id,
+    target_comment_id,
+    mode,
+    extra_tokens,
+    compact?,
+    auth.principal.handle,
+    true,
+    reason,
+    now
+  )
+
+  var resp = json_ok(
+    200,
+    Json.Object({
+      "receipt": ErasureOps.erasure_receipt_to_json(receipt),
+      "blocks_redacted": Json.int(blocks_redacted),
+      "comments_redacted": Json.int(comments_redacted),
+      "affected_page_ids": affected_page_ids.to_json
+    })
+  )
+  if mode.trim.ascii_lowercase == "redact"
+    for pid in affected_page_ids
+      ev = Json.Object({
+        "page_id": Json.String(pid),
+        "actor": Json.String(auth.principal.handle),
+        "reason": Json.String("redacted via Modb.Erasure #{receipt.id}")
+      })
+      resp = resp.with_sse_publish_json("page:#{pid}", "page.blocks_updated", ev)
+    end
+  end
+  Ok(resp)
+end
+
+## `GET /api/admin/erasure/receipts/:id/download` — Downloads a verifiable `Modb.Erasure.ErasureReceipt` JSON file.
+fn download_erasure_receipt(id: Text, auth: AuthContext, rf: ReadFiles) : Result(
+  Api.Response,
+  AppError
+)
+  role_ok = auth.principal.role == Owner or auth.principal.role == Admin
+  if not role_ok
+    return Error(Forbidden(reason: "only Owner/Admin may download Modb.Erasure receipts"))
+  end
+  if not rf.exists?(Db.ledger_db_path)
+    return Error(Missing(entity: "erasure_receipt", id: id))
+  end
+  rcpt_json = try Ledger.read_locked(
+    rf,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      case try ErasureOps.get_erasure_receipt_json(Ledger.store(db), id)
+        Some(rj): Ok(rj)
+        None: Error(Missing(entity: "erasure_receipt", id: id))
+      end
+    end
+  )
+  safe_id = sanitize_filename_segment(id)
+  body = Json.Object({
+    "receipt": rcpt_json,
+    "verification_note": Json.String(
+      "Generated by Modb.Erasure dual-layer verification; raw secrets and PII are omitted (SHA-256 subject binding only)."
+    )
+  })
+  Ok(
+    Api.response(
+      200,
+      [
+        ("Content-Type", "application/json; charset=utf-8"),
+        ("Content-Disposition", "attachment; filename=\"vellum-erasure-receipt-#{safe_id}.json\""),
+        ("Cache-Control", "no-store"),
+        ("X-Content-Type-Options", "nosniff")
+      ],
+      body.to_text.bytes
+    )
+  )
 end

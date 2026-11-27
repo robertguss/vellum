@@ -2,6 +2,8 @@ import { Link } from "@inertiajs/react";
 import {
   AlertTriangle,
   Bot,
+  Download,
+  Flame,
   GitCompare,
   GitPullRequest,
   History,
@@ -23,7 +25,9 @@ import type {
   ClaimRecord,
   Collection,
   DatabaseDef,
+  ErasureStatusResponse,
   GardenReport,
+  PurgeSecretResponse,
   ReplayProposalSummary,
   ReplayStatusResponse,
   TaintStatusResponse,
@@ -44,7 +48,7 @@ export default function AdminConsole({
   webhooks: initialWebhooks = [],
 }: AdminProps) {
   const [tab, setTab] = useState<
-    "agents" | "garden" | "importer" | "replay" | "taint" | "webhooks"
+    "agents" | "garden" | "importer" | "replay" | "taint" | "erasure" | "webhooks"
   >("agents");
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -94,6 +98,15 @@ export default function AdminConsole({
     "Admin reviewed untrusted provenance and approved taint reset"
   );
 
+  // One-Click Modb.Erasure Secret Purge
+  const [erasureStatus, setErasureStatus] = useState<ErasureStatusResponse | null>(null);
+  const [erasureLoading, setErasureLoading] = useState(false);
+  const [purgingKey, setPurgingKey] = useState<string | null>(null);
+  const [customSubjectId, setCustomSubjectId] = useState("");
+  const [customTokens, setCustomTokens] = useState("");
+  const [customReason, setCustomReason] = useState("Incident response secret crypto-purge");
+  const [purgeCompact, setPurgeCompact] = useState(true);
+
   // Webhooks
   const [webhooks, setWebhooks] = useState<WebhookSubPublic[]>(initialWebhooks);
   const [whUrl, setWhUrl] = useState("");
@@ -109,8 +122,60 @@ export default function AdminConsole({
       void loadReplayStatus();
     } else if (tab === "taint") {
       void loadTaintStatus();
+    } else if (tab === "erasure") {
+      void loadErasureStatus();
     }
   }, [tab]);
+
+  async function loadErasureStatus() {
+    setErasureLoading(true);
+    try {
+      const st = await apiFetch<ErasureStatusResponse>("/api/admin/erasure/status");
+      setErasureStatus(st);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not load Modb.Erasure status");
+    } finally {
+      setErasureLoading(false);
+    }
+  }
+
+  async function handlePurgeSecret(opts: {
+    key: string;
+    page_id?: string | null;
+    block_id?: string | null;
+    comment_id?: string | null;
+    mode: "redact" | "delete_page";
+    subject_id?: string;
+    match_tokens?: string[];
+    reason?: string;
+  }) {
+    setPurgingKey(opts.key);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await apiFetch<PurgeSecretResponse>("/api/admin/erasure/purge", {
+        method: "POST",
+        body: JSON.stringify({
+          page_id: opts.page_id ?? null,
+          block_id: opts.block_id ?? null,
+          comment_id: opts.comment_id ?? null,
+          mode: opts.mode,
+          subject_id: opts.subject_id ?? null,
+          match_tokens: opts.match_tokens ?? [],
+          compact: purgeCompact,
+          reason: opts.reason ?? customReason,
+        }),
+      });
+      setNotice(
+        `Modb.Erasure receipt ${res.receipt.id} completed (${res.blocks_redacted} blocks, ${res.receipt.audit_entries_redacted} audit entries scrubbed, compacted=${res.receipt.compacted}).`
+      );
+      await loadErasureStatus();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Modb.Erasure purge failed");
+    } finally {
+      setPurgingKey(null);
+    }
+  }
 
   async function loadTaintStatus() {
     setTaintLoading(true);
@@ -469,6 +534,7 @@ export default function AdminConsole({
                 ["importer", "Notion Importer", Upload],
                 ["replay", "Selective Undo", RotateCcw],
                 ["taint", "Taint & Safety", ShieldAlert],
+                ["erasure", "Secret Purge", Flame],
                 ["webhooks", "Webhooks", Webhook],
               ] as const
             ).map(([key, label, Icon]) => (
@@ -1544,6 +1610,285 @@ export default function AdminConsole({
                     {taintStatus.untrusted.blocks.length}) · Proposals (
                     {taintStatus.untrusted.proposals.length})
                   </div>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* TAB 7: ONE-CLICK MODB.ERASURE SECRET PURGE */}
+        {tab === "erasure" && (
+          <div className="space-y-6">
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-stone-200 bg-white p-5">
+              <div>
+                <div className="flex items-center gap-2 text-sm font-semibold text-stone-900">
+                  <Flame className="h-4 w-4 text-rose-700" />
+                  One-Click Modb.Erasure Secret Crypto-Purge
+                </div>
+                <p className="text-xs text-stone-500 mt-0.5">
+                  Shreds AES-256-GCM subject keys, sanitizes blocks/comments/FTS/Vec, scrubs{" "}
+                  <code className="font-mono">_modb_replay_calls</code> &amp; re-chains{" "}
+                  <code className="font-mono">_modb_audit</code>, evicts dead B+Tree pages via{" "}
+                  <code className="font-mono">compact_after_erasure</code>, and issues downloadable{" "}
+                  <code className="font-mono">ErasureReceipt</code> proofs.
+                </p>
+              </div>
+              <div className="flex items-center gap-3">
+                <label className="inline-flex items-center gap-1.5 text-xs text-stone-700">
+                  <input
+                    type="checkbox"
+                    checked={purgeCompact}
+                    onChange={(e) => setPurgeCompact(e.target.checked)}
+                    className="rounded border-stone-300"
+                  />
+                  Physical B+Tree Compaction
+                </label>
+                <button
+                  type="button"
+                  onClick={() => void loadErasureStatus()}
+                  disabled={erasureLoading}
+                  className="rounded-lg border border-stone-200 px-3 py-1.5 text-xs font-medium text-stone-700 hover:bg-stone-50 disabled:opacity-50"
+                >
+                  {erasureLoading ? "Scanning..." : "Scan Workspace"}
+                </button>
+              </div>
+            </div>
+
+            {erasureStatus && (
+              <>
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                  <div className="rounded-2xl border border-rose-200 bg-rose-50/50 p-4">
+                    <div className="text-[11px] uppercase tracking-wider text-rose-800">
+                      Detected Secrets
+                    </div>
+                    <div className="mt-1 text-2xl font-semibold text-rose-950">
+                      {erasureStatus.findings.length}
+                    </div>
+                  </div>
+                  <div className="rounded-2xl border border-stone-200 bg-white p-4">
+                    <div className="text-[11px] uppercase tracking-wider text-stone-500">
+                      Erasure Receipts
+                    </div>
+                    <div className="mt-1 text-2xl font-semibold text-stone-950">
+                      {erasureStatus.receipts.length}
+                    </div>
+                  </div>
+                  <div className="rounded-2xl border border-stone-200 bg-white p-4">
+                    <div className="text-[11px] uppercase tracking-wider text-stone-500">
+                      Audit &amp; Replay Scrubbed
+                    </div>
+                    <div className="mt-1 text-2xl font-semibold text-stone-950">
+                      {erasureStatus.receipts.reduce(
+                        (acc, r) => acc + r.audit_entries_redacted + r.replay_calls_scrubbed,
+                        0
+                      )}
+                    </div>
+                  </div>
+                  <div className="rounded-2xl border border-emerald-200 bg-emerald-50/40 p-4">
+                    <div className="text-[11px] uppercase tracking-wider text-emerald-800">
+                      Compacted Receipts
+                    </div>
+                    <div className="mt-1 text-2xl font-semibold text-emerald-950">
+                      {erasureStatus.receipts.filter((r) => r.compacted).length}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-stone-200 bg-white p-5 space-y-3">
+                  <div className="text-sm font-semibold text-stone-900">
+                    Detected Secrets Across Active Pages &amp; Comments (
+                    {erasureStatus.findings.length})
+                  </div>
+                  {erasureStatus.findings.length === 0 ? (
+                    <p className="text-xs text-stone-400">
+                      Clean scan: no exposed API keys, GitHub/Slack/AWS tokens, webhook secrets,
+                      agent tokens, or PEM keys detected.
+                    </p>
+                  ) : (
+                    <div className="divide-y divide-stone-100">
+                      {erasureStatus.findings.map((f, idx) => {
+                        const rowKey = `${f.page_id}-${f.match_sha256}-${idx}`;
+                        return (
+                          <div
+                            key={rowKey}
+                            className="py-3 flex flex-wrap items-center justify-between gap-3 text-xs"
+                          >
+                            <div className="space-y-1 min-w-0">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-semibold uppercase text-rose-800">
+                                  {f.severity}
+                                </span>
+                                <span className="font-semibold text-stone-900">{f.label}</span>
+                                <span className="rounded bg-stone-100 px-2 py-0.5 font-mono text-[11px] text-stone-800">
+                                  {f.masked_preview}
+                                </span>
+                              </div>
+                              <div className="text-stone-500">
+                                Page:{" "}
+                                <Link
+                                  href={`/p/${f.page_id}`}
+                                  className="text-blue-700 hover:underline font-medium"
+                                >
+                                  {f.page_title}
+                                </Link>{" "}
+                                · {f.target_kind}
+                                {f.block_id ? ` (${f.block_id})` : ""}
+                                {f.comment_id ? ` (${f.comment_id})` : ""}
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-2 shrink-0">
+                              <button
+                                type="button"
+                                disabled={purgingKey === `${rowKey}-redact`}
+                                onClick={() =>
+                                  void handlePurgeSecret({
+                                    key: `${rowKey}-redact`,
+                                    page_id: f.page_id,
+                                    block_id: f.block_id,
+                                    comment_id: f.comment_id,
+                                    mode: "redact",
+                                  })
+                                }
+                                className="rounded-lg bg-rose-700 px-3 py-1.5 font-medium text-white hover:bg-rose-800 disabled:opacity-50"
+                              >
+                                {purgingKey === `${rowKey}-redact`
+                                  ? "Purging..."
+                                  : "Purge & Redact"}
+                              </button>
+                              <button
+                                type="button"
+                                disabled={purgingKey === `${rowKey}-delete`}
+                                onClick={() =>
+                                  void handlePurgeSecret({
+                                    key: `${rowKey}-delete`,
+                                    page_id: f.page_id,
+                                    mode: "delete_page",
+                                  })
+                                }
+                                className="rounded-lg border border-rose-300 bg-white px-2.5 py-1.5 font-medium text-rose-800 hover:bg-rose-50 disabled:opacity-50"
+                              >
+                                Purge Page
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    const toks = customTokens
+                      .split(/\n|,/)
+                      .map((s) => s.trim())
+                      .filter(Boolean);
+                    if (toks.length === 0) return;
+                    void handlePurgeSecret({
+                      key: "custom-purge",
+                      mode: "redact",
+                      subject_id: customSubjectId.trim() || undefined,
+                      match_tokens: toks,
+                      reason: customReason,
+                    });
+                  }}
+                  className="rounded-2xl border border-stone-200 bg-white p-5 space-y-3 text-xs"
+                >
+                  <div className="text-sm font-semibold text-stone-900">
+                    Custom Token / Subject Crypto-Purge
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div>
+                      <label className="font-medium text-stone-700">
+                        Subject ID (optional)
+                      </label>
+                      <input
+                        value={customSubjectId}
+                        onChange={(e) => setCustomSubjectId(e.target.value)}
+                        placeholder="e.g. customer:acme or leaked-key-2026"
+                        className="mt-1 w-full rounded-lg border border-stone-200 px-3 py-2 font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label className="font-medium text-stone-700">Audit Reason</label>
+                      <input
+                        value={customReason}
+                        onChange={(e) => setCustomReason(e.target.value)}
+                        className="mt-1 w-full rounded-lg border border-stone-200 px-3 py-2"
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="font-medium text-stone-700">
+                      Exact Token(s) / PII Strings to Scrub (comma or newline separated)
+                    </label>
+                    <textarea
+                      rows={2}
+                      value={customTokens}
+                      onChange={(e) => setCustomTokens(e.target.value)}
+                      placeholder="Paste exact sensitive string to scrub from blocks, comments, FTS, Vec, Replay, and Audit"
+                      className="mt-1 w-full rounded-lg border border-stone-200 p-2 font-mono"
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={purgingKey === "custom-purge" || !customTokens.trim()}
+                    className="rounded-lg bg-stone-900 px-4 py-2 font-medium text-white disabled:opacity-50"
+                  >
+                    {purgingKey === "custom-purge"
+                      ? "Executing Purge..."
+                      : "Execute Modb.Erasure Purge"}
+                  </button>
+                </form>
+
+                <div className="rounded-2xl border border-stone-200 bg-white p-5 space-y-3">
+                  <div className="text-sm font-semibold text-stone-900">
+                    Verifiable Erasure Receipts ({erasureStatus.receipts.length})
+                  </div>
+                  {erasureStatus.receipts.length === 0 ? (
+                    <p className="text-xs text-stone-400">
+                      No Modb.Erasure receipts issued yet.
+                    </p>
+                  ) : (
+                    <div className="space-y-2.5">
+                      {erasureStatus.receipts.map((r) => (
+                        <div
+                          key={r.id}
+                          className="rounded-xl border border-stone-200 bg-stone-50 p-3.5 text-xs space-y-1.5"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex flex-wrap items-center gap-2 font-mono">
+                              <span className="font-semibold text-stone-900">{r.id}</span>
+                              <span className="text-stone-500">by {r.erased_by}</span>
+                              <span className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-800">
+                                key_shredded={String(r.key_shredded)}
+                              </span>
+                              <span className="rounded bg-stone-200 px-1.5 py-0.5 text-[10px] font-semibold text-stone-800">
+                                compacted={String(r.compacted)}
+                              </span>
+                            </div>
+                            <a
+                              href={`/api/admin/erasure/receipts/${encodeURIComponent(r.id)}/download`}
+                              className="inline-flex items-center gap-1 rounded-lg border border-stone-300 bg-white px-2.5 py-1 font-medium text-stone-800 hover:bg-stone-100"
+                            >
+                              <Download className="h-3 w-3" />
+                              Download Receipt
+                            </a>
+                          </div>
+                          <div className="text-stone-600">
+                            rows={r.rows_deleted} · fts={r.fts_docs_deleted} · vec=
+                            {r.vec_docs_deleted} · audit={r.audit_entries_redacted} · replay=
+                            {r.replay_calls_scrubbed}
+                          </div>
+                          <div className="font-mono text-[10px] text-stone-400 truncate">
+                            subj_sha256={r.subject_id_sha256} · tip: {r.pre_erasure_tip_hash.slice(0, 12)} →{" "}
+                            {r.post_erasure_tip_hash.slice(0, 12)}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </>
             )}

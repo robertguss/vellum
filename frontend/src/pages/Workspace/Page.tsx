@@ -3,8 +3,10 @@ import {
   ArrowUpRight,
   CheckCircle2,
   Clock,
+  Download,
   Eye,
   FileText,
+  Flame,
   GitBranch,
   GitPullRequest,
   Link2,
@@ -43,8 +45,10 @@ import type {
   PageTaintProvenance,
   PrincipalSummary,
   ProposalMeta,
+  PurgeSecretResponse,
   RelationTargetOption,
   ResolvedMetric,
+  SecretHint,
   SemanticBacklink,
 } from "../../lib/types";
 
@@ -71,6 +75,7 @@ interface PageProps {
   explicit_backlinks?: ExplicitBacklink[];
   semantic_backlinks?: SemanticBacklink[];
   taint_provenance?: PageTaintProvenance | null;
+  secret_hints?: SecretHint[];
 }
 
 async function sha256Hex(file: File): Promise<string> {
@@ -122,6 +127,7 @@ export default function PageView({
   explicit_backlinks = [],
   semantic_backlinks = [],
   taint_provenance = null,
+  secret_hints = [],
 }: PageProps) {
   const [page, setPage] = useState<Page>(initialPage);
   const [stagingDriftId, setStagingDriftId] = useState<string | null>(null);
@@ -152,6 +158,8 @@ export default function PageView({
   const [commentBody, setCommentBody] = useState("");
   const [commentSaving, setCommentSaving] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [purgingSecrets, setPurgingSecrets] = useState(false);
+  const [purgeReceipt, setPurgeReceipt] = useState<PurgeSecretResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -583,6 +591,105 @@ export default function PageView({
               </Link>
             </div>
           )}
+
+        {/* Modb.Erasure Secret Exposure Warning & One-Click Purge */}
+        {(secret_hints.length > 0 || purgeReceipt) && (
+          <div className="rounded-xl border border-rose-300 bg-rose-50 px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs text-rose-950">
+            <div className="flex items-start gap-2.5">
+              <Flame className="h-4 w-4 text-rose-700 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                {secret_hints.length > 0 ? (
+                  <>
+                    <div className="font-semibold">
+                      Detected {secret_hints.length} Exposed Secret(s) in This Page
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {secret_hints.map((h, i) => (
+                        <span
+                          key={`${h.match_sha256}-${i}`}
+                          className="rounded bg-white border border-rose-200 px-2 py-0.5 font-mono text-[11px] text-rose-900"
+                        >
+                          {h.label}: {h.masked_preview}
+                        </span>
+                      ))}
+                    </div>
+                  </>
+                ) : (
+                  purgeReceipt && (
+                    <div className="font-semibold text-emerald-900">
+                      Purged secrets via Modb.Erasure receipt{" "}
+                      <code className="font-mono">{purgeReceipt.receipt.id}</code> (
+                      {purgeReceipt.blocks_redacted} blocks redacted, compacted:{" "}
+                      {String(purgeReceipt.receipt.compacted)})
+                    </div>
+                  )
+                )}
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              {secret_hints.length > 0 && (
+                <button
+                  type="button"
+                  disabled={purgingSecrets}
+                  onClick={async () => {
+                    setPurgingSecrets(true);
+                    setError(null);
+                    try {
+                      const res = await apiFetch<PurgeSecretResponse>("/api/admin/erasure/purge", {
+                        method: "POST",
+                        body: JSON.stringify({
+                          page_id: page.id,
+                          mode: "redact",
+                          compact: true,
+                          reason: `One-click secret purge from page ${page.id}`,
+                        }),
+                      });
+                      setPurgeReceipt(res);
+                      router.reload({
+                        only: [
+                          "page",
+                          "blocks",
+                          "anchored_markdown",
+                          "yaml_frontmatter",
+                          "comments",
+                          "page_audit",
+                          "secret_hints",
+                        ],
+                      });
+                    } catch (err) {
+                      setError(
+                        err instanceof ApiError
+                          ? err.message
+                          : "Only Owner/Admin can purge secrets"
+                      );
+                    } finally {
+                      setPurgingSecrets(false);
+                    }
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-rose-700 px-3 py-1.5 font-medium text-white hover:bg-rose-800 disabled:opacity-50"
+                >
+                  <Flame className="h-3.5 w-3.5" />
+                  {purgingSecrets ? "Purging..." : "Purge Secrets Now"}
+                </button>
+              )}
+              {purgeReceipt && (
+                <a
+                  href={`/api/admin/erasure/receipts/${encodeURIComponent(purgeReceipt.receipt.id)}/download`}
+                  className="inline-flex items-center gap-1 rounded-lg border border-rose-300 bg-white px-2.5 py-1.5 font-medium text-rose-900 hover:bg-rose-100"
+                >
+                  <Download className="h-3.5 w-3.5" />
+                  Receipt JSON
+                </a>
+              )}
+              <Link
+                href="/admin"
+                className="rounded-lg border border-rose-300 bg-white px-2.5 py-1.5 font-medium text-rose-900 hover:bg-rose-100"
+              >
+                Secret Purge Console →
+              </Link>
+            </div>
+          </div>
+        )}
 
         {/* Scenario Comparison Strip */}
         {openScenarios.length > 0 && (
