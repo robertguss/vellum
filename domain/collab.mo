@@ -3,6 +3,7 @@
 ## and webhook subscription/delivery payloads (`Arvo.Webhooks`).
 module Domain.Collab
 expose ProposalMeta(..),
+ProposalComment(..),
 WorldPatchArgs(..),
 WorldMutation(..),
 WorldBranchArgs(..),
@@ -14,7 +15,7 @@ claim_resource_for_block,
 claim_resource_for_row,
 webhook_matches_event?
 use Domain.DatabaseModel{AiCellMeta, CellValue, PropertyDef}
-use Domain.Types{BlockOp, Provenance}
+use Domain.Types{AuthorKind, BlockOp, Provenance}
 use Json
 
 ## Persistent metadata row in `vlm_proposals` pairing a friendly `ProposalMeta` with a `Modb.World` branch ID.
@@ -35,6 +36,22 @@ struct ProposalMeta
   updated_at: Time
   decided_by: Option(Text)
   decided_at: Option(Time)
+end
+
+## Anchored Patchwork/Review discussion or Steer-in-Place thread attached to a `Modb.World` Change Proposal.
+struct ProposalComment
+  id: Text
+  proposal_id: Text
+  target_kind: Text
+  target_ref: Option(Text)
+  parent_comment_id: Option(Text)
+  author_id: Text
+  author_handle: Text
+  author_kind: AuthorKind
+  body_markdown: Text
+  steer_requested: Bool
+  resolved_at: Option(Time)
+  created_at: Time
 end
 
 ## JSON-serializable arguments stored in `Modb.World` steps and `Modb.Replay` call history

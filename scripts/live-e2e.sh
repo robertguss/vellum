@@ -143,11 +143,17 @@ const server = http.createServer((req, res) => {
         const allText = (lastBody.messages || [])
           .map((m) => String(m.content || ""))
           .join("\n");
+        const isSteer = allText.includes(
+          "revising a speculative Vellum proposal block in-place"
+        );
         const isAiColumn = allText.includes("AI-compiled database column");
         const isBrief = allText.includes("Living Brief");
         let replyText =
           "Concise workspace semantic summary generated for progressive disclosure.";
-        if (isAiColumn) {
+        if (isSteer) {
+          replyText =
+            "Steered incident runbook paragraph revised in-place inside Modb.World branch.";
+        } else if (isAiColumn) {
           if (allText.includes("ai_select") || allText.toLowerCase().includes("tier")) {
             replyText = JSON.stringify({
               value: "high",
@@ -1123,6 +1129,214 @@ assert.ok(
 );
 assert.ok(!afterBriefAccept.json.anchored_markdown.includes("Initial E2E brief placeholder"));
 console.log("✓ MCP vellum://index + vellum://packs + Living AI Brief refresh-into-proposal verified");
+
+// 7b. Phase 2.3 Full MCP DB Surface & Patchwork Per-Hunk Reject + Steer-in-Place
+const dbMcpMint = await apiJson("/api/admin/agents", {
+  method: "POST",
+  body: JSON.stringify({
+    handle: "db-mcp-agent",
+    display_name: "DB MCP Agent",
+    model_id: "gpt-4o-mini",
+    label: "live-e2e-p23",
+    allowed_actions: ["read", "write_db", "propose", "comment"],
+    allowed_collections: [colId],
+    max_calls: 50,
+    ttl_days: 7,
+  }),
+});
+assert.equal(dbMcpMint.res.status, 201, dbMcpMint.text);
+const dbMcpTok = dbMcpMint.json.raw_token;
+
+async function mcpDbCall(id, method, params) {
+  const r = await fetch(`${BASE}/mcp`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${dbMcpTok}`,
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
+  });
+  assert.equal(r.status, 200);
+  return r.json();
+}
+
+const mcpDbSchemaR = await mcpDbCall(301, "tools/call", {
+  name: "vellum.db_schema",
+  arguments: { database_id: dbId },
+});
+assert.equal(mcpDbSchemaR.result?.isError, false);
+assert.ok((mcpDbSchemaR.result?.structuredContent?.views || []).length >= 1);
+
+const mcpCreateRowR = await mcpDbCall(302, "tools/call", {
+  name: "vellum.db_create_row",
+  arguments: {
+    database_id: dbId,
+    cells: {
+      title: { text_val: "MCP Live Node" },
+      cost: { number_val: "33.00" },
+    },
+    reason: "live mcp create row",
+  },
+});
+assert.equal(mcpCreateRowR.result?.isError, false);
+const mcpRowId = mcpCreateRowR.result.structuredContent.row.id;
+assert.ok(mcpRowId && mcpRowId.startsWith("row_"), "MCP created DB row id");
+
+const mcpUpdateRowR = await mcpDbCall(303, "tools/call", {
+  name: "vellum.db_update_row",
+  arguments: {
+    database_id: dbId,
+    row_id: mcpRowId,
+    cells: { cost: { number_val: "55.00" } },
+    expected_version: 1,
+    reason: "live mcp update row",
+  },
+});
+assert.equal(mcpUpdateRowR.result?.isError, false);
+assert.equal(mcpUpdateRowR.result.structuredContent.row.version, 2);
+
+const mcpProposeDbR = await mcpDbCall(304, "tools/call", {
+  name: "vellum.db_propose_changes",
+  arguments: {
+    database_id: dbId,
+    title: "MCP Propose Cost Revision",
+    reason: "stage db_row_update via MCP",
+    mutations: [
+      {
+        kind: "db_row_update",
+        row_id: mcpRowId,
+        expected_version: 2,
+        cells: { cost: { number_val: "77.00" } },
+      },
+    ],
+  },
+});
+assert.equal(mcpProposeDbR.result?.isError, false);
+assert.equal(mcpProposeDbR.result.structuredContent.staged_count, 1);
+const mcpDbPropId = mcpProposeDbR.result.structuredContent.proposal.id;
+
+const mcpDbDiffRes = await apiJson(`/api/proposals/${mcpDbPropId}/diff`);
+assert.equal(mcpDbDiffRes.res.status, 200, mcpDbDiffRes.text);
+assert.equal(mcpDbDiffRes.json.db_row_diffs.length, 1);
+
+const acceptMcpDbRes = await apiJson(`/api/proposals/${mcpDbPropId}/accept`, {
+  method: "POST",
+  body: JSON.stringify({ reason: "Approve MCP proposed DB edit" }),
+});
+assert.equal(acceptMcpDbRes.res.status, 200, acceptMcpDbRes.text);
+
+const mcpQueryAfterR = await mcpDbCall(305, "tools/call", {
+  name: "vellum.db_query",
+  arguments: { database_id: dbId },
+});
+assert.equal(mcpQueryAfterR.result?.isError, false);
+const mcpUpdatedRow = (mcpQueryAfterR.result.structuredContent.rows || []).find(
+  (er) => er.row.id === mcpRowId
+);
+assert.equal(Number(mcpUpdatedRow?.row?.cells?.cost?.number_val), 77);
+
+const steerPgRes = await apiJson("/api/pages", {
+  method: "POST",
+  body: JSON.stringify({
+    collection_id: colId,
+    parent_page_id: null,
+    title: "Steer Patchwork Target",
+    icon: null,
+    markdown: "Live paragraph one.\n\nLive paragraph two.",
+    freshness_ttl_days: null,
+    reason: "seed patchwork steer page",
+  }),
+});
+assert.equal(steerPgRes.res.status, 201, steerPgRes.text);
+const steerPageId = steerPgRes.json.page.id;
+const sBlk1 = steerPgRes.json.blocks[0].id;
+const sBlk2 = steerPgRes.json.blocks[1].id;
+
+const openSteerPropR = await mcpDbCall(306, "tools/call", {
+  name: "vellum.proposal_open",
+  arguments: {
+    page_id: steerPageId,
+    title: "Steerable Two-Block Draft",
+    reason: "Update both blocks via MCP",
+  },
+});
+assert.equal(openSteerPropR.result?.isError, false);
+const steerPropId = openSteerPropR.result.structuredContent.id;
+
+const stageSteerOpsR = await mcpDbCall(307, "tools/call", {
+  name: "vellum.proposal_stage_ops",
+  arguments: {
+    proposal_id: steerPropId,
+    reason: "Modify two blocks",
+    ops: [
+      {
+        replace_block: {
+          block_id: sBlk1,
+          expected_version: 1,
+          kind: null,
+          markdown: "Agent draft paragraph one.",
+        },
+      },
+      {
+        replace_block: {
+          block_id: sBlk2,
+          expected_version: 1,
+          kind: null,
+          markdown: "Agent draft paragraph two to reject.",
+        },
+      },
+    ],
+    expected_versions: { [sBlk1]: 1, [sBlk2]: 1 },
+  },
+});
+assert.equal(stageSteerOpsR.result?.isError, false);
+
+const rejectHunkRes = await apiJson(`/api/proposals/${steerPropId}/hunks/reject`, {
+  method: "POST",
+  body: JSON.stringify({
+    target_kind: "block",
+    target_id: sBlk2,
+    page_id: steerPageId,
+    database_id: null,
+    reason: "Keep original block two",
+  }),
+});
+assert.equal(rejectHunkRes.res.status, 200, rejectHunkRes.text);
+
+const steerActionRes = await apiJson(`/api/proposals/${steerPropId}/steer`, {
+  method: "POST",
+  body: JSON.stringify({
+    target_block_id: sBlk1,
+    target_page_id: steerPageId,
+    instruction: "Tighten incident summary",
+    deterministic_fallback: false,
+  }),
+});
+assert.equal(steerActionRes.res.status, 200, steerActionRes.text);
+assert.ok(steerActionRes.json.revised_markdown.includes("Steered incident runbook"));
+
+const listPropCmtsRes = await apiJson(`/api/proposals/${steerPropId}/comments`);
+assert.equal(listPropCmtsRes.res.status, 200, listPropCmtsRes.text);
+assert.ok(listPropCmtsRes.json.comments.length >= 2);
+
+const mcpPropCmtsR = await mcpDbCall(308, "tools/call", {
+  name: "vellum.proposal_comments",
+  arguments: { proposal_id: steerPropId },
+});
+assert.equal(mcpPropCmtsR.result?.isError, false);
+assert.ok(mcpPropCmtsR.result.structuredContent.comments.length >= 2);
+
+const acceptSteerPropRes = await apiJson(`/api/proposals/${steerPropId}/accept`, {
+  method: "POST",
+  body: JSON.stringify({ reason: "Merge steered block 1 only" }),
+});
+assert.equal(acceptSteerPropRes.res.status, 200, acceptSteerPropRes.text);
+
+const afterSteerPg = await apiJson(`/api/pages/${steerPageId}`);
+assert.equal(afterSteerPg.res.status, 200, afterSteerPg.text);
+assert.ok(afterSteerPg.json.anchored_markdown.includes("Steered incident runbook"));
+assert.ok(afterSteerPg.json.anchored_markdown.includes("Live paragraph two."));
+console.log("✓ Phase 2.3 Full MCP DB Surface & Patchwork Steer-in-Place verified");
 
 // 8. True Streaming SSE multi-client fanout + MCP live event + Last-Event-ID replay
 async function openLiveSse(path, lastEventId = null) {

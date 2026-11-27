@@ -515,6 +515,30 @@ export interface ScenarioQueryResponse {
   step_count: number;
 }
 
+export interface ProposalComment {
+  id: string;
+  proposal_id: string;
+  target_kind: string;
+  target_ref: string | null;
+  parent_comment_id: string | null;
+  author_id: string;
+  author_handle: string;
+  author_kind: AuthorKind;
+  body_markdown: string;
+  steer_requested: boolean;
+  resolved_at: string | null;
+  created_at: string;
+}
+
+export interface SteerProposalResponse {
+  proposal: ProposalMeta;
+  human_comment: ProposalComment;
+  agent_comment: ProposalComment;
+  revised_block_id: string;
+  revised_markdown: string;
+  model: string;
+}
+
 export interface ProposalDiffResponse {
   proposal: ProposalMeta;
   page_title?: string | null;
@@ -524,6 +548,7 @@ export interface ProposalDiffResponse {
   db_row_diffs?: DbRowDiffEntry[];
   db_schema_diffs?: DbSchemaDiffEntry[];
   rollup_deltas?: DecimalDelta[];
+  comments?: ProposalComment[];
   step_count?: number;
 }
 

@@ -96,6 +96,8 @@ AiFeedSyncResult(..),
 ai_cell_meta_by_database,
 ai_cell_meta_table,
 ai_col_usage_table,
+proposal_comments_by_proposal,
+proposal_comments_table,
 map_feeds_error,
 ai_col_feed_id,
 ensure_ai_col_feed_locked,
@@ -106,6 +108,7 @@ use Domain.FeedBridge
 use Domain.Packs{ContextPack, LivingSummary}
 use Domain.Collab{
   DecimalDelta,
+  ProposalComment,
   ProposalMeta,
   WebhookSub,
   WorldBranchArgs,
@@ -376,6 +379,18 @@ end
 
 fn ai_col_usage_table() : Table.Table(Text, AiColumnUsage)
   Table.text_key[AiColumnUsage]("vlm_ai_col_usage")
+end
+
+fn proposal_comments_by_proposal() : Table.Index(Text, ProposalComment, Text)
+  Table.text_index[Text, ProposalComment]("vlm_proposal_comments_by_proposal", fn(c)
+    c.proposal_id
+  end)
+end
+
+fn proposal_comments_table() : Table.Table(Text, ProposalComment)
+  Table.text_key[ProposalComment]("vlm_proposal_comments").with_index(
+    proposal_comments_by_proposal()
+  )
 end
 
 ## Converts `Modb.Table` errors to `AppError`.

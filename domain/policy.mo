@@ -6,6 +6,7 @@ action_permitted?,
 collection_permitted?,
 require_collection_access,
 can_write_page_direct?,
+can_write_db_direct?,
 extract_bearer_token,
 mint_agent_token_raw,
 valid_collection_slug?
@@ -105,6 +106,17 @@ end
 ## Whether `auth` may edit pages directly inside `col` according to its `CollectionWritePolicy`.
 fn can_write_page_direct?(auth: AuthContext, col: Collection) : Bool
   return false if not action_permitted?(auth, "write_direct")
+  return false if not collection_permitted?(auth, col.id)
+  case col.write_policy
+    DirectWithAudit: true
+    ProposalsRequiredForAgents: auth.principal.kind == Human
+    ProposalsRequiredForAll: false
+  end
+end
+
+## Whether `auth` may edit database rows directly inside `col` according to its `CollectionWritePolicy`.
+fn can_write_db_direct?(auth: AuthContext, col: Collection) : Bool
+  return false if not (action_permitted?(auth, "write_db") or action_permitted?(auth, "write_direct"))
   return false if not collection_permitted?(auth, col.id)
   case col.write_policy
     DirectWithAudit: true

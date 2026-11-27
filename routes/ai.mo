@@ -10,6 +10,7 @@ AskWorkspaceInput(..),
 DraftBlockInput(..),
 RefreshAiBriefInput(..),
 RunAiColumnInput(..),
+SteerProposalInput(..),
 GardenStalePage(..),
 GardenBrokenLink(..),
 GardenReport(..),
@@ -24,7 +25,9 @@ execute_workspace_search,
 ask_workspace,
 draft_blocks,
 refresh_ai_brief,
+steer_proposal,
 build_ai_column_prompts,
+build_steer_prompts,
 run_ai_column,
 ai_columns_status,
 sync_ai_column_feed,
@@ -34,7 +37,7 @@ use Api
 use Arvo.Id
 use Db
 use Domain.Blocks
-use Domain.Collab{ProposalMeta, WorldBranchArgs, WorldMutation, WorldPatchArgs}
+use Domain.Collab{ProposalComment, ProposalMeta, WorldBranchArgs, WorldMutation, WorldPatchArgs}
 use Domain.DatabaseModel{
   AiCellMeta,
   AiColumnMode,
@@ -2171,4 +2174,291 @@ fn run_ai_column(
       })
     )
   )
+end
+
+## JSON payload for `POST /api/proposals/:id/steer`.
+struct SteerProposalInput
+  target_block_id: Option(Text)
+  target_page_id: Option(Text)
+  instruction: Text
+  deterministic_fallback: Option(Bool)
+end
+
+## Builds exact `(system_prompt, user_prompt)` strings for Patchwork Steer-in-Place revision.
+fn build_steer_prompts(
+  page_title: Text,
+  block_id: Text,
+  live_md: Text,
+  proposed_md: Text,
+  instruction: Text
+) : (Text, Text)
+  sys_prompt = "You are revising a speculative Vellum proposal block in-place inside a Modb.World branch. Return ONLY the revised Markdown for this single block without code fences or commentary."
+  usr_prompt = "Page: #{page_title}\nBlock: #{block_id}\nCurrent Live Text:\n#{live_md}\n\nCurrent Proposed Text:\n#{proposed_md}\n\nReviewer Steer Instruction:\n#{instruction}"
+  (sys_prompt, usr_prompt)
+end
+
+## `POST /api/proposals/:id/steer` — Revises a single block inside an existing `Modb.World` branch according to reviewer instruction and records anchored comments.
+fn steer_proposal(
+  req: Api.Request,
+  id: Text,
+  auth: AuthContext,
+  input: SteerProposalInput,
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock,
+  env: Env,
+  net: Network
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  clean_instr = input.instruction.trim
+  if clean_instr.empty?
+    return Error(BadInput(reason: "steer instruction must not be empty"))
+  end
+  if not files.read_only.exists?(Db.ledger_db_path)
+    return Error(Missing(entity: "proposal", id: id))
+  end
+
+  (pm, target_pid, page_title, spec_blk, live_md) = try Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      found = case try Table.get(store, Db.proposals_table(), id).map_error(Db.map_table_error)
+        Some(p): p
+        None: return Error(Missing(entity: "proposal", id: id))
+      end
+      if found.status != "open"
+        return Error(Conflict(reason: "proposal '#{id}' is '#{found.status}', not 'open'"))
+      end
+      try Policy.require_collection_access(auth, "propose", found.collection_id)
+      world = case try World.get_world(store, found.world_id).map_error(Db.map_world_error)
+        Some(w): w
+        None: return Error(Missing(entity: "world", id: found.world_id))
+      end
+      (base_tx, spec_tx) = try Db.materialize_world_tx(store, world)
+      pid = case input.target_page_id
+        Some(p) if not p.trim.empty?: p.trim
+        Some(_) | None: found.target_page_id
+      end
+      pg_spec = try Table.tx_get(spec_tx, Db.pages_table(), pid).map_error(Db.map_table_error)
+      pg_base = try Table.tx_get(base_tx, Db.pages_table(), pid).map_error(Db.map_table_error)
+      ptitle = case pg_spec
+        Some(p): p.title
+        None:
+          case pg_base
+            Some(p): p.title
+            None: pid
+          end
+      end
+
+      brows = try Table.tx_lookup(base_tx, Db.blocks_table(), Db.blocks_by_page(), pid).map_error(
+        Db.map_table_error
+      )
+      srows = try Table.tx_lookup(spec_tx, Db.blocks_table(), Db.blocks_by_page(), pid).map_error(
+        Db.map_table_error
+      )
+      base_blocks = Blocks.sort_blocks(brows.map(fn(x) x.1 end))
+      spec_blocks = Blocks.sort_blocks(srows.map(fn(x) x.1 end))
+      var base_by_id = {}
+      for bb in base_blocks
+        base_by_id = base_by_id.set(bb.id, bb)
+      end
+
+      chosen = case input.target_block_id
+        Some(bid) if not bid.trim.empty?:
+          tbid = bid.trim
+          case spec_blocks.find(fn(b) b.id == tbid end)
+            Some(sb): sb
+            None: return Error(Missing(entity: "block", id: tbid))
+          end
+        Some(_) | None:
+          changed_opt = spec_blocks.find(fn(sb)
+            case base_by_id.get(sb.id)
+              None: true
+              Some(bb): bb.markdown != sb.markdown or bb.kind != sb.kind
+            end
+          end)
+          case changed_opt
+            Some(sb): sb
+            None:
+              case spec_blocks.first
+                Some(sb): sb
+                None: return Error(
+                  BadInput(reason: "no block available on page '#{pid}' to steer")
+                )
+              end
+          end
+      end
+
+      cur_live = case base_by_id.get(chosen.id)
+        Some(bb): bb.markdown
+        None: ""
+      end
+      Ok((found, pid, ptitle, chosen, cur_live))
+    end
+  )
+
+  # Execute LLM call strictly outside any MoDB lock
+  (sys_prompt, usr_prompt) = build_steer_prompts(
+    page_title,
+    spec_blk.id,
+    live_md,
+    spec_blk.markdown,
+    clean_instr
+  )
+  use_det? = input.deterministic_fallback or false
+  (revised_md, model_name) = if not use_det?
+    case ai_config(env)
+      Ok(cfg):
+        http_res = try Http.send(build_llm_request(cfg, sys_prompt, usr_prompt), net).map_error(
+          fn(e) ServerFailed(reason: "Steer LLM HTTP request failed: #{e.to_text}") end
+        )
+        if http_res.status < 200 or http_res.status >= 300
+          return Error(
+            ServerFailed(reason: "Steer LLM provider returned HTTP #{http_res.status}")
+          )
+        end
+        txt = (try extract_llm_text(cfg, http_res.body)).trim
+        if txt.empty?
+          return Error(ServerFailed(reason: "Steer LLM returned empty response"))
+        end
+        (txt, cfg.model)
+      Error(e):
+        return Error(BadInput(reason: "AI provider not configured for Steer-in-Place: #{e.to_text}"))
+    end
+  else
+    ("#{spec_blk.markdown.trim} [Steered: #{clean_instr}]", "deterministic-steer")
+  end
+
+  now = clock.now
+  agent_prov = Provenance(
+    author_id: auth.principal.id,
+    author_kind: AgentAuthor(model: Some(model_name)),
+    grant_id: if auth.principal.kind == Agent: Some(auth.grant_id) else: None,
+    proposal_id: Some(pm.id),
+    reason: Some("Steered in-place: #{clean_instr}"),
+    citations: [],
+    updated_at: now
+  )
+  patch_mut = PatchPageBlocks(
+    page_id: target_pid,
+    ops: [
+      ReplaceBlock(
+        block_id: spec_blk.id,
+        expected_version: spec_blk.version,
+        kind: None,
+        markdown: revised_md
+      )
+    ],
+    new_ids: [],
+    provenance: agent_prov,
+    expected_versions: {}
+  )
+  _step = try World.world_call_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.world_catalog(),
+    pm.world_id,
+    "propose",
+    WorldBranchArgs(mutation: patch_mut, updated_at: now).to_json,
+    "steer block #{spec_blk.id} in #{pm.id}",
+    now
+  ).map_error(Db.map_world_error)
+
+  h_kind = case auth.principal.kind
+    Human: HumanAuthor
+    Agent: AgentAuthor(model: auth.principal.model_id)
+  end
+  human_cmt = ProposalComment(
+    id: "pcmt_#{Id.ulid(rng, clock)}",
+    proposal_id: pm.id,
+    target_kind: "block",
+    target_ref: Some(spec_blk.id),
+    parent_comment_id: None,
+    author_id: auth.principal.id,
+    author_handle: auth.principal.handle,
+    author_kind: h_kind,
+    body_markdown: clean_instr,
+    steer_requested: true,
+    resolved_at: None,
+    created_at: now
+  )
+  agent_cmt = ProposalComment(
+    id: "pcmt_#{Id.ulid(rng, clock)}",
+    proposal_id: pm.id,
+    target_kind: "block",
+    target_ref: Some(spec_blk.id),
+    parent_comment_id: Some(human_cmt.id),
+    author_id: auth.principal.id,
+    author_handle: "@vellum-steer",
+    author_kind: AgentAuthor(model: Some(model_name)),
+    body_markdown: "Revised block `#{spec_blk.id}` in-place inside branch `#{pm.world_id}`.",
+    steer_requested: false,
+    resolved_at: None,
+    created_at: now
+  )
+  cmeta = Ledger.WriteMeta(
+    principal: auth.principal.handle,
+    action: "proposal.steer",
+    reason: "steer block '#{spec_blk.id}' inside proposal '#{pm.id}'",
+    at: now
+  )
+  audit_payload = Json.Object({
+    "proposal_id": Json.String(pm.id),
+    "block_id": Json.String(spec_blk.id),
+    "model": Json.String(model_name)
+  })
+  try Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    cmeta,
+    "steered block #{spec_blk.id} in proposal #{pm.id}",
+    audit_payload,
+    Db.map_ledger_error,
+    fn(tx)
+      t1 = if auth.principal.kind == Agent
+        (tg, _g) = try Grants.tx_authorize(tx, auth.grant_id, "propose", now).map_error(
+          Db.map_grants_error
+        )
+        tg
+      else
+        tx
+      end
+      t2 = try Table.put(t1, Db.proposal_comments_table(), human_cmt.id, human_cmt).map_error(
+        Db.map_table_error
+      )
+      t3 = try Table.put(t2, Db.proposal_comments_table(), agent_cmt.id, agent_cmt).map_error(
+        Db.map_table_error
+      )
+      Ok((t3, Unit))
+    end
+  )
+
+  steer_ev = Json.Object({
+    "proposal_id": Json.String(pm.id),
+    "page_id": Json.String(target_pid),
+    "block_id": Json.String(spec_blk.id),
+    "actor": Json.String(auth.principal.handle)
+  })
+  var resp = json_ok(
+    200,
+    Json.Object({
+      "proposal": pm.to_json,
+      "human_comment": human_cmt.to_json,
+      "agent_comment": agent_cmt.to_json,
+      "revised_block_id": Json.String(spec_blk.id),
+      "revised_markdown": Json.String(revised_md),
+      "model": Json.String(model_name)
+    })
+  ).with_sse_publish_json("collection:#{pm.collection_id}", "proposal.updated", steer_ev)
+    .with_sse_publish_json("collection:#{pm.collection_id}", "proposal.commented", steer_ev)
+  if not target_pid.trim.empty?
+    resp = resp.with_sse_publish_json("page:#{target_pid}", "proposal.updated", steer_ev)
+      .with_sse_publish_json("page:#{target_pid}", "proposal.commented", steer_ev)
+  end
+  Ok(resp)
 end
