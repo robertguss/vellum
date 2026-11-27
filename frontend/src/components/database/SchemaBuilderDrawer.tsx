@@ -1,7 +1,9 @@
-import { ArrowDown, ArrowUp, Plus, Trash2, X } from "lucide-react";
+import { ArrowDown, ArrowUp, Plus, Sparkles, Trash2, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { ApiError } from "../../lib/api";
 import type {
+  AiColumnMode,
+  AiOutputKind,
   DatabaseDef,
   PropertyDef,
   PropertyKind,
@@ -22,7 +24,10 @@ type KindKey =
   | "person"
   | "url"
   | "relation"
-  | "rollup";
+  | "rollup"
+  | "ai_derived";
+
+type AiOutputKey = "ai_text" | "ai_number" | "ai_date" | "ai_bool" | "ai_select";
 
 const KIND_LABELS: Record<KindKey, string> = {
   title: "Title",
@@ -36,6 +41,7 @@ const KIND_LABELS: Record<KindKey, string> = {
   url: "URL",
   relation: "Relation",
   rollup: "Rollup",
+  ai_derived: "AI Compiled",
 };
 
 const ALL_COLORS: SelectOptionColor[] = ["gray", "blue", "green", "amber", "red", "purple"];
@@ -47,6 +53,7 @@ function kindKeyOf(kind: PropertyKind): KindKey {
   if ("select" in kind) return "select";
   if ("multi_select" in kind) return "multi_select";
   if ("relation" in kind) return "relation";
+  if ("ai_derived" in kind) return "ai_derived";
   return "rollup";
 }
 
@@ -107,6 +114,12 @@ export default function SchemaBuilderDrawer({
   const [rollupRelPropId, setRollupRelPropId] = useState("");
   const [rollupTargetPropId, setRollupTargetPropId] = useState("");
   const [rollupAgg, setRollupAgg] = useState<RollupAgg>("sum_values");
+  const [aiPrompt, setAiPrompt] = useState("");
+  const [aiOutputKey, setAiOutputKey] = useState<AiOutputKey>("ai_text");
+  const [aiSourcePropIds, setAiSourcePropIds] = useState<string[]>([]);
+  const [aiIncludeRowBody, setAiIncludeRowBody] = useState(false);
+  const [aiMode, setAiMode] = useState<AiColumnMode>("stage_proposal");
+  const [aiDailyCap, setAiDailyCap] = useState(100);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -137,6 +150,12 @@ export default function SchemaBuilderDrawer({
         : undefined;
     setRollupTargetPropId(relTargetDb?.properties[0]?.id ?? "");
     setRollupAgg("sum_values");
+    setAiPrompt("");
+    setAiOutputKey("ai_text");
+    setAiSourcePropIds([]);
+    setAiIncludeRowBody(false);
+    setAiMode("stage_proposal");
+    setAiDailyCap(100);
   }
 
   function startEditProp(p: PropertyDef) {
@@ -154,6 +173,23 @@ export default function SchemaBuilderDrawer({
       setRollupRelPropId(p.kind.rollup.relation_prop_id);
       setRollupTargetPropId(p.kind.rollup.target_prop_id);
       setRollupAgg(p.kind.rollup.agg);
+    }
+    if (typeof p.kind === "object" && "ai_derived" in p.kind) {
+      const ai = p.kind.ai_derived;
+      setAiPrompt(ai.prompt);
+      setAiSourcePropIds(ai.source_prop_ids);
+      setAiIncludeRowBody(ai.include_row_body);
+      setAiMode(ai.mode);
+      setAiDailyCap(ai.daily_call_cap);
+      if (typeof ai.output_kind === "string") {
+        setAiOutputKey(ai.output_kind);
+      } else if ("ai_number" in ai.output_kind) {
+        setAiOutputKey("ai_number");
+        setNumFormat(ai.output_kind.ai_number.format);
+      } else if ("ai_select" in ai.output_kind) {
+        setAiOutputKey("ai_select");
+        setOptions(ai.output_kind.ai_select.options);
+      }
     }
     setError(null);
   }
@@ -211,6 +247,40 @@ export default function SchemaBuilderDrawer({
             agg: rollupAgg,
           },
         };
+      case "ai_derived": {
+        if (!aiPrompt.trim()) {
+          setError("AI Compiled column requires a prompt instruction");
+          return null;
+        }
+        if (aiDailyCap < 1 || aiDailyCap > 10000) {
+          setError("Daily call cap must be between 1 and 10000");
+          return null;
+        }
+        let outKind: AiOutputKind = "ai_text";
+        if (aiOutputKey === "ai_number") {
+          outKind = { ai_number: { format: numFormat } };
+        } else if (aiOutputKey === "ai_select") {
+          if (options.length === 0) {
+            setError("AI Select column needs at least one option");
+            return null;
+          }
+          outKind = { ai_select: { options } };
+        } else if (aiOutputKey === "ai_date") {
+          outKind = "ai_date";
+        } else if (aiOutputKey === "ai_bool") {
+          outKind = "ai_bool";
+        }
+        return {
+          ai_derived: {
+            prompt: aiPrompt.trim(),
+            source_prop_ids: aiSourcePropIds.filter((id) => id !== editingId),
+            include_row_body: aiIncludeRowBody,
+            output_kind: outKind,
+            mode: aiMode,
+            daily_call_cap: aiDailyCap,
+          },
+        };
+      }
     }
   }
 
@@ -228,7 +298,13 @@ export default function SchemaBuilderDrawer({
       setDraftProps((prev) =>
         prev.map((p) =>
           p.id === editingId
-            ? { ...p, name: colName.trim(), kind: builtKind, required: colRequired }
+            ? {
+                ...p,
+                name: colName.trim(),
+                kind: builtKind,
+                required:
+                  colKind === "rollup" || colKind === "ai_derived" ? false : colRequired,
+              }
             : p
         )
       );
@@ -239,7 +315,7 @@ export default function SchemaBuilderDrawer({
         id,
         name: colName.trim(),
         kind: builtKind,
-        required: colRequired,
+        required: colKind === "rollup" || colKind === "ai_derived" ? false : colRequired,
         sort_order: nextSortOrder(draftProps),
       };
       const updated = [...draftProps, next];
@@ -342,6 +418,9 @@ export default function SchemaBuilderDrawer({
                   >
                     <div className="min-w-0">
                       <div className="flex items-center gap-2">
+                        {kk === "ai_derived" && (
+                          <Sparkles className="h-3 w-3 text-purple-600 shrink-0" />
+                        )}
                         <span className="font-medium text-stone-900 truncate">{p.name}</span>
                         <span className="rounded bg-stone-200/80 px-1.5 py-0.5 font-mono text-[10px] text-stone-600">
                           {KIND_LABELS[kk]}
@@ -446,16 +525,19 @@ export default function SchemaBuilderDrawer({
               </div>
             </div>
 
-            <label className="inline-flex items-center gap-2 text-stone-700">
-              <input
-                type="checkbox"
-                checked={colRequired}
-                onChange={(e) => setColRequired(e.target.checked)}
-              />
-              Required on all rows
-            </label>
+            {colKind !== "rollup" && colKind !== "ai_derived" && (
+              <label className="inline-flex items-center gap-2 text-stone-700">
+                <input
+                  type="checkbox"
+                  checked={colRequired}
+                  onChange={(e) => setColRequired(e.target.checked)}
+                />
+                Required on all rows
+              </label>
+            )}
 
-            {colKind === "number" && (
+            {(colKind === "number" ||
+              (colKind === "ai_derived" && aiOutputKey === "ai_number")) && (
               <div>
                 <label className="block text-[11px] font-medium text-stone-600 mb-1">
                   Display Format
@@ -483,7 +565,9 @@ export default function SchemaBuilderDrawer({
               </label>
             )}
 
-            {(colKind === "select" || colKind === "multi_select") && (
+            {(colKind === "select" ||
+              colKind === "multi_select" ||
+              (colKind === "ai_derived" && aiOutputKey === "ai_select")) && (
               <div className="space-y-2 rounded-xl border border-stone-200 bg-white p-3">
                 <div className="text-[11px] font-medium text-stone-600">Options</div>
                 <div className="flex flex-wrap gap-1.5">
@@ -613,6 +697,116 @@ export default function SchemaBuilderDrawer({
                     <option value="min_value">Minimum Value / Date</option>
                     <option value="max_value">Maximum Value / Date</option>
                   </select>
+                </div>
+              </div>
+            )}
+
+            {colKind === "ai_derived" && (
+              <div className="space-y-3 rounded-xl border border-purple-200 bg-purple-50/40 p-3">
+                <div className="flex items-center gap-1.5 font-semibold text-purple-900 text-[11px]">
+                  <Sparkles className="h-3.5 w-3.5 text-purple-700" />
+                  AI-Compiled Column Configuration
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-stone-600 mb-1">
+                    Prompt Instruction
+                  </label>
+                  <textarea
+                    rows={2}
+                    value={aiPrompt}
+                    onChange={(e) => setAiPrompt(e.target.value)}
+                    placeholder="e.g. Classify operational severity from title & cost impact..."
+                    className="w-full rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 text-xs outline-none focus:border-purple-500"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="block text-[11px] font-medium text-stone-600 mb-1">
+                      Strict Output Type
+                    </label>
+                    <select
+                      value={aiOutputKey}
+                      onChange={(e) => setAiOutputKey(e.target.value as AiOutputKey)}
+                      className="w-full rounded-md border border-stone-200 bg-white px-2 py-1 text-xs"
+                    >
+                      <option value="ai_text">Text</option>
+                      <option value="ai_number">Number (Decimal)</option>
+                      <option value="ai_select">Select Option</option>
+                      <option value="ai_bool">Checkbox (Boolean)</option>
+                      <option value="ai_date">Date (YYYY-MM-DD)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-medium text-stone-600 mb-1">
+                      Write Routing Policy
+                    </label>
+                    <select
+                      value={aiMode}
+                      onChange={(e) => setAiMode(e.target.value as AiColumnMode)}
+                      className="w-full rounded-md border border-stone-200 bg-white px-2 py-1 text-xs"
+                    >
+                      <option value="stage_proposal">Stage Change Proposal</option>
+                      <option value="auto_apply">Auto-Apply Validated Cells</option>
+                    </select>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-2 items-center">
+                  <div>
+                    <label className="block text-[11px] font-medium text-stone-600 mb-1">
+                      Daily Call Cap (1-10000)
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={10000}
+                      value={aiDailyCap}
+                      onChange={(e) => {
+                        const n = Number.parseInt(e.target.value, 10);
+                        if (Number.isFinite(n)) setAiDailyCap(n);
+                      }}
+                      className="w-full rounded-md border border-stone-200 bg-white px-2 py-1 font-mono text-xs"
+                    />
+                  </div>
+                  <label className="flex items-center gap-2 text-stone-700 pt-4 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={aiIncludeRowBody}
+                      onChange={(e) => setAiIncludeRowBody(e.target.checked)}
+                    />
+                    Include row doc blocks
+                  </label>
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-stone-600 mb-1">
+                    Grounded Source Columns{" "}
+                    <span className="text-stone-400">(blank = all non-AI columns)</span>
+                  </label>
+                  <div className="max-h-24 overflow-y-auto rounded-lg border border-stone-200 bg-white p-2 space-y-1">
+                    {draftProps
+                      .filter((dp) => dp.id !== editingId)
+                      .map((dp) => (
+                        <label
+                          key={dp.id}
+                          className="flex items-center gap-2 text-xs text-stone-700 cursor-pointer"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={aiSourcePropIds.includes(dp.id)}
+                            onChange={() =>
+                              setAiSourcePropIds((prev) =>
+                                prev.includes(dp.id)
+                                  ? prev.filter((x) => x !== dp.id)
+                                  : [...prev, dp.id]
+                              )
+                            }
+                          />
+                          <span className="truncate">{dp.name}</span>
+                          <span className="font-mono text-[10px] text-stone-400 ml-auto">
+                            {dp.id}
+                          </span>
+                        </label>
+                      ))}
+                  </div>
                 </div>
               </div>
             )}

@@ -93,8 +93,15 @@ fn validate_blueprint_def(bp: BlueprintDef) : Option(Text)
         if tdb.trim.empty?
           return Some("relation field '#{fid}' requires non-empty target_db_id")
         end
-      Rollup(relation_prop_id: _, target_prop_id: _, agg: _): return Some(
-        "blueprint field '#{fid}' cannot use Rollup kind"
+      Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
+        prompt: _,
+        source_prop_ids: _,
+        include_row_body: _,
+        output_kind: _,
+        mode: _,
+        daily_call_cap: _
+      ): return Some(
+        "blueprint field '#{fid}' cannot use Rollup or AiDerived kind"
       )
       Title | RichText | DateProp(include_time: _) | Checkbox | Person | Url: Unit
     end
@@ -138,7 +145,14 @@ fn option_label_or_id(prop: PropertyDef, oid: Text) : Text
     Title | RichText | Number(format: _) | DateProp(include_time: _) | Checkbox | Person | Url | Relation(
       target_db_id: _,
       inverse_prop_id: _
-    ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): oid
+    ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
+      prompt: _,
+      source_prop_ids: _,
+      include_row_body: _,
+      output_kind: _,
+      mode: _,
+      daily_call_cap: _
+    ): oid
   end
 end
 

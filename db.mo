@@ -91,9 +91,18 @@ world_touched_resources,
 compute_db_decimal_deltas,
 tx_apply_world_patch,
 world_catalog,
-replay_catalog
+replay_catalog,
+AiFeedSyncResult(..),
+ai_cell_meta_by_database,
+ai_cell_meta_table,
+ai_col_usage_table,
+map_feeds_error,
+ai_col_feed_id,
+ensure_ai_col_feed_locked,
+sync_ai_col_feed_locked
 use Domain.Blocks
 use Domain.Blueprints{BlueprintDef, PageBlueprintMeta}
+use Domain.FeedBridge
 use Domain.Packs{ContextPack, LivingSummary}
 use Domain.Collab{
   DecimalDelta,
@@ -104,6 +113,10 @@ use Domain.Collab{
   WorldPatchArgs
 }
 use Domain.DatabaseModel{
+  AiCellMeta,
+  AiColumnMode,
+  AiColumnUsage,
+  AiOutputKind,
   CellValue,
   DatabaseDef,
   DbRow,
@@ -143,6 +156,7 @@ use Json
 use Modb{Store, WriteTx}
 use Modb.Claims
 use Modb.Errors
+use Modb.Feeds
 use Modb.Fts
 use Modb.Grants
 use Modb.Ledger
@@ -347,6 +361,23 @@ fn packs_table() : Table.Table(Text, ContextPack)
   Table.text_key[ContextPack]("vlm_packs").with_index(packs_by_slug())
 end
 
+## Deterministic `Modb.Feeds` subscription ID tracking source changes for a database's `AiDerived` columns.
+fn ai_col_feed_id(db_id: Text) : Text
+  "ai-col:#{db_id}"
+end
+
+fn ai_cell_meta_by_database() : Table.Index(Text, AiCellMeta, Text)
+  Table.text_index[Text, AiCellMeta]("vlm_ai_cell_meta_by_db", fn(m) m.database_id end)
+end
+
+fn ai_cell_meta_table() : Table.Table(Text, AiCellMeta)
+  Table.text_key[AiCellMeta]("vlm_ai_cell_meta").with_index(ai_cell_meta_by_database())
+end
+
+fn ai_col_usage_table() : Table.Table(Text, AiColumnUsage)
+  Table.text_key[AiColumnUsage]("vlm_ai_col_usage")
+end
+
 ## Converts `Modb.Table` errors to `AppError`.
 fn map_table_error(err: Table.TableError) : AppError
   case err
@@ -453,6 +484,24 @@ fn map_replay_error(err: Replay.ReplayError) : AppError
   end
 end
 
+## Converts `Modb.Feeds` errors to `AppError`.
+fn map_feeds_error(err: Feeds.FeedError) : AppError
+  case err
+    Feeds.LedgerFailure(le): map_ledger_error(le)
+    Feeds.GrantFailure(ge): map_grants_error(ge)
+    Feeds.PolicyFailure(_): Forbidden(reason: Feeds.to_text(err))
+    Feeds.FeedNotFound(id: fid): Missing(entity: "feed", id: fid)
+    Feeds.FeedAlreadyExists(id: _) | Feeds.CursorStale(
+      feed_id: _,
+      expected_txid: _,
+      actual_txid: _
+    ): Conflict(reason: Feeds.to_text(err))
+    Feeds.InvalidFeed(reason: _) | Feeds.PinMissing(feed_id: _, pin_id: _): BadInput(
+      reason: Feeds.to_text(err)
+    )
+  end
+end
+
 ## Whether `err` represents an uninitialized/missing `vellum.modb` file on `ReadFiles`.
 fn not_found_ledger?(err: Ledger.LedgerError) : Bool
   err is Ledger.TableFailure(Table.Storage(Errors.Io(NotFound(path: _))))
@@ -531,7 +580,14 @@ fn check_single_db_row(
         end
       Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
         options: _
-      ) | Checkbox | Person | Url | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): Unit
+      ) | Checkbox | Person | Url | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
+        prompt: _,
+        source_prop_ids: _,
+        include_row_body: _,
+        output_kind: _,
+        mode: _,
+        daily_call_cap: _
+      ): Unit
     end
   end
   Ok(None)
@@ -571,6 +627,7 @@ fn vellum_schema() : Ledger.Schema
   bps = blueprints_table()
   page_metas = page_meta_table()
   packs = packs_table()
+  ai_metas = ai_cell_meta_table()
   Ledger.schema(1).with_require_reason(true).with_migration(
     Ledger.migration(1, "initialize default workspace and general collection", init_v1_migration)
   ).with_invariant(
@@ -691,6 +748,20 @@ fn vellum_schema() : Ledger.Schema
     )
   ).with_invariant(
     Ledger.row_invariant("pack_valid", packs, fn(_id, p) Packs.validate_context_pack(p) end)
+  ).with_invariant(
+    Ledger.row_invariant(
+      "ai_cell_meta_valid",
+      ai_metas,
+      fn(id, m)
+        if m.database_id.trim.empty? or m.row_id.trim.empty? or m.prop_id.trim.empty? or m.model
+          .trim
+          .empty?
+          Some("ai_cell_meta '#{id}' requires database_id, row_id, prop_id, and model")
+        else
+          None
+        end
+      end
+    )
   )
 end
 
@@ -1421,7 +1492,14 @@ fn tx_delete_db_row(tx: WriteTx, def: DatabaseDef, row_id: Text) : Result(WriteT
   t1 = try tx_update_db_cell_index(tx, def.id, Some(old_row), None)
   t2 = try Table.delete(t1, db_rows_table(), row_id).map_error(map_table_error)
   t3 = try tx_delete_page_and_blocks(t2, old_row.page_id)
-  tx_refresh_db_summary(t3, def, old_row.updated_at)
+  var t4 = t3
+  for p in def.properties
+    mk = DatabaseModel.ai_cell_meta_key(def.id, row_id, p.id)
+    if (try Table.tx_get(t4, ai_cell_meta_table(), mk).map_error(map_table_error)) != None
+      t4 = try Table.delete(t4, ai_cell_meta_table(), mk).map_error(map_table_error)
+    end
+  end
+  tx_refresh_db_summary(t4, def, old_row.updated_at)
 end
 
 ## Resolves all `Rollup` columns for `rows` of `def` by fetching referenced target rows from `Store`.
@@ -1436,7 +1514,14 @@ fn enrich_rows_with_rollups(store: Store, def: DatabaseDef, rows: List(DbRow)) :
         .append((p.id, rel_id, tgt_id, agg))
       Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
         options: _
-      ) | Checkbox | Person | Url | Relation(target_db_id: _, inverse_prop_id: _): Unit
+      ) | Checkbox | Person | Url | Relation(target_db_id: _, inverse_prop_id: _) | AiDerived(
+        prompt: _,
+        source_prop_ids: _,
+        include_row_body: _,
+        output_kind: _,
+        mode: _,
+        daily_call_cap: _
+      ): Unit
     end
   end
 
@@ -1489,7 +1574,14 @@ fn tx_enrich_rows_with_rollups(tx: WriteTx, def: DatabaseDef, rows: List(DbRow))
         .append((p.id, rel_id, tgt_id, agg))
       Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
         options: _
-      ) | Checkbox | Person | Url | Relation(target_db_id: _, inverse_prop_id: _): Unit
+      ) | Checkbox | Person | Url | Relation(target_db_id: _, inverse_prop_id: _) | AiDerived(
+        prompt: _,
+        source_prop_ids: _,
+        include_row_body: _,
+        output_kind: _,
+        mode: _,
+        daily_call_cap: _
+      ): Unit
     end
   end
 
@@ -1631,6 +1723,12 @@ fn tx_clean_removed_db_properties(tx: WriteTx, old_def: DatabaseDef, next_def: D
         cur = try Table.put(cur, db_rows_table(), cleaned_row.id, cleaned_row).map_error(
           map_table_error
         )
+      end
+      for rem_pid in removed_ids
+        mk = DatabaseModel.ai_cell_meta_key(old_def.id, row.id, rem_pid)
+        if (try Table.tx_get(cur, ai_cell_meta_table(), mk).map_error(map_table_error)) != None
+          cur = try Table.delete(cur, ai_cell_meta_table(), mk).map_error(map_table_error)
+        end
       end
     end
   end
@@ -1936,6 +2034,17 @@ fn tx_apply_world_patch(tx: WriteTx, args_json: Json) : Result((WriteTx, Json), 
             "version": Json.int(next_def.version)
           })
         ))
+      PutAiCellMeta(meta: m):
+        next_tx = try Table.put(tx, ai_cell_meta_table(), m.id, m).map_error(fn(e) e.to_text end)
+        Ok((
+          next_tx,
+          Json.Object({
+            "kind": Json.String("put_ai_cell_meta"),
+            "database_id": Json.String(m.database_id),
+            "row_id": Json.String(m.row_id),
+            "prop_id": Json.String(m.prop_id)
+          })
+        ))
     end
   end
 
@@ -2017,7 +2126,7 @@ fn world_touches_schema?(world: World.WorldRecord) : Bool
                   cells: _,
                   expected_version: _,
                   provenance: _
-                ) | DeleteDbRow(database_id: _, row_id: _): Unit
+                ) | DeleteDbRow(database_id: _, row_id: _) | PutAiCellMeta(meta: _): Unit
               end
             Error(_): Unit
           end
@@ -2084,6 +2193,7 @@ fn world_touched_resources(
                     properties: _,
                     expected_version: _
                   ): db_ids = append_unique_text(db_ids, did)
+                  PutAiCellMeta(meta: m): db_ids = append_unique_text(db_ids, m.database_id)
                 end
               Error(_): Unit
             end
@@ -2109,6 +2219,14 @@ fn compute_db_decimal_deltas(
   for p in def.properties
     (include?, fmt, is_roll) = case p.kind
       Number(format: f): (true, f, false)
+      AiDerived(
+        prompt: _,
+        source_prop_ids: _,
+        include_row_body: _,
+        output_kind: AiNumber(format: f),
+        mode: _,
+        daily_call_cap: _
+      ): (true, f, false)
       Rollup(relation_prop_id: _, target_prop_id: _, agg: agg):
         always_num = case agg
           CountAll | CountValues | SumValues: true
@@ -2118,6 +2236,13 @@ fn compute_db_decimal_deltas(
       Title | RichText | DateProp(include_time: _) | Select(options: _) | MultiSelect(options: _) | Checkbox | Person | Url | Relation(
         target_db_id: _,
         inverse_prop_id: _
+      ) | AiDerived(
+        prompt: _,
+        source_prop_ids: _,
+        include_row_body: _,
+        output_kind: _,
+        mode: _,
+        daily_call_cap: _
       ): (false, "plain", false)
     end
     var live_sum = 0.0
@@ -2167,6 +2292,216 @@ fn compute_db_decimal_deltas(
     end
   end
   out
+end
+
+## Result returned by consuming the `Modb.Feeds` reactive subscription for an AI-compiled database.
+struct AiFeedSyncResult
+  feed_id: Text
+  from_txid: Int
+  to_txid: Int
+  events_seen: Int
+  pages_read: Int
+  subtrees_skipped: Int
+  marked_stale_count: Int
+end
+
+## Ensures a persistent CoW-pinned `Modb.Feeds` cursor (`ai-col:<db_id>`) exists for `db_id`.
+fn ensure_ai_col_feed_locked(files: Files, db_id: Text, now: Time) : Result(Unit, AppError)
+  fid = ai_col_feed_id(db_id)
+  existing = if files.read_only.exists?(ledger_db_path)
+    try Ledger.read_locked(
+      files.read_only,
+      ledger_db_path,
+      vellum_schema(),
+      map_ledger_error,
+      fn(db) Feeds.get_feed(Ledger.store(db), fid).map_error(map_feeds_error) end
+    )
+  else
+    None
+  end
+  return Ok(Unit) if existing != None
+
+  spec = Feeds.FeedSpec(
+    id: fid,
+    principal: "system:ai-columns",
+    grant_id: None,
+    buckets: [db_rows_table().bucket, blocks_table().bucket],
+    include_internal: false,
+    from_beginning: false
+  )
+  case Feeds.subscribe_locked(
+    files,
+    ledger_db_path,
+    vellum_schema(),
+    spec,
+    "track AI column staleness for #{db_id}",
+    now
+  )
+    Ok(_): Ok(Unit)
+    Error(Feeds.FeedAlreadyExists(id: _)): Ok(Unit)
+    Error(e): Error(map_feeds_error(e))
+  end
+end
+
+## Consumes O(diff) `Modb.Feeds` events for `db_id` and marks drifted `AiCellMeta` entries stale.
+fn sync_ai_col_feed_locked(files: Files, db_id: Text, now: Time) : Result(
+  AiFeedSyncResult,
+  AppError
+)
+  try ensure_ai_col_feed_locked(files, db_id, now)
+  fid = ai_col_feed_id(db_id)
+  (batch, _sub) = try Feeds.consume_feed_locked(
+    files,
+    ledger_db_path,
+    vellum_schema(),
+    FeedBridge.empty_sensitivity_policy(),
+    fid,
+    true,
+    500,
+    now
+  ).map_error(map_feeds_error)
+
+  row_bucket = db_rows_table().bucket
+  var touched_rows = {}
+  for ev in batch.events
+    if ev.bucket == row_bucket
+      case ev.key_text
+        Some(rk): touched_rows = touched_rows.set(rk, true)
+        None: Unit
+      end
+    end
+  end
+
+  stale_updates = try Ledger.read_locked(
+    files.read_only,
+    ledger_db_path,
+    vellum_schema(),
+    map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      def = case try Table.get(store, databases_table(), db_id).map_error(map_table_error)
+        Some(d): d
+        None: return Ok([])
+      end
+      var prop_by_id = {}
+      for p in def.properties
+        prop_by_id = prop_by_id.set(p.id, p)
+      end
+      r_pairs = try Table.lookup(store, db_rows_table(), db_rows_by_database(), db_id).map_error(
+        map_table_error
+      )
+      var row_by_id = {}
+      for (_rid, r) in r_pairs
+        if r.archived_at == None
+          row_by_id = row_by_id.set(r.id, r)
+        end
+      end
+      meta_pairs = try Table.lookup(store, ai_cell_meta_table(), ai_cell_meta_by_database(), db_id)
+        .map_error(map_table_error)
+      var to_mark = []
+      for (_mid, m) in meta_pairs
+        continue if m.stale
+        prop = case prop_by_id.get(m.prop_id)
+          Some(p): p
+          None: continue
+        end
+        row = case row_by_id.get(m.row_id)
+          Some(r): r
+          None: continue
+        end
+        (pr_hash, body?) = case prop.kind
+          AiDerived(
+            prompt: pr,
+            source_prop_ids: _,
+            include_row_body: inc,
+            output_kind: out_k,
+            mode: _,
+            daily_call_cap: _
+          ): (DatabaseModel.compute_ai_prompt_hash(pr, out_k), inc)
+          Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
+            options: _
+          ) | Checkbox | Person | Url | Relation(target_db_id: _, inverse_prop_id: _) | Rollup(
+            relation_prop_id: _,
+            target_prop_id: _,
+            agg: _
+          ): continue
+        end
+        body_plain = if body?
+          Blocks.blocks_plain_text(try load_page_blocks(store, row.page_id))
+        else
+          ""
+        end
+        in_hash = DatabaseModel.compute_ai_input_hash(def, prop, row, body_plain)
+        row_touched? = touched_rows.get(row.id) != None
+        if pr_hash != m.prompt_hash or in_hash != m.input_hash or row_touched?
+          if pr_hash != m.prompt_hash or in_hash != m.input_hash
+            to_mark = to_mark.append(m)
+          end
+        end
+      end
+      Ok(to_mark)
+    end
+  )
+
+  var marked = 0
+  if not stale_updates.empty?
+    wmeta = Ledger.WriteMeta(
+      principal: "system:ai-columns",
+      action: "ai_column.feed_sync",
+      reason: "mark drifted AI-compiled cells stale via Modb.Feeds on #{db_id}",
+      at: now
+    )
+    marked = try Ledger.transact_locked(
+      files,
+      ledger_db_path,
+      vellum_schema(),
+      wmeta,
+      "marked stale AI cells on #{db_id}",
+      Json.Object({"database_id": Json.String(db_id)}),
+      map_ledger_error,
+      fn(tx)
+        var t = tx
+        var cnt = 0
+        for stale_m in stale_updates
+          case try Table.tx_get(t, ai_cell_meta_table(), stale_m.id).map_error(map_table_error)
+            Some(cur) if not cur.stale and cur.input_hash == stale_m.input_hash:
+              next_m = AiCellMeta(
+                id: cur.id,
+                database_id: cur.database_id,
+                row_id: cur.row_id,
+                prop_id: cur.prop_id,
+                model: cur.model,
+                prompt_hash: cur.prompt_hash,
+                input_hash: cur.input_hash,
+                stale: true,
+                rationale: cur.rationale,
+                citations: cur.citations,
+                proposal_id: cur.proposal_id,
+                computed_at: cur.computed_at
+              )
+              t = try Table.put(t, ai_cell_meta_table(), next_m.id, next_m).map_error(
+                map_table_error
+              )
+              cnt += 1
+            Some(_) | None: Unit
+          end
+        end
+        Ok((t, cnt))
+      end
+    )
+  end
+
+  Ok(
+    AiFeedSyncResult(
+      feed_id: fid,
+      from_txid: batch.from_txid,
+      to_txid: batch.to_txid,
+      events_seen: batch.events.size,
+      pages_read: batch.pages_read,
+      subtrees_skipped: batch.subtrees_skipped,
+      marked_stale_count: marked
+    )
+  )
 end
 
 ## Speculative `Modb.World` catalog registering `read_page` (O(diff) key-scoped) and `propose`.
@@ -2519,7 +2854,7 @@ test "Db relational database composite cell indexes, rollup enrichment, and Ledg
       end
 
       rep = try Ledger.verify_all(db).map_error(map_ledger_error)
-      return Error(BadInput(reason: "expected 8 invariants")) if rep.invariants_checked != 8
+      return Error(BadInput(reason: "expected 9 invariants")) if rep.invariants_checked != 9
       Ok(Unit)
     end
   )
@@ -2873,7 +3208,7 @@ test "Db Modb.Vec hybrid RRF search, neural vector updates/dimension switches, a
       new_other = try Vec.get_doc(store, neural_vec_index(8), pg_other.id).map_error(map_vec_error)
       return Error(BadInput(reason: "expected 8d vector present")) if new_other == None
       rep = try Ledger.verify_all(db).map_error(map_ledger_error)
-      return Error(BadInput(reason: "expected 8 invariants")) if rep.invariants_checked != 8
+      return Error(BadInput(reason: "expected 9 invariants")) if rep.invariants_checked != 9
       Ok(Unit)
     end
   )
@@ -3295,7 +3630,7 @@ test "living summaries auto-persist on page/db writes, clean up on delete, and e
     Ok((Some(s), inv_cnt)):
       assert s.title == "Release Checklist"
       assert s.headings == ["Rollback Plan"]
-      assert inv_cnt == 8
+      assert inv_cnt == 9
     Ok((None, _)) | Error(_): assert false
   end
 
@@ -3316,4 +3651,197 @@ test "living summaries auto-persist on page/db writes, clean up on delete, and e
     end
   )
   assert del_res == Ok(None)
+end
+
+test "AiDerived Modb.Feeds O(diff) staleness detection, World PutAiCellMeta landing, and 9 invariants"
+  files = Files.in_memory({})
+  schema = vellum_schema()
+  t0 = Time.parse("2026-12-01T10:00:00Z") or stop "t0"
+  meta = Ledger.WriteMeta(principal: "usr_ada", action: "test.ai_cols", reason: "seed ai db", at: t0)
+  opt_low = SelectOption(id: "low", label: "Low", color: Green)
+  opt_high = SelectOption(id: "high", label: "High", color: Red)
+  ai_prop = PropertyDef(
+    id: "tier",
+    name: "Tier",
+    kind: AiDerived(
+      prompt: "Classify tier",
+      source_prop_ids: ["title"],
+      include_row_body: false,
+      output_kind: AiSelect(options: [opt_low, opt_high]),
+      mode: StageProposal,
+      daily_call_cap: 10
+    ),
+    required: false,
+    sort_order: "b"
+  )
+  def = DatabaseDef(
+    id: "db_feed1",
+    collection_id: default_collection_id,
+    page_id: "pg_db_feed1",
+    title: "Alerts",
+    description: "Feed staleness test",
+    properties: [
+      PropertyDef(id: "title", name: "Title", kind: Title, required: true, sort_order: "a"),
+      ai_prop
+    ],
+    version: 1
+  )
+  row1 = DbRow(
+    id: "row_f1",
+    database_id: def.id,
+    page_id: "pg_rf1",
+    cells: {"title": TextVal("Minor latency"), "tier": SelectVal(option_id: "low")},
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+  row_pg = Page(
+    id: "pg_rf1",
+    collection_id: default_collection_id,
+    parent_page_id: Some(def.page_id),
+    title: "Minor latency",
+    icon: None,
+    cover_attachment_id: None,
+    kind: DatabaseRow(database_id: def.id, row_id: row1.id),
+    sort_order: row1.id,
+    database_id: Some(def.id),
+    freshness_ttl_days: None,
+    verified_at: None,
+    verified_by: None,
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+  host_pg = Page(
+    id: def.page_id,
+    collection_id: default_collection_id,
+    parent_page_id: None,
+    title: def.title,
+    icon: None,
+    cover_attachment_id: None,
+    kind: Document,
+    sort_order: "a",
+    database_id: Some(def.id),
+    freshness_ttl_days: None,
+    verified_at: None,
+    verified_by: None,
+    created_by: "usr_ada",
+    created_at: t0,
+    updated_at: t0,
+    archived_at: None,
+    version: 1
+  )
+  m1 = AiCellMeta(
+    id: DatabaseModel.ai_cell_meta_key(def.id, row1.id, ai_prop.id),
+    database_id: def.id,
+    row_id: row1.id,
+    prop_id: ai_prop.id,
+    model: "gpt-4o-mini",
+    prompt_hash: DatabaseModel.compute_ai_prompt_hash("Classify tier", AiSelect(options: [opt_low, opt_high])),
+    input_hash: DatabaseModel.compute_ai_input_hash(def, ai_prop, row1, ""),
+    stale: false,
+    rationale: Some("Initial low latency"),
+    citations: [],
+    proposal_id: None,
+    computed_at: t0
+  )
+
+  w0 = Ledger.transact_locked(
+    files,
+    ledger_db_path,
+    schema,
+    meta,
+    "seed db and ai meta",
+    Json.Null,
+    map_ledger_error,
+    fn(tx)
+      t1 = try Table.put(tx, pages_table(), host_pg.id, host_pg).map_error(map_table_error)
+      t2 = try Table.put(t1, databases_table(), def.id, def).map_error(map_table_error)
+      t3 = try tx_put_db_row(t2, def, row1, row_pg, [])
+      t4 = try Table.put(t3, ai_cell_meta_table(), m1.id, m1).map_error(map_table_error)
+      Ok((t4, Unit))
+    end
+  )
+  assert w0 is Ok(Unit)
+
+  assert ensure_ai_col_feed_locked(files, def.id, t0) is Ok(Unit)
+  idle_sync = sync_ai_col_feed_locked(files, def.id, t0)
+  case idle_sync
+    Ok(s):
+      assert s.events_seen == 0
+      assert s.marked_stale_count == 0
+    Error(_): assert false
+  end
+
+  # Mutate source title -> Modb.Feeds O(diff) detects delta and marks m1 stale!
+  row1_v2 = DbRow(
+    id: row1.id,
+    database_id: def.id,
+    page_id: row1.page_id,
+    cells: {"title": TextVal("Critical DB Outage"), "tier": SelectVal(option_id: "low")},
+    created_by: row1.created_by,
+    created_at: row1.created_at,
+    updated_at: t0 + 10.seconds,
+    archived_at: None,
+    version: 2
+  )
+  pg_v2 = Page(
+    id: row_pg.id,
+    collection_id: row_pg.collection_id,
+    parent_page_id: row_pg.parent_page_id,
+    title: "Critical DB Outage",
+    icon: None,
+    cover_attachment_id: None,
+    kind: row_pg.kind,
+    sort_order: row_pg.sort_order,
+    database_id: row_pg.database_id,
+    freshness_ttl_days: None,
+    verified_at: None,
+    verified_by: None,
+    created_by: row_pg.created_by,
+    created_at: row_pg.created_at,
+    updated_at: t0 + 10.seconds,
+    archived_at: None,
+    version: 2
+  )
+  w1 = Ledger.transact_locked(
+    files,
+    ledger_db_path,
+    schema,
+    meta,
+    "mutate source cell",
+    Json.Null,
+    map_ledger_error,
+    fn(tx)
+      t1 = try tx_put_db_row(tx, def, row1_v2, pg_v2, [])
+      Ok((t1, Unit))
+    end
+  )
+  assert w1 is Ok(Unit)
+
+  dirty_sync = sync_ai_col_feed_locked(files, def.id, t0 + 15.seconds)
+  case dirty_sync
+    Ok(s):
+      assert s.events_seen >= 1
+      assert s.marked_stale_count == 1
+    Error(_): assert false
+  end
+
+  chk = Ledger.read_locked(
+    files.read_only,
+    ledger_db_path,
+    schema,
+    map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      got_m = try Table.get(store, ai_cell_meta_table(), m1.id).map_error(map_table_error)
+      rep = try Ledger.verify_all(db).map_error(map_ledger_error)
+      Ok((got_m.map(fn(x) x.stale end), rep.invariants_checked))
+    end
+  )
+  assert chk == Ok((Some(true), 9))
 end

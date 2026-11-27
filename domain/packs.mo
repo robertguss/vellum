@@ -18,7 +18,15 @@ render_llms_txt,
 compile_pack
 use Domain.Blocks
 use Domain.Blueprints{BlueprintDef, PageBlueprintMeta, to_yaml_frontmatter}
-use Domain.DatabaseModel{CellValue, DatabaseDef, EnrichedRow, PropertyKind, effective_cell, extract_row_title}
+use Domain.DatabaseModel{
+  AiOutputKind,
+  CellValue,
+  DatabaseDef,
+  EnrichedRow,
+  PropertyKind,
+  effective_cell,
+  extract_row_title
+}
 use Domain.Policy{valid_collection_slug?}
 use Domain.Types{
   AuthorKind,
@@ -277,10 +285,25 @@ fn build_database_summary(
   for p in def.properties
     is_numeric? = case p.kind
       Number(format: _): true
+      AiDerived(
+        prompt: _,
+        source_prop_ids: _,
+        include_row_body: _,
+        output_kind: AiNumber(format: _),
+        mode: _,
+        daily_call_cap: _
+      ): true
       Title | RichText | DateProp(include_time: _) | Select(options: _) | MultiSelect(options: _) | Checkbox | Person | Url | Relation(
         target_db_id: _,
         inverse_prop_id: _
-      ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): false
+      ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
+        prompt: _,
+        source_prop_ids: _,
+        include_row_body: _,
+        output_kind: _,
+        mode: _,
+        daily_call_cap: _
+      ): false
     end
     if is_numeric? and totals_parts.size < 3
       var acc = 0.0

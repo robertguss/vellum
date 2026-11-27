@@ -34,6 +34,7 @@ mo check domain/blocks.mo
 mo check domain/policy.mo
 mo check domain/database-model.mo
 mo check domain/blueprints.mo
+mo check domain/feed-bridge.mo
 mo check domain/packs.mo
 mo check domain/collab.mo
 mo check domain/notion-import.mo

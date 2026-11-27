@@ -13,7 +13,7 @@ claim_resource_for_page,
 claim_resource_for_block,
 claim_resource_for_row,
 webhook_matches_event?
-use Domain.DatabaseModel{CellValue, PropertyDef}
+use Domain.DatabaseModel{AiCellMeta, CellValue, PropertyDef}
 use Domain.Types{BlockOp, Provenance}
 use Json
 
@@ -81,6 +81,7 @@ enum WorldMutation
     properties: Option(List(PropertyDef)),
     expected_version: Option(Int)
   )
+  PutAiCellMeta(meta: AiCellMeta)
 end
 
 ## JSON-serializable envelope wrapping a `WorldMutation` inside `Modb.World` `CallStep`s.

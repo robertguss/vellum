@@ -9,6 +9,7 @@ WorkspaceSearchOutcome(..),
 AskWorkspaceInput(..),
 DraftBlockInput(..),
 RefreshAiBriefInput(..),
+RunAiColumnInput(..),
 GardenStalePage(..),
 GardenBrokenLink(..),
 GardenReport(..),
@@ -23,21 +24,39 @@ execute_workspace_search,
 ask_workspace,
 draft_blocks,
 refresh_ai_brief,
+build_ai_column_prompts,
+run_ai_column,
+ai_columns_status,
+sync_ai_column_feed,
 run_garden,
 garden_job
 use Api
 use Arvo.Id
 use Db
 use Domain.Blocks
-use Domain.Collab{ProposalMeta, WorldPatchArgs}
+use Domain.Collab{ProposalMeta, WorldBranchArgs, WorldMutation, WorldPatchArgs}
+use Domain.DatabaseModel{
+  AiCellMeta,
+  AiColumnMode,
+  AiColumnUsage,
+  AiOutputKind,
+  CellValue,
+  DatabaseDef,
+  DbRow,
+  PropertyDef,
+  PropertyKind
+}
 use Domain.Policy
 use Domain.Types{
   AppError,
   AuthContext,
   AuthorKind,
+  Block,
   BlockKind,
   BlockOp,
   Citation,
+  CollectionWritePolicy,
+  Page,
   PrincipalKind,
   Provenance,
   SearchResultItem
@@ -45,6 +64,7 @@ use Domain.Types{
 use Http
 use Json
 use Modb{Store}
+use Modb.Feeds
 use Modb.Grants
 use Modb.Ledger
 use Modb.Table
@@ -1140,6 +1160,1014 @@ fn refresh_ai_brief(
         "draft_markdown": Json.String(brief_md),
         "block_id": Json.String(target_blk.id),
         "model": Json.String(model_name)
+      })
+    )
+  )
+end
+
+## JSON payload for `POST /api/databases/:id/ai-columns/:prop_id/run`.
+struct RunAiColumnInput
+  row_ids: Option(List(Text))
+  only_stale: Option(Bool)
+  mode_override: Option(Text)
+  deterministic_fallback: Option(Bool)
+end
+
+fn ai_output_schema_description(out_k: AiOutputKind) : Text
+  case out_k
+    AiText: "short plain text string"
+    AiNumber(format: fmt): "exact decimal number (format=#{fmt}), e.g. \"42.50\" or 42.50"
+    AiDate: "ISO date string YYYY-MM-DD"
+    AiBool: "JSON boolean true or false"
+    AiSelect(options: opts):
+      labels = opts.map(fn(o) "#{o.id} (#{o.label})" end).join(", ")
+      "one allowed select option id/label from: [#{labels}]"
+  end
+end
+
+## Builds exact `(system_prompt, user_prompt)` strings used to evaluate an `AiDerived` cell.
+fn build_ai_column_prompts(
+  db_title: Text,
+  prop_name: Text,
+  prompt_str: Text,
+  out_k: AiOutputKind,
+  row_title: Text,
+  src_txt: Text
+) : (Text, Text)
+  schema_desc = ai_output_schema_description(out_k)
+  sys_prompt = "You evaluate an AI-compiled database column '#{prop_name}' (schema: #{schema_desc}). Respond ONLY with a valid JSON object {\"value\": <value>, \"rationale\": \"<short citation-grounded explanation>\"}."
+  usr_prompt = "Database: #{db_title}\nColumn Prompt: #{prompt_str}\nOutput Type: #{schema_desc}\nRow Title: #{row_title}\n\nGrounded Row Inputs:\n#{src_txt}"
+  (sys_prompt, usr_prompt)
+end
+
+fn ai_cell_value_to_plain_text(prop: PropertyDef, c: CellValue) : Text
+  case c
+    Empty: ""
+    TextVal(s) | UrlVal(s): s.trim
+    NumberVal(d): d.to_text
+    DateVal(start: st, end_date: ed_opt):
+      case ed_opt
+        Some(ed): "#{st.to_iso}..#{ed.to_iso}"
+        None: st.to_iso
+      end
+    BoolVal(b): if b: "true" else: "false"
+    SelectVal(option_id: oid):
+      case prop.kind
+        Select(options: opts) | AiDerived(
+          prompt: _,
+          source_prop_ids: _,
+          include_row_body: _,
+          output_kind: AiSelect(options: opts),
+          mode: _,
+          daily_call_cap: _
+        ):
+          for o in opts
+            if o.id == oid
+              return "#{o.label} (#{o.id})"
+            end
+          end
+          oid
+        Title | RichText | Number(format: _) | DateProp(include_time: _) | MultiSelect(options: _) | Checkbox | Person | Url | Relation(
+          target_db_id: _,
+          inverse_prop_id: _
+        ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _) | AiDerived(
+          prompt: _,
+          source_prop_ids: _,
+          include_row_body: _,
+          output_kind: _,
+          mode: _,
+          daily_call_cap: _
+        ): oid
+      end
+    MultiSelectVal(option_ids: xs) | PrincipalVal(xs) | RelationVal(row_ids: xs): xs.join(", ")
+  end
+end
+
+fn build_row_ai_context(
+  def: DatabaseDef,
+  row: DbRow,
+  source_prop_ids: List(Text),
+  include_row_body?: Bool,
+  body_blocks: List(Block)
+) : (Text, Text, List(Citation))
+  row_title = DatabaseModel.extract_row_title(def, row.cells)
+  var prop_by_id = {}
+  for p in def.properties
+    prop_by_id = prop_by_id.set(p.id, p)
+  end
+  target_ids = if source_prop_ids.empty?
+    def.properties.filter(fn(p)
+      case p.kind
+        AiDerived(
+          prompt: _,
+          source_prop_ids: _,
+          include_row_body: _,
+          output_kind: _,
+          mode: _,
+          daily_call_cap: _
+        ): false
+        Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
+          options: _
+        ) | Checkbox | Person | Url | Relation(target_db_id: _, inverse_prop_id: _) | Rollup(
+          relation_prop_id: _,
+          target_prop_id: _,
+          agg: _
+        ): true
+      end
+    end).map(fn(p) p.id end)
+  else
+    source_prop_ids
+  end
+
+  var lines = []
+  var cits = []
+  for sid in target_ids
+    case prop_by_id.get(sid)
+      Some(sp):
+        val = row.cells.get(sid) or Empty
+        txt = ai_cell_value_to_plain_text(sp, val)
+        if not txt.empty?
+          lines = lines.append("- #{sp.name} (#{sp.id}): #{txt}")
+          if cits.size < 4
+            cits = cits.append(
+              Citation(
+                source_kind: "db_row",
+                source_ref: row.id,
+                label: "#{row_title} · #{sp.name}",
+                excerpt: Some(txt)
+              )
+            )
+          end
+        end
+      None: Unit
+    end
+  end
+
+  body_plain = if include_row_body? and not body_blocks.empty?
+    plain = Blocks.blocks_plain_text(body_blocks)
+    if not plain.trim.empty?
+      case body_blocks.first
+        Some(fb):
+          if cits.size < 6
+            cits = cits.append(
+              Citation(
+                source_kind: "block",
+                source_ref: fb.id,
+                label: "#{row_title} notes",
+                excerpt: Some(fb.markdown)
+              )
+            )
+          end
+        None: Unit
+      end
+    end
+    plain
+  else
+    ""
+  end
+
+  src_txt = if body_plain.trim.empty?
+    lines.join("\n")
+  else if lines.empty?
+    "Row Document Notes:\n#{body_plain}"
+  else
+    "#{lines.join("\n")}\n\nRow Document Notes:\n#{body_plain}"
+  end
+  (row_title, src_txt, cits)
+end
+
+## `GET /api/databases/:id/ai-columns/status` — Returns daily AI column budget usage, `Modb.Feeds` cursor, and per-cell metadata (`ReadFiles`-only).
+fn ai_columns_status(
+  id: Text,
+  auth: AuthContext,
+  rf: ReadFiles,
+  clock: Clock
+) : Result(Api.Response, AppError)
+  if auth.principal.suspended or not Policy.action_permitted?(auth, "read")
+    return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'read'"))
+  end
+  if not rf.exists?(Db.ledger_db_path)
+    return Error(Missing(entity: "database", id: id))
+  end
+
+  now = clock.now
+  today_iso = now.to_text.bytes.slice(0, 10).decode_utf8 or "1970-01-01"
+  payload = try Ledger.read_locked(
+    rf,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      def = case try Table.get(store, Db.databases_table(), id).map_error(Db.map_table_error)
+        Some(d): d
+        None: return Error(Missing(entity: "database", id: id))
+      end
+      try Policy.require_collection_access(auth, "read", def.collection_id)
+
+      var prop_by_id = {}
+      var usage_map = {}
+      for p in def.properties
+        prop_by_id = prop_by_id.set(p.id, p)
+        case p.kind
+          AiDerived(
+            prompt: _,
+            source_prop_ids: _,
+            include_row_body: _,
+            output_kind: _,
+            mode: _,
+            daily_call_cap: cap
+          ):
+            uk = DatabaseModel.ai_col_usage_key(def.id, p.id, today_iso)
+            used = case try Table.get(store, Db.ai_col_usage_table(), uk).map_error(
+              Db.map_table_error
+            )
+              Some(u): u.calls_used
+              None: 0
+            end
+            rem = if cap > used: cap - used else: 0
+            usage_map = usage_map.set(
+              p.id,
+              Json.Object({
+                "calls_used": Json.int(used),
+                "daily_call_cap": Json.int(cap),
+                "remaining_calls": Json.int(rem),
+                "day_iso": Json.String(today_iso)
+              })
+            )
+          Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
+            options: _
+          ) | Checkbox | Person | Url | Relation(target_db_id: _, inverse_prop_id: _) | Rollup(
+            relation_prop_id: _,
+            target_prop_id: _,
+            agg: _
+          ): Unit
+        end
+      end
+
+      r_pairs = try Table.lookup(store, Db.db_rows_table(), Db.db_rows_by_database(), def.id)
+        .map_error(Db.map_table_error)
+      var row_by_id = {}
+      for (_rid, r) in r_pairs
+        if r.archived_at == None
+          row_by_id = row_by_id.set(r.id, r)
+        end
+      end
+
+      meta_pairs = try Table.lookup(
+        store,
+        Db.ai_cell_meta_table(),
+        Db.ai_cell_meta_by_database(),
+        def.id
+      ).map_error(Db.map_table_error)
+      var cell_map = {}
+      for (_mk, m) in meta_pairs
+        live_stale = if m.stale
+          true
+        else
+          case (prop_by_id.get(m.prop_id), row_by_id.get(m.row_id))
+            (Some(prop), Some(row)):
+              case prop.kind
+                AiDerived(
+                  prompt: pr,
+                  source_prop_ids: _,
+                  include_row_body: body?,
+                  output_kind: out_k,
+                  mode: _,
+                  daily_call_cap: _
+                ):
+                  pr_h = DatabaseModel.compute_ai_prompt_hash(pr, out_k)
+                  b_plain = if body?
+                    Blocks.blocks_plain_text(try Db.load_page_blocks(store, row.page_id))
+                  else
+                    ""
+                  end
+                  in_h = DatabaseModel.compute_ai_input_hash(def, prop, row, b_plain)
+                  pr_h != m.prompt_hash or in_h != m.input_hash
+                Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(
+                  options: _
+                ) | MultiSelect(options: _) | Checkbox | Person | Url | Relation(
+                  target_db_id: _,
+                  inverse_prop_id: _
+                ) | Rollup(relation_prop_id: _, target_prop_id: _, agg: _): false
+              end
+            (_, _): true
+          end
+        end
+        eff_m = AiCellMeta(
+          id: m.id,
+          database_id: m.database_id,
+          row_id: m.row_id,
+          prop_id: m.prop_id,
+          model: m.model,
+          prompt_hash: m.prompt_hash,
+          input_hash: m.input_hash,
+          stale: live_stale,
+          rationale: m.rationale,
+          citations: m.citations,
+          proposal_id: m.proposal_id,
+          computed_at: m.computed_at
+        )
+        cell_map = cell_map.set("#{m.row_id}:#{m.prop_id}", eff_m.to_json)
+      end
+
+      feed_json = case try Feeds.get_feed(store, Db.ai_col_feed_id(def.id)).map_error(
+        Db.map_feeds_error
+      )
+        Some(sub):
+          Json.Object({
+            "feed_id": Json.String(sub.id),
+            "cursor_txid": Json.int(sub.cursor_txid),
+            "events_delivered": Json.int(sub.events_delivered),
+            "bootstrapped": Json.Boolean(sub.bootstrapped)
+          })
+        None: Json.Null
+      end
+
+      Ok(
+        Json.Object({
+          "database_id": Json.String(def.id),
+          "day_iso": Json.String(today_iso),
+          "feed": feed_json,
+          "usage": Json.Object(usage_map),
+          "cells": Json.Object(cell_map)
+        })
+      )
+    end
+  )
+  Ok(json_ok(200, payload))
+end
+
+## `POST /api/databases/:id/ai-columns/sync-feed` — Consumes `Modb.Feeds` changes and marks stale AI cells.
+fn sync_ai_column_feed(
+  req: Api.Request,
+  id: Text,
+  auth: AuthContext,
+  files: Files,
+  clock: Clock
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  if auth.principal.suspended or not Policy.action_permitted?(auth, "read")
+    return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'read'"))
+  end
+  if not files.read_only.exists?(Db.ledger_db_path)
+    return Error(Missing(entity: "database", id: id))
+  end
+  _def = try Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      d = case try Table.get(Ledger.store(db), Db.databases_table(), id).map_error(
+        Db.map_table_error
+      )
+        Some(x): x
+        None: return Error(Missing(entity: "database", id: id))
+      end
+      try Policy.require_collection_access(auth, "read", d.collection_id)
+      Ok(d)
+    end
+  )
+  res = try Db.sync_ai_col_feed_locked(files, id, clock.now)
+  Ok(json_ok(200, res.to_json))
+end
+
+## `POST /api/databases/:id/ai-columns/:prop_id/run` — Evaluates one `AiDerived` column over target/stale rows
+## strictly outside MoDB write locks, validates outputs via `DatabaseModel.validate_cell`, enforces daily caps,
+## and routes writes to AutoApply or a `Modb.World` Change Proposal according to column & collection policy.
+fn run_ai_column(
+  req: Api.Request,
+  id: Text,
+  prop_id: Text,
+  auth: AuthContext,
+  input: RunAiColumnInput,
+  files: Files,
+  rng: SecureRandom,
+  clock: Clock,
+  env: Env,
+  net: Network
+) : Result(Api.Response, AppError)
+  try Auth.require_session_csrf(req, auth)
+  if auth.principal.suspended or not Policy.action_permitted?(auth, "read")
+    return Error(Forbidden(reason: "grant '#{auth.grant_id}' does not permit 'read'"))
+  end
+  if not files.read_only.exists?(Db.ledger_db_path)
+    return Error(Missing(entity: "database", id: id))
+  end
+
+  now = clock.now
+  day_iso = now.to_text.bytes.slice(0, 10).decode_utf8 or "1970-01-01"
+
+  (def_check, col_check, prop, prompt_str, src_ids, include_body?, out_kind, col_mode, daily_cap) = try Ledger
+    .read_locked(
+      files.read_only,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      Db.map_ledger_error,
+      fn(db)
+        store = Ledger.store(db)
+        d = case try Table.get(store, Db.databases_table(), id).map_error(Db.map_table_error)
+          Some(x): x
+          None: return Error(Missing(entity: "database", id: id))
+        end
+        try Policy.require_collection_access(auth, "read", d.collection_id)
+        c = case try Table.get(store, Db.collections_table(), d.collection_id).map_error(
+          Db.map_table_error
+        )
+          Some(x): x
+          None: return Error(Missing(entity: "collection", id: d.collection_id))
+        end
+        var found_p = None
+        for p in d.properties
+          if p.id == prop_id
+            found_p = Some(p)
+            break
+          end
+        end
+        prp = try found_p.or_fail(Missing(entity: "property", id: prop_id))
+        case prp.kind
+          AiDerived(
+            prompt: pr_t,
+            source_prop_ids: sids,
+            include_row_body: inc_b,
+            output_kind: ok_k,
+            mode: cm,
+            daily_call_cap: cap
+          ): Ok((d, c, prp, pr_t, sids, inc_b, ok_k, cm, cap))
+          Title | RichText | Number(format: _) | DateProp(include_time: _) | Select(options: _) | MultiSelect(
+            options: _
+          ) | Checkbox | Person | Url | Relation(target_db_id: _, inverse_prop_id: _) | Rollup(
+            relation_prop_id: _,
+            target_prop_id: _,
+            agg: _
+          ): Error(BadInput(reason: "property '#{prop_id}' is not an AI-compiled column"))
+        end
+      end
+    )
+
+  base_mode = case input.mode_override
+    None: col_mode
+    Some(m):
+      norm = m.trim.ascii_lowercase
+      if norm.empty?
+        col_mode
+      else if norm == "proposal" or norm == "stage_proposal"
+        StageProposal
+      else if norm == "auto" or norm == "auto_apply"
+        AutoApply
+      else
+        return Error(BadInput(reason: "mode_override must be 'auto' or 'proposal'"))
+      end
+  end
+  eff_mode = if col_check.write_policy == ProposalsRequiredForAll or
+    (col_check.write_policy == ProposalsRequiredForAgents and auth.principal.kind == Agent)
+    StageProposal
+  else
+    base_mode
+  end
+
+  write_act = if eff_mode == AutoApply
+    if Policy.action_permitted?(auth, "write_db")
+      "write_db"
+    else
+      "write_direct"
+    end
+  else
+    "propose"
+  end
+  try Policy.require_collection_access(auth, write_act, col_check.id)
+
+  # Sync Modb.Feeds O(diff) staleness cursor before evaluating target rows
+  _feed_sync = try Db.sync_ai_col_feed_locked(files, def_check.id, now)
+
+  usage_key = DatabaseModel.ai_col_usage_key(def_check.id, prop.id, day_iso)
+  pr_hash = DatabaseModel.compute_ai_prompt_hash(prompt_str, out_kind)
+  only_stale? = case input.only_stale
+    Some(b): b
+    None: true
+  end
+
+  (used_before, candidates, row_blocks_map) = try Ledger.read_locked(
+    files.read_only,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    Db.map_ledger_error,
+    fn(db)
+      store = Ledger.store(db)
+      used = case try Table.get(store, Db.ai_col_usage_table(), usage_key).map_error(
+        Db.map_table_error
+      )
+        Some(u): u.calls_used
+        None: 0
+      end
+      r_pairs = try Table.lookup(store, Db.db_rows_table(), Db.db_rows_by_database(), def_check.id)
+        .map_error(Db.map_table_error)
+      active_rows = r_pairs.filter(fn(p) p.1.archived_at == None end).map(fn(p) p.1 end).sort_by(
+        fn(r) r.id end
+      )
+
+      row_filter = case input.row_ids
+        Some(xs) if not xs.empty?: Some(xs)
+        Some(_) | None: None
+      end
+
+      var out_cands = []
+      var blk_map = {}
+      for r in active_rows
+        in_row_filter = case row_filter
+          Some(xs): xs.contains?(r.id)
+          None: true
+        end
+        continue if not in_row_filter
+
+        blks = if include_body?
+          try Db.load_page_blocks(store, r.page_id)
+        else
+          []
+        end
+        b_plain = if include_body?: Blocks.blocks_plain_text(blks) else: ""
+        in_h = DatabaseModel.compute_ai_input_hash(def_check, prop, r, b_plain)
+        mk = DatabaseModel.ai_cell_meta_key(def_check.id, r.id, prop.id)
+        m_opt = try Table.get(store, Db.ai_cell_meta_table(), mk).map_error(Db.map_table_error)
+        cur_val = r.cells.get(prop.id) or Empty
+        stale? = case m_opt
+          Some(m): m.stale or m.prompt_hash != pr_hash or m.input_hash != in_h
+          None: true
+        end
+        need_eval = if only_stale?
+          cur_val == Empty or stale?
+        else
+          true
+        end
+        if need_eval
+          out_cands = out_cands.append((r, in_h))
+          blk_map = blk_map.set(r.id, blks)
+        end
+      end
+      Ok((used, out_cands, blk_map))
+    end
+  )
+
+  remaining = if daily_cap > used_before: daily_cap - used_before else: 0
+  if remaining <= 0 and not candidates.empty?
+    return Error(
+      Conflict(
+        reason: "daily call cap (#{daily_cap}) reached for AI column '#{prop.id}' on #{day_iso}"
+      )
+    )
+  end
+
+  to_eval = candidates.take(remaining)
+  skipped_budget = candidates.size - to_eval.size
+  cfg_res = ai_config(env)
+
+  var attempted_calls = 0
+  var valid_updates = []
+  var result_items = []
+  var used_model = "none"
+
+  for (row, in_h) in to_eval
+    blks = row_blocks_map.get(row.id) or []
+    (row_title, src_txt, cits) = build_row_ai_context(
+      def_check,
+      row,
+      src_ids,
+      include_body?,
+      blks
+    )
+    attempted_calls += 1
+
+    eval_out = case cfg_res
+      Ok(cfg):
+        used_model = cfg.model
+        (sys_prompt, usr_prompt) = build_ai_column_prompts(
+          def_check.title,
+          prop.name,
+          prompt_str,
+          out_kind,
+          row_title,
+          src_txt
+        )
+        http_res = try Http.send(build_llm_request(cfg, sys_prompt, usr_prompt), net).map_error(
+          fn(e) ServerFailed(reason: "AI column LLM request failed: #{e.to_text}") end
+        )
+        if http_res.status < 200 or http_res.status >= 300
+          return Error(ServerFailed(reason: "LLM provider returned HTTP #{http_res.status}"))
+        end
+        raw_reply = try extract_llm_text(cfg, http_res.body)
+        case DatabaseModel.parse_ai_cell_output(out_kind, raw_reply)
+          Ok((cval, rat_opt)): Ok((cval, rat_opt, cfg.model))
+          Error(msg): Error(msg)
+        end
+      Error(cfg_err):
+        if input.deterministic_fallback == Some(true)
+          used_model = "deterministic-column"
+          (cval, rat) = DatabaseModel.compute_deterministic_ai_cell(
+            prop,
+            out_kind,
+            row_title,
+            src_txt
+          )
+          Ok((cval, Some(rat), "deterministic-column"))
+        else
+          return Error(cfg_err)
+        end
+    end
+
+    case eval_out
+      Error(parse_msg):
+        result_items = result_items.append(
+          Json.Object({
+            "row_id": Json.String(row.id),
+            "status": Json.String("validation_error"),
+            "error": Json.String(parse_msg)
+          })
+        )
+      Ok((cell_val, rat_opt, mname)):
+        case DatabaseModel.validate_cell(prop, cell_val)
+          Some(val_msg):
+            result_items = result_items.append(
+              Json.Object({
+                "row_id": Json.String(row.id),
+                "status": Json.String("validation_error"),
+                "error": Json.String(val_msg)
+              })
+            )
+          None:
+            valid_updates = valid_updates.append((row, cell_val, rat_opt, cits, in_h, mname))
+            result_items = result_items.append(
+              Json.Object({
+                "row_id": Json.String(row.id),
+                "status": Json.String(
+                  if eff_mode == AutoApply: "applied" else: "staged"
+                ),
+                "value": cell_val.to_json,
+                "rationale": case rat_opt
+                  Some(r): Json.String(r)
+                  None: Json.Null
+                end
+              })
+            )
+        end
+    end
+  end
+
+  if eff_mode == AutoApply
+    wmeta = Ledger.WriteMeta(
+      principal: auth.principal.handle,
+      action: "ai_column.run_auto",
+      reason: "AI-compiled column '#{prop.id}' evaluated #{attempted_calls} rows",
+      at: now
+    )
+    (next_usage, updated_cnt) = try Ledger.transact_locked(
+      files,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      wmeta,
+      "ran AI column #{prop.id} (auto_apply)",
+      Json.Object({
+        "database_id": Json.String(def_check.id),
+        "prop_id": Json.String(prop.id),
+        "attempted": Json.int(attempted_calls),
+        "updated": Json.int(valid_updates.size)
+      }),
+      Db.map_ledger_error,
+      fn(tx)
+        var t = if auth.principal.kind == Agent
+          (tg, _g) = try Grants.tx_authorize(tx, auth.grant_id, write_act, now).map_error(
+            Db.map_grants_error
+          )
+          tg
+        else
+          tx
+        end
+        cur_u = case try Table.tx_get(t, Db.ai_col_usage_table(), usage_key).map_error(
+          Db.map_table_error
+        )
+          Some(u): u.calls_used
+          None: 0
+        end
+        new_u = AiColumnUsage(
+          id: usage_key,
+          database_id: def_check.id,
+          prop_id: prop.id,
+          day_iso: day_iso,
+          calls_used: cur_u + attempted_calls,
+          updated_at: now
+        )
+        t = try Table.put(t, Db.ai_col_usage_table(), new_u.id, new_u).map_error(
+          Db.map_table_error
+        )
+
+        var applied = 0
+        for (orig_row, cell_val, rat_opt, cits, in_h, mname) in valid_updates
+          cur_def = case try Table.tx_get(t, Db.databases_table(), def_check.id).map_error(
+            Db.map_table_error
+          )
+            Some(d): d
+            None: def_check
+          end
+          cur_row = case try Table.tx_get(t, Db.db_rows_table(), orig_row.id).map_error(
+            Db.map_table_error
+          )
+            Some(r) if r.archived_at == None: r
+            Some(_) | None: continue
+          end
+          old_pg = case try Table.tx_get(t, Db.pages_table(), cur_row.page_id).map_error(
+            Db.map_table_error
+          )
+            Some(p): p
+            None: continue
+          end
+          blks = try Table.tx_lookup(t, Db.blocks_table(), Db.blocks_by_page(), old_pg.id)
+            .map_error(Db.map_table_error)
+            .map(fn(xs) Blocks.sort_blocks(xs.map(fn(x) x.1 end)) end)
+          merged_cells = cur_row.cells.set(prop.id, cell_val)
+          bumped_row = DbRow(
+            id: cur_row.id,
+            database_id: cur_row.database_id,
+            page_id: cur_row.page_id,
+            cells: merged_cells,
+            created_by: cur_row.created_by,
+            created_at: cur_row.created_at,
+            updated_at: now,
+            archived_at: cur_row.archived_at,
+            version: cur_row.version + 1
+          )
+          bumped_pg = Page(
+            id: old_pg.id,
+            collection_id: old_pg.collection_id,
+            parent_page_id: old_pg.parent_page_id,
+            title: DatabaseModel.extract_row_title(cur_def, merged_cells),
+            icon: old_pg.icon,
+            cover_attachment_id: old_pg.cover_attachment_id,
+            kind: old_pg.kind,
+            sort_order: old_pg.sort_order,
+            database_id: old_pg.database_id,
+            freshness_ttl_days: old_pg.freshness_ttl_days,
+            verified_at: old_pg.verified_at,
+            verified_by: old_pg.verified_by,
+            created_by: old_pg.created_by,
+            created_at: old_pg.created_at,
+            updated_at: now,
+            archived_at: old_pg.archived_at,
+            version: old_pg.version + 1
+          )
+          t = try Db.tx_put_db_row(t, cur_def, bumped_row, bumped_pg, blks)
+          cmeta = AiCellMeta(
+            id: DatabaseModel.ai_cell_meta_key(cur_def.id, bumped_row.id, prop.id),
+            database_id: cur_def.id,
+            row_id: bumped_row.id,
+            prop_id: prop.id,
+            model: mname,
+            prompt_hash: pr_hash,
+            input_hash: in_h,
+            stale: false,
+            rationale: rat_opt,
+            citations: cits,
+            proposal_id: None,
+            computed_at: now
+          )
+          t = try Table.put(t, Db.ai_cell_meta_table(), cmeta.id, cmeta).map_error(
+            Db.map_table_error
+          )
+          applied += 1
+        end
+        Ok((t, (new_u, applied)))
+      end
+    )
+
+    rem_after = if daily_cap > next_usage.calls_used
+      daily_cap - next_usage.calls_used
+    else
+      0
+    end
+    return Ok(
+      json_ok(
+        200,
+        Json.Object({
+          "database_id": Json.String(def_check.id),
+          "prop_id": Json.String(prop.id),
+          "mode": Json.String("auto_apply"),
+          "model": Json.String(used_model),
+          "attempted_calls": Json.int(attempted_calls),
+          "updated_count": Json.int(updated_cnt),
+          "skipped_budget_count": Json.int(skipped_budget),
+          "usage": Json.Object({
+            "calls_used": Json.int(next_usage.calls_used),
+            "daily_call_cap": Json.int(daily_cap),
+            "remaining_calls": Json.int(rem_after),
+            "day_iso": Json.String(day_iso)
+          }),
+          "results": Json.Array(result_items),
+          "proposal": Json.Null
+        })
+      )
+    )
+  end
+
+  # StageProposal mode: debit usage and stage all valid cell + AiCellMeta updates inside ONE Modb.World branch
+  umeta = Ledger.WriteMeta(
+    principal: auth.principal.handle,
+    action: "ai_column.usage_debit",
+    reason: "debit AI column call budget on '#{prop.id}'",
+    at: now
+  )
+  next_usage = try Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    umeta,
+    "debited AI column usage on #{prop.id}",
+    Json.Object({
+      "database_id": Json.String(def_check.id),
+      "prop_id": Json.String(prop.id),
+      "attempted": Json.int(attempted_calls)
+    }),
+    Db.map_ledger_error,
+    fn(tx)
+      t = if auth.principal.kind == Agent
+        (tg, _g) = try Grants.tx_authorize(tx, auth.grant_id, "propose", now).map_error(
+          Db.map_grants_error
+        )
+        tg
+      else
+        tx
+      end
+      cur_u = case try Table.tx_get(t, Db.ai_col_usage_table(), usage_key).map_error(
+        Db.map_table_error
+      )
+        Some(u): u.calls_used
+        None: 0
+      end
+      new_u = AiColumnUsage(
+        id: usage_key,
+        database_id: def_check.id,
+        prop_id: prop.id,
+        day_iso: day_iso,
+        calls_used: cur_u + attempted_calls,
+        updated_at: now
+      )
+      t1 = try Table.put(t, Db.ai_col_usage_table(), new_u.id, new_u).map_error(
+        Db.map_table_error
+      )
+      Ok((t1, new_u))
+    end
+  )
+  rem_after = if daily_cap > next_usage.calls_used
+    daily_cap - next_usage.calls_used
+  else
+    0
+  end
+  usage_json = Json.Object({
+    "calls_used": Json.int(next_usage.calls_used),
+    "daily_call_cap": Json.int(daily_cap),
+    "remaining_calls": Json.int(rem_after),
+    "day_iso": Json.String(day_iso)
+  })
+
+  if valid_updates.empty?
+    return Ok(
+      json_ok(
+        200,
+        Json.Object({
+          "database_id": Json.String(def_check.id),
+          "prop_id": Json.String(prop.id),
+          "mode": Json.String("stage_proposal"),
+          "model": Json.String(used_model),
+          "attempted_calls": Json.int(attempted_calls),
+          "updated_count": Json.int(0),
+          "skipped_budget_count": Json.int(skipped_budget),
+          "usage": usage_json,
+          "results": Json.Array(result_items),
+          "proposal": Json.Null
+        })
+      )
+    )
+  end
+
+  prop_id_new = "prop_#{Id.ulid(rng, clock)}"
+  world_id = "w_#{Id.ulid(rng, clock)}"
+  _wrec = try World.open_world_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    world_id,
+    auth.grant_id,
+    now,
+    now + 7.days
+  ).map_error(Db.map_world_error)
+
+  base_prov = make_provenance(auth, "AI-compiled column '#{prop.name}'", now)
+  for (row, cell_val, rat_opt, cits, in_h, mname) in valid_updates
+    row_prov = Provenance(
+      author_id: base_prov.author_id,
+      author_kind: base_prov.author_kind,
+      grant_id: base_prov.grant_id,
+      proposal_id: Some(prop_id_new),
+      reason: Some("AI column '#{prop.name}': #{rat_opt or mname}"),
+      citations: cits,
+      updated_at: now
+    )
+    row_mut = UpdateDbRow(
+      database_id: def_check.id,
+      row_id: row.id,
+      cells: {prop.id: cell_val},
+      expected_version: Some(row.version),
+      provenance: row_prov
+    )
+    _s1 = try World.world_call_locked(
+      files,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      Db.world_catalog(),
+      world_id,
+      "propose",
+      WorldBranchArgs(mutation: row_mut, updated_at: now).to_json,
+      "stage AI cell #{prop.id} on #{row.id}",
+      now
+    ).map_error(Db.map_world_error)
+
+    cmeta = AiCellMeta(
+      id: DatabaseModel.ai_cell_meta_key(def_check.id, row.id, prop.id),
+      database_id: def_check.id,
+      row_id: row.id,
+      prop_id: prop.id,
+      model: mname,
+      prompt_hash: pr_hash,
+      input_hash: in_h,
+      stale: false,
+      rationale: rat_opt,
+      citations: cits,
+      proposal_id: Some(prop_id_new),
+      computed_at: now
+    )
+    _s2 = try World.world_call_locked(
+      files,
+      Db.ledger_db_path,
+      Db.vellum_schema(),
+      Db.world_catalog(),
+      world_id,
+      "propose",
+      WorldBranchArgs(mutation: PutAiCellMeta(meta: cmeta), updated_at: now).to_json,
+      "stage AI cell metadata #{prop.id} on #{row.id}",
+      now
+    ).map_error(Db.map_world_error)
+  end
+
+  pm = ProposalMeta(
+    id: prop_id_new,
+    world_id: world_id,
+    collection_id: def_check.collection_id,
+    target_page_id: def_check.page_id,
+    target_database_id: Some(def_check.id),
+    branch_kind: "proposal",
+    title: "AI Column: #{prop.name} (#{valid_updates.size} rows)",
+    reason: "AI-compiled column '#{prop.id}' run via #{used_model}",
+    author_id: auth.principal.id,
+    author_handle: auth.principal.handle,
+    grant_id: auth.grant_id,
+    status: "open",
+    created_at: now,
+    updated_at: now,
+    decided_by: None,
+    decided_at: None
+  )
+  pmeta = Ledger.WriteMeta(
+    principal: auth.principal.handle,
+    action: "ai_column.stage_proposal",
+    reason: "open AI column proposal #{prop_id_new} on #{def_check.id}",
+    at: now
+  )
+  saved_pm = try Ledger.transact_locked(
+    files,
+    Db.ledger_db_path,
+    Db.vellum_schema(),
+    pmeta,
+    "created AI column proposal #{prop_id_new}",
+    Json.Object({"proposal_id": Json.String(prop_id_new), "database_id": Json.String(def_check.id)}),
+    Db.map_ledger_error,
+    fn(tx)
+      t1 = try Table.put(tx, Db.proposals_table(), pm.id, pm).map_error(Db.map_table_error)
+      Ok((t1, pm))
+    end
+  )
+
+  Ok(
+    json_ok(
+      201,
+      Json.Object({
+        "database_id": Json.String(def_check.id),
+        "prop_id": Json.String(prop.id),
+        "mode": Json.String("stage_proposal"),
+        "model": Json.String(used_model),
+        "attempted_calls": Json.int(attempted_calls),
+        "updated_count": Json.int(valid_updates.size),
+        "skipped_budget_count": Json.int(skipped_budget),
+        "usage": usage_json,
+        "results": Json.Array(result_items),
+        "proposal": saved_pm.to_json
       })
     )
   )
